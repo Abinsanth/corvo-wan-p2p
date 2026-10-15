@@ -341,13 +341,7 @@ impl Core {
             Internal::Closed { peer, id, duplicate } => self.closed(peer, id, duplicate),
             Internal::DialFailed { peer } => {
                 self.dialing.remove(&peer);
-                if self.quiet.remove(&peer) {
-                    self.went_offline(peer);
-                }
-                if !self.links.contains_key(&peer) {
-                    let delay = self.retry.get(&peer).map_or(self.config.retry_first, |r| r.delay * 2);
-                    self.retry_in(peer, delay.min(self.config.retry_max));
-                }
+                self.back_off(peer, None);
             }
         }
     }
@@ -396,12 +390,13 @@ impl Core {
         }
         let Frame::Hello { proto, .. } = hello else {
             conn.close(4u32.into(), b"expected hello");
+            self.back_off(peer, None);
             return;
         };
         if proto != PROTO_VERSION {
             conn.close(5u32.into(), b"protocol version");
             self.emit(Event::VersionMismatch { peer, theirs: proto });
-            self.retry_in(peer, self.config.retry_max);
+            self.back_off(peer, Some(self.config.retry_max));
             return;
         }
         let initiator = if role == Role::Dialer { self.me } else { peer };
@@ -517,8 +512,21 @@ impl Core {
         self.retry.insert(peer, Retry { at: Instant::now() + delay, delay: delay.max(self.config.retry_first) });
     }
 
+    /// Reaching `peer` didn't work out: try again after `wait`, or else twice as
+    /// long as last time. Nothing to do while another connection to them is up.
+    fn back_off(&mut self, peer: Code, wait: Option<Duration>) {
+        if self.links.contains_key(&peer) {
+            return;
+        }
+        if self.quiet.remove(&peer) {
+            self.went_offline(peer);
+        }
+        let doubled = self.retry.get(&peer).map_or(self.config.retry_first, |r| r.delay * 2);
+        self.retry_in(peer, wait.unwrap_or(doubled).min(self.config.retry_max));
+    }
+
     fn next_dial(&self) -> Option<Instant> {
-        self.retry.iter().filter(|(peer, _)| !self.dialing.contains(peer)).map(|(_, r)| r.at).min()
+        next_due(&self.retry, |peer| self.dialing.contains(peer) || self.links.contains_key(peer))
     }
 
     fn dial_due(&mut self) {
@@ -572,6 +580,13 @@ async fn accept_loop(endpoint: Endpoint, internal: mpsc::UnboundedSender<Interna
     }
 }
 
+/// When the next dial is due: the earliest retry among peers that aren't
+/// connected or being dialed. Busy peers never count, so a leftover entry
+/// can't wake the loop over and over.
+fn next_due(retry: &HashMap<Code, Retry>, busy: impl Fn(&Code) -> bool) -> Option<Instant> {
+    retry.iter().filter(|(peer, _)| !busy(peer)).map(|(_, r)| r.at).min()
+}
+
 async fn sleep_until(at: Option<Instant>) {
     match at {
         Some(at) => tokio::time::sleep_until(at).await,
@@ -581,4 +596,23 @@ async fn sleep_until(at: Option<Instant>) {
 
 fn now_ms() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::identity::Seed;
+
+    #[test]
+    fn connected_or_dialing_peers_are_never_due() {
+        let now = Instant::now();
+        let (linked, dialing, waiting) = (Seed::generate().code(), Seed::generate().code(), Seed::generate().code());
+        let mut retry = HashMap::new();
+        retry.insert(linked, Retry { at: now - Duration::from_secs(9), delay: Duration::from_secs(1) });
+        retry.insert(dialing, Retry { at: now - Duration::from_secs(8), delay: Duration::from_secs(1) });
+        retry.insert(waiting, Retry { at: now + Duration::from_secs(3), delay: Duration::from_secs(1) });
+        let busy = |peer: &Code| *peer == linked || *peer == dialing;
+        assert_eq!(next_due(&retry, busy), Some(now + Duration::from_secs(3)));
+        assert_eq!(next_due(&retry, |_| true), None);
+    }
 }

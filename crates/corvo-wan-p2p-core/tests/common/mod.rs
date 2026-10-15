@@ -4,6 +4,8 @@
 
 #![allow(dead_code)] // each test file uses a different part of this
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use corvo_wan_p2p_core::chat::{Client, Config, Event};
@@ -134,6 +136,29 @@ impl Fake {
             Some((send, recv, theirs))
         };
         tokio::time::timeout(PATIENCE, exchange).await.expect("the exchange took too long")
+    }
+}
+
+impl Fake {
+    /// Answers every connection with `reply` where a hello should be, keeps it
+    /// open, and counts the connections.
+    pub fn answer_with(&self, reply: Frame) -> Arc<AtomicUsize> {
+        let count = Arc::new(AtomicUsize::new(0));
+        let (endpoint, counter) = (self.endpoint.clone(), count.clone());
+        tokio::spawn(async move {
+            while let Some(incoming) = endpoint.accept().await {
+                counter.fetch_add(1, Ordering::SeqCst);
+                let reply = reply.clone();
+                tokio::spawn(async move {
+                    let Ok(conn) = incoming.await else { return };
+                    let Ok((mut send, mut recv)) = conn.accept_bi().await else { return };
+                    let _ = read_frame(&mut recv).await;
+                    let _ = write_frame(&mut send, &reply).await;
+                    conn.closed().await;
+                });
+            }
+        });
+        count
     }
 }
 

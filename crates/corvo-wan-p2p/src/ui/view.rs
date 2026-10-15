@@ -948,7 +948,9 @@ mod tests {
         state.select_tab(1);
         let buf = render(&state, 80, 24);
         let chat = areas((80, 24), 1).unwrap().chat;
-        let xs: usize = (chat.y..chat.bottom()).map(|y| row(&buf, y).chars().filter(|&c| c == 'x').count()).sum();
+        // Only the chat's columns: a random code in the sidebar can hold an x too.
+        let in_chat = |y| (chat.x..chat.right()).filter(|&x| buf[(x, y)].symbol() == "x").count();
+        let xs: usize = (chat.y..chat.bottom()).map(in_chat).sum();
         assert_eq!(xs, 300, "every character is drawn");
         assert!((chat.y..chat.bottom()).filter(|&y| row(&buf, y).contains("xxxx")).count() >= 6);
     }

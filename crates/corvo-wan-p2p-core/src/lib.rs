@@ -2,7 +2,9 @@
 //! encrypted store, the wire protocol, networking and the chat logic. It never
 //! depends on terminal crates, so all of it can be tested without a screen.
 
+pub mod files;
 pub mod identity;
+pub mod store;
 
 /// The app version, shared by every crate in the workspace.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

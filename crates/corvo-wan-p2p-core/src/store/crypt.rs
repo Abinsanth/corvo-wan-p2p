@@ -1,0 +1,123 @@
+//! The store's encryption: passphrase stretching, and sealing single values.
+
+use argon2::{Algorithm, Argon2, Params, Version};
+use chacha20poly1305::aead::{Aead, KeyInit, Payload};
+use chacha20poly1305::{XChaCha20Poly1305, XNonce};
+use hkdf::Hkdf;
+use serde::{Deserialize, Serialize};
+use sha2::Sha256;
+use zeroize::Zeroizing;
+
+const NONCE_LEN: usize = 24;
+
+/// How hard Argon2id works to turn a passphrase into a key. Saved in
+/// `key.json`, so opening always uses the settings the store was locked with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KdfParams {
+    /// Memory, in KiB.
+    pub m_kib: u32,
+    /// Passes.
+    pub t: u32,
+    /// Lanes.
+    pub p: u32,
+}
+
+impl KdfParams {
+    /// 64 MiB, 3 passes: about half a second on a laptop, which is fine once per start.
+    pub const DEFAULT: KdfParams = KdfParams { m_kib: 64 * 1024, t: 3, p: 1 };
+    /// The smallest Argon2 allows. Only for tests, which would crawl otherwise.
+    pub const FAST_INSECURE: KdfParams = KdfParams { m_kib: 8, t: 1, p: 1 };
+}
+
+/// Stretches a passphrase into a 32-byte key. `None` if `params` are outside
+/// what Argon2 accepts (a damaged `key.json`).
+pub(crate) fn passphrase_key(passphrase: &str, salt: &[u8], params: KdfParams) -> Option<Zeroizing<[u8; 32]>> {
+    let params = Params::new(params.m_kib, params.t, params.p, Some(32)).ok()?;
+    let mut key = Zeroizing::new([0u8; 32]);
+    Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
+        .hash_password_into(passphrase.as_bytes(), salt, key.as_mut())
+        .ok()?;
+    Some(key)
+}
+
+/// A purpose-specific key from the data key, so one key is never used for two jobs.
+pub(crate) fn subkey(data_key: &[u8; 32], label: &[u8]) -> Zeroizing<[u8; 32]> {
+    let mut out = Zeroizing::new([0u8; 32]);
+    Hkdf::<Sha256>::new(None, data_key).expand(label, out.as_mut()).expect("32 bytes is a valid HKDF length");
+    out
+}
+
+/// Encrypts `plain` with a fresh random nonce. `aad` says where the value
+/// belongs (for example `b"profile.name"`), so a value copied into another
+/// place won't open there. Output: nonce, then ciphertext.
+pub(crate) fn seal(key: &[u8; 32], aad: &[u8], plain: &[u8]) -> Vec<u8> {
+    let nonce: [u8; NONCE_LEN] = rand::random();
+    let ct = XChaCha20Poly1305::new(&(*key).into())
+        .encrypt(&XNonce::from(nonce), Payload { msg: plain, aad })
+        .expect("encrypting in memory can't fail");
+    let mut out = nonce.to_vec();
+    out.extend_from_slice(&ct);
+    out
+}
+
+/// Reverses [`seal`]. `None` if the key or `aad` is wrong or the bytes were changed.
+pub(crate) fn open(key: &[u8; 32], aad: &[u8], sealed: &[u8]) -> Option<Zeroizing<Vec<u8>>> {
+    if sealed.len() < NONCE_LEN {
+        return None;
+    }
+    let (nonce, ct) = sealed.split_at(NONCE_LEN);
+    let nonce: [u8; NONCE_LEN] = nonce.try_into().ok()?;
+    XChaCha20Poly1305::new(&(*key).into())
+        .decrypt(&XNonce::from(nonce), Payload { msg: ct, aad })
+        .ok()
+        .map(Zeroizing::new)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const KEY: [u8; 32] = [7; 32];
+
+    #[test]
+    fn sealed_values_open_only_with_the_same_key_and_place() {
+        let sealed = seal(&KEY, b"profile.name", b"abin");
+        assert_eq!(open(&KEY, b"profile.name", &sealed).unwrap().as_slice(), b"abin");
+        assert!(open(&[8; 32], b"profile.name", &sealed).is_none());
+        assert!(open(&KEY, b"profile.seed", &sealed).is_none());
+    }
+
+    #[test]
+    fn sealing_twice_gives_different_bytes() {
+        assert_ne!(seal(&KEY, b"a", b"same"), seal(&KEY, b"a", b"same"));
+    }
+
+    #[test]
+    fn changed_or_short_bytes_do_not_open() {
+        let mut sealed = seal(&KEY, b"a", b"abin");
+        let last = sealed.len() - 1;
+        sealed[last] ^= 1;
+        assert!(open(&KEY, b"a", &sealed).is_none());
+        assert!(open(&KEY, b"a", &[0; 10]).is_none());
+        assert!(open(&KEY, b"a", &[]).is_none());
+    }
+
+    #[test]
+    fn passphrase_key_depends_on_passphrase_and_salt() {
+        let p = KdfParams::FAST_INSECURE;
+        let a = passphrase_key("correct horse", &[1; 16], p).unwrap();
+        assert_eq!(a, passphrase_key("correct horse", &[1; 16], p).unwrap());
+        assert_ne!(a, passphrase_key("correct horsf", &[1; 16], p).unwrap());
+        assert_ne!(a, passphrase_key("correct horse", &[2; 16], p).unwrap());
+    }
+
+    #[test]
+    fn impossible_kdf_params_are_refused_not_a_panic() {
+        assert!(passphrase_key("x", &[1; 16], KdfParams { m_kib: 0, t: 0, p: 0 }).is_none());
+    }
+
+    #[test]
+    fn subkeys_differ_by_label() {
+        assert_ne!(subkey(&KEY, b"one"), subkey(&KEY, b"two"));
+    }
+}

@@ -4,6 +4,7 @@ use argon2::{Algorithm, Argon2, Params, Version};
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use hkdf::Hkdf;
+use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use unicode_normalization::UnicodeNormalization;
@@ -51,6 +52,17 @@ pub(crate) fn subkey(data_key: &[u8; 32], label: &[u8]) -> Zeroizing<[u8; 32]> {
     let mut out = Zeroizing::new([0u8; 32]);
     Hkdf::<Sha256>::new(None, data_key).expand(label, out.as_mut()).expect("32 bytes is a valid HKDF length");
     out
+}
+
+/// A stable, secret-keyed name for a value, so rows can be found by it without
+/// storing the value itself: HMAC-SHA256(key, kind, 0, value). `kind` keeps
+/// different sorts of value (peers, message ids) from ever sharing a tag.
+pub(crate) fn tag(key: &[u8; 32], kind: &[u8], value: &[u8]) -> [u8; 32] {
+    let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("HMAC takes any key length");
+    mac.update(kind);
+    mac.update(&[0]);
+    mac.update(value);
+    mac.finalize().into_bytes().into()
 }
 
 /// Encrypts `plain` with a fresh random nonce. `aad` says where the value
@@ -120,6 +132,14 @@ mod tests {
     #[test]
     fn impossible_kdf_params_are_refused_not_a_panic() {
         assert!(passphrase_key("x", &[1; 16], KdfParams { m_kib: 0, t: 0, p: 0 }).is_none());
+    }
+
+    #[test]
+    fn tags_are_stable_and_separated() {
+        assert_eq!(tag(&KEY, b"peer", b"abc"), tag(&KEY, b"peer", b"abc"));
+        assert_ne!(tag(&KEY, b"peer", b"abc"), tag(&KEY, b"msg", b"abc"));
+        assert_ne!(tag(&KEY, b"peer", b"abc"), tag(&[8; 32], b"peer", b"abc"));
+        assert_ne!(tag(&KEY, b"pe", b"erabc"), tag(&KEY, b"peer", b"abc"));
     }
 
     #[test]

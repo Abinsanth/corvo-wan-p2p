@@ -2,8 +2,11 @@
 //! encrypted store, the wire protocol, networking and the chat logic. It never
 //! depends on terminal crates, so all of it can be tested without a screen.
 
+pub mod chat;
 pub mod files;
 pub mod identity;
+pub mod net;
+pub mod proto;
 pub mod recovery;
 pub mod store;
 

@@ -1,0 +1,215 @@
+//! Your encrypted data on disk.
+//!
+//! Two files in the data folder:
+//! - `key.json` holds the data key, locked with your passphrase (see `keyfile`).
+//! - `store.db` is SQLite. Every value in it is sealed with a key derived from
+//!   the data key, so the file shows nothing readable.
+//!
+//! A `lock` file stops two copies of the app opening the same data at once.
+
+mod crypt;
+mod keyfile;
+mod schema;
+
+use std::fs::{self, File, TryLockError};
+use std::io::ErrorKind;
+use std::path::{Path, PathBuf};
+
+use rusqlite::{Connection, OptionalExtension, params};
+use zeroize::Zeroizing;
+
+pub use crypt::KdfParams;
+use keyfile::KeyFile;
+
+use crate::files::{private_dir, private_file};
+use crate::identity::{NameError, Seed, clean_name};
+
+pub const KEY_FILE: &str = "key.json";
+pub const DB_FILE: &str = "store.db";
+const LOCK_FILE: &str = "lock";
+/// SQLite's side files, which belong to `store.db`.
+const DB_SIDE_FILES: [&str; 3] = ["store.db-journal", "store.db-wal", "store.db-shm"];
+
+/// Label for the key that seals values in `store.db`.
+const FIELD_KEY_LABEL: &[u8] = b"corvo-wan-p2p store fields v1";
+
+/// Who you are, as saved in the store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Profile {
+    pub seed: Seed,
+    pub name: String,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum StoreError {
+    #[error("there's already an account in {0}")]
+    AlreadyExists(PathBuf),
+    #[error("there's no account in {0} yet")]
+    NotFound(PathBuf),
+    #[error("wrong passphrase")]
+    WrongPassphrase,
+    #[error("the passphrase can't be empty")]
+    EmptyPassphrase,
+    #[error("corvo-wan-p2p is already open with this account; close the other window first")]
+    AlreadyRunning,
+    #[error("{0} was saved by a newer version of corvo-wan-p2p; update to open it")]
+    TooNew(PathBuf),
+    #[error("{file} is damaged: {why}")]
+    Damaged { file: PathBuf, why: String },
+    #[error("those passphrase settings aren't usable")]
+    BadKdfParams,
+    #[error(transparent)]
+    Name(#[from] NameError),
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error("database error: {0}")]
+    Db(#[from] rusqlite::Error),
+}
+
+/// An unlocked store. Holds the lock until dropped.
+pub struct Store {
+    dir: PathBuf,
+    db: Connection,
+    data_key: Zeroizing<[u8; 32]>,
+    field_key: Zeroizing<[u8; 32]>,
+    _lock: File,
+}
+
+impl Store {
+    /// Whether `dir` holds an account (its `key.json` exists).
+    pub fn exists(dir: &Path) -> bool {
+        dir.join(KEY_FILE).is_file()
+    }
+
+    /// Makes a new account in `dir`, locked with `passphrase`. `key.json` is
+    /// written last, so a crash part-way leaves no account rather than a broken one.
+    pub fn create(
+        dir: &Path,
+        passphrase: &str,
+        params: KdfParams,
+        seed: &Seed,
+        name: &str,
+    ) -> Result<Store, StoreError> {
+        let name = clean_name(name)?;
+        if passphrase.is_empty() {
+            return Err(StoreError::EmptyPassphrase);
+        }
+        private_dir(dir)?;
+        let lock = take_lock(dir)?;
+        if Store::exists(dir) {
+            return Err(StoreError::AlreadyExists(dir.to_path_buf()));
+        }
+        remove_db_files(dir)?; // left by a create that crashed before key.json
+        let data_key = Zeroizing::new(rand::random::<[u8; 32]>());
+        let store = Store::assemble(dir, data_key, lock)?;
+        store.db.execute(
+            "INSERT INTO profile (id, seed, name) VALUES (1, ?1, ?2)",
+            params![store.seal(b"profile.seed", seed.as_bytes()), store.seal(b"profile.name", name.as_bytes())],
+        )?;
+        KeyFile::lock(&store.data_key, passphrase, params)?.write(&dir.join(KEY_FILE))?;
+        Ok(store)
+    }
+
+    /// Unlocks the account in `dir`.
+    pub fn open(dir: &Path, passphrase: &str) -> Result<Store, StoreError> {
+        if !Store::exists(dir) {
+            return Err(StoreError::NotFound(dir.to_path_buf()));
+        }
+        let lock = take_lock(dir)?;
+        let key_path = dir.join(KEY_FILE);
+        let data_key = KeyFile::read(&key_path)?.unlock(passphrase, &key_path)?;
+        let store = Store::assemble(dir, data_key, lock)?;
+        store.profile()?; // fail now, not later, if store.db doesn't match key.json
+        Ok(store)
+    }
+
+    /// Opens `store.db` (creating it privately if missing) and brings its tables up to date.
+    fn assemble(dir: &Path, data_key: Zeroizing<[u8; 32]>, lock: File) -> Result<Store, StoreError> {
+        let db_path = dir.join(DB_FILE);
+        private_file().create(true).truncate(false).open(&db_path)?;
+        let mut db = Connection::open(&db_path)?;
+        if schema::upgrade(&mut db)? == schema::Upgrade::TooNew {
+            return Err(StoreError::TooNew(db_path));
+        }
+        let field_key = crypt::subkey(&data_key, FIELD_KEY_LABEL);
+        Ok(Store { dir: dir.to_path_buf(), db, data_key, field_key, _lock: lock })
+    }
+
+    /// Your seed and name.
+    pub fn profile(&self) -> Result<Profile, StoreError> {
+        let row: Option<(Vec<u8>, Vec<u8>)> = self
+            .db
+            .query_row("SELECT seed, name FROM profile WHERE id = 1", [], |r| Ok((r.get(0)?, r.get(1)?)))
+            .optional()?;
+        let (seed, name) = row.ok_or_else(|| self.damaged("no profile"))?;
+        let seed = self.open_value(b"profile.seed", &seed)?;
+        let seed: [u8; 16] = seed.as_slice().try_into().map_err(|_| self.damaged("seed is the wrong size"))?;
+        let name = String::from_utf8(self.open_value(b"profile.name", &name)?.to_vec())
+            .map_err(|_| self.damaged("name isn't text"))?;
+        Ok(Profile { seed: Seed::from_bytes(seed), name })
+    }
+
+    /// Changes your display name; returns it as saved (tidied, see `clean_name`).
+    pub fn set_name(&self, name: &str) -> Result<String, StoreError> {
+        let name = clean_name(name)?;
+        self.db.execute("UPDATE profile SET name = ?1 WHERE id = 1", [self.seal(b"profile.name", name.as_bytes())])?;
+        Ok(name)
+    }
+
+    /// Locks the data key with a new passphrase. Only `key.json` changes.
+    pub fn change_passphrase(&self, new_passphrase: &str, params: KdfParams) -> Result<(), StoreError> {
+        if new_passphrase.is_empty() {
+            return Err(StoreError::EmptyPassphrase);
+        }
+        KeyFile::lock(&self.data_key, new_passphrase, params)?.write(&self.dir.join(KEY_FILE))
+    }
+
+    /// Deletes the account in `dir` (for `--recover` after a forgotten passphrase).
+    /// `key.json` goes first, so a wipe cut short leaves no account.
+    pub fn wipe(dir: &Path) -> Result<(), StoreError> {
+        if !dir.exists() {
+            return Ok(());
+        }
+        let _lock = take_lock(dir)?;
+        remove_if_present(&dir.join(KEY_FILE))?;
+        remove_db_files(dir)
+    }
+
+    fn seal(&self, place: &[u8], plain: &[u8]) -> Vec<u8> {
+        crypt::seal(&self.field_key, place, plain)
+    }
+
+    fn open_value(&self, place: &[u8], sealed: &[u8]) -> Result<Zeroizing<Vec<u8>>, StoreError> {
+        crypt::open(&self.field_key, place, sealed).ok_or_else(|| self.damaged("a value doesn't decrypt"))
+    }
+
+    fn damaged(&self, why: &str) -> StoreError {
+        StoreError::Damaged { file: self.dir.join(DB_FILE), why: why.into() }
+    }
+}
+
+/// Takes the lock file in `dir`, or reports that another copy holds it.
+fn take_lock(dir: &Path) -> Result<File, StoreError> {
+    let file = private_file().create(true).truncate(false).open(dir.join(LOCK_FILE))?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(TryLockError::WouldBlock) => Err(StoreError::AlreadyRunning),
+        Err(TryLockError::Error(e)) => Err(e.into()),
+    }
+}
+
+fn remove_db_files(dir: &Path) -> Result<(), StoreError> {
+    remove_if_present(&dir.join(DB_FILE))?;
+    for side in DB_SIDE_FILES {
+        remove_if_present(&dir.join(side))?;
+    }
+    Ok(())
+}
+
+fn remove_if_present(path: &Path) -> Result<(), StoreError> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}

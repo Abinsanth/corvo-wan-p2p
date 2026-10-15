@@ -709,4 +709,28 @@ mod tests {
             assert_eq!(done(&mut s, Outcome::Unlock(error)), vec![Effect::Exit(message)]);
         }
     }
+
+    #[test]
+    fn a_pasted_answer_loses_its_line_breaks() {
+        let mut s = begin(true, false);
+        run(&mut s, Msg::Paste("hunter2\r\n".into()));
+        assert_eq!(s.editor.text(), "hunter2");
+        assert_eq!(send(&mut s, ""), vec![Effect::Unlock(Secret::new("hunter2".into()))]);
+
+        let seed = Seed::generate();
+        let mut s = begin(false, true);
+        run(&mut s, Msg::Paste(format!("{}\n", seed.words().join("\n"))));
+        assert_eq!(s.editor.text(), seed.phrase(), "words pasted one per line become one line");
+        send(&mut s, "");
+        assert_eq!(label(&s), "name: ");
+    }
+
+    #[test]
+    fn altgr_characters_reach_a_masked_answer() {
+        // Windows reports AltGr chords (like @ on a German keyboard) as Ctrl+Alt.
+        let mut s = begin(true, false);
+        run(&mut s, Msg::Key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE)));
+        run(&mut s, Msg::Key(KeyEvent::new(KeyCode::Char('@'), KeyModifiers::CONTROL | KeyModifiers::ALT)));
+        assert_eq!(s.editor.text(), "p@");
+    }
 }

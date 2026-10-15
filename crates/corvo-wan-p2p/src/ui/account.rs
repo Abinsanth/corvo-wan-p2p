@@ -374,4 +374,13 @@ mod tests {
         }
         assert_eq!(seen, vec!["/phrase", "/passphrase"]);
     }
+
+    #[test]
+    fn a_paste_while_the_words_are_up_only_hides_them() {
+        let mut s = state();
+        s.reveal = Some(secret("abandon ability able"));
+        update(&mut s, Msg::Paste("hello".into()));
+        assert_eq!(s.reveal, None);
+        assert!(s.editor.is_empty());
+    }
 }

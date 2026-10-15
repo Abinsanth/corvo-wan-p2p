@@ -26,8 +26,8 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::event::{
     self, DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste, EnableFocusChange,
-    EnableMouseCapture, Event as TermEvent, KeyboardEnhancementFlags, MouseEventKind, PopKeyboardEnhancementFlags,
-    PushKeyboardEnhancementFlags,
+    EnableMouseCapture, Event as TermEvent, KeyCode, KeyModifiers, KeyboardEnhancementFlags, MouseEventKind,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use ratatui::crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, SetTitle, disable_raw_mode, enable_raw_mode,
@@ -176,6 +176,23 @@ fn to_msg(ev: TermEvent) -> Option<Msg> {
     }
 }
 
+/// What to keep of the input that arrived during a slow step, like
+/// unlocking: only resizes and Ctrl-C. Anything typed ahead would land on
+/// the next screen, maybe unmasked, so a passphrase typed twice would show.
+fn typed_ahead(rx: &mut mpsc::UnboundedReceiver<TermEvent>) -> Vec<Msg> {
+    let mut kept = Vec::new();
+    while let Ok(ev) = rx.try_recv() {
+        match ev {
+            TermEvent::Resize(..) => kept.extend(to_msg(ev)),
+            TermEvent::Key(key) if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) => {
+                kept.push(Msg::Key(key))
+            }
+            _ => {}
+        }
+    }
+    kept
+}
+
 /// Runs the UI until it quits. `Some` with a message to print if it has to
 /// exit, like when the account is open in another window.
 pub async fn run<W: Write>(mut state: State, mut runner: Runner<W>) -> anyhow::Result<Option<String>> {
@@ -199,23 +216,34 @@ async fn interact<W: Write>(state: &mut State, runner: &mut Runner<W>) -> anyhow
     let mut tick = tokio::time::interval(TICK);
     loop {
         terminal.draw(|frame| view::draw(frame, state))?;
-        let msg = match effects.pop_front() {
-            Some(effect) => match runner.apply(effect).await? {
-                Flow::Next(msg) => msg,
-                Flow::Quit => return Ok(None),
-                Flow::Exit(why) => return Ok(Some(why)),
-            },
-            None => tokio::select! {
+        let (msg, slow) = match effects.pop_front() {
+            Some(effect) => {
+                let slow = effect.busy().is_some();
+                match runner.apply(effect).await? {
+                    Flow::Next(msg) => (msg, slow),
+                    Flow::Quit => return Ok(None),
+                    Flow::Exit(why) => return Ok(Some(why)),
+                }
+            }
+            None => (
+                tokio::select! {
                 ev = term_rx.recv() => match ev {
                     Some(ev) => to_msg(ev),
                     None => anyhow::bail!("the terminal stopped sending input"),
                 },
                 Some(event) = runner.next_event() => Some(Msg::Core(event)),
                 _ = tick.tick() => Some(Msg::Tick),
-            },
+                },
+                false,
+            ),
         };
         if let Some(msg) = msg {
             effects.extend(update(state, msg));
+        }
+        if slow {
+            for msg in typed_ahead(&mut term_rx) {
+                effects.extend(update(state, msg));
+            }
         }
     }
 }
@@ -285,6 +313,23 @@ mod tests {
         assert!(KEYBOARD_FLAGS.contains(F::DISAMBIGUATE_ESCAPE_CODES));
         assert!(KEYBOARD_FLAGS.contains(F::REPORT_ALTERNATE_KEYS));
         assert!(!KEYBOARD_FLAGS.contains(F::REPORT_ALL_KEYS_AS_ESCAPE_CODES));
+    }
+
+    #[test]
+    fn what_was_typed_during_a_slow_step_is_dropped_but_resizes_and_ctrl_c_are_kept() {
+        use ratatui::crossterm::event::KeyEvent;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let key = |code, modifiers| TermEvent::Key(KeyEvent::new(code, modifiers));
+        for c in "hunter2".chars() {
+            tx.send(key(KeyCode::Char(c), KeyModifiers::NONE)).unwrap();
+        }
+        tx.send(key(KeyCode::Enter, KeyModifiers::NONE)).unwrap();
+        tx.send(TermEvent::Paste("hunter2".into())).unwrap();
+        tx.send(TermEvent::Resize(90, 30)).unwrap();
+        tx.send(key(KeyCode::Char('c'), KeyModifiers::CONTROL)).unwrap();
+        let kept = typed_ahead(&mut rx);
+        assert!(matches!(kept[..], [Msg::Resize(90, 30), Msg::Key(k)] if k.code == KeyCode::Char('c')), "{kept:?}");
+        assert!(rx.try_recv().is_err(), "nothing is left to read");
     }
 
     #[test]

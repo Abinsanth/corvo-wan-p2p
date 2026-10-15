@@ -32,6 +32,8 @@ use super::state::{APP, MAX_INPUT_ROWS, Screen, Secret, State, Tab, Tone};
 pub const MIN_WIDTH: u16 = 40;
 pub const MIN_HEIGHT: u16 = 12;
 pub const TOO_SMALL: &str = "make the window bigger";
+/// Instead of the 12 words, when they don't all fit.
+pub const BIGGER_FOR_WORDS: &str = "make the window bigger for your words";
 /// Rows that aren't the chat area or the input: tabs, flash, the input's border, status.
 const FIXED_ROWS: u16 = 4;
 /// Before the input's first row, and the space before its others.
@@ -255,29 +257,61 @@ fn draw_onboarding(frame: &mut Frame, state: &State, onboarding: &Onboarding, ar
     let title = format!(" {APP} {VERSION}");
     frame.render_widget(Paragraph::new(title).style(Style::new().add_modifier(Modifier::BOLD)), Rect::new(0, 0, w, 1));
     let body = Rect::new(1, 2, w - 2, h - 5);
-    let mut lines: Vec<TextLine> = onboarding.guidance().iter().map(|l| TextLine::from(one_line(l))).collect();
-    if let Some(words) = onboarding.words() {
-        lines.push(TextLine::default());
-        lines.extend(word_grid(&words, body.width).into_iter().map(TextLine::from));
+    let plain = |text: &String| (text.clone(), Style::new());
+    let guidance: Vec<(String, Style)> = onboarding.guidance().iter().map(plain).collect();
+    let mut notes: Vec<(String, Style)> = onboarding.notes.iter().map(|n| (n.text.clone(), tone(n.tone))).collect();
+    if !notes.is_empty() {
+        notes.insert(0, (String::new(), Style::new()));
     }
-    if !onboarding.notes.is_empty() {
-        lines.push(TextLine::default());
-        lines.extend(onboarding.notes.iter().map(|n| TextLine::styled(one_line(&n.text), tone(n.tone))));
-    }
-    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), body);
+    let lines = match onboarding.words() {
+        None => [guidance, notes].concat(),
+        Some(words) => {
+            let grid: Vec<(String, Style)> = word_grid(&words, body.width).iter().map(plain).collect();
+            let blank = vec![(String::new(), Style::new())];
+            let all = [guidance.clone(), blank, grid.clone(), notes.clone()].concat();
+            if text_rows(&all, body.width) <= body.height.into() {
+                all
+            } else if grid.len() <= body.height.into() {
+                // The words matter most: they go first, and the rest as fits.
+                [grid, notes, guidance].concat()
+            } else {
+                [vec![(BIGGER_FOR_WORDS.to_string(), tone(Tone::Warn))], notes, guidance].concat()
+            }
+        }
+    };
+    let rows: Vec<TextLine> = lines
+        .iter()
+        .flat_map(|(text, style)| {
+            wrap(&one_line(text), body.width.into()).into_iter().map(|r| TextLine::styled(r, *style))
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(rows), body);
     draw_flash(frame, state, Rect::new(0, h - 3, w, 1));
     frame.render_widget(Block::new().borders(Borders::TOP).border_style(dim()), Rect::new(0, h - 2, w, 1));
     draw_input(frame, state, Rect::new(0, h - 1, w, 1));
+}
+
+/// How many rows `lines` take at `width`, wrapped.
+fn text_rows(lines: &[(String, Style)], width: u16) -> usize {
+    lines.iter().map(|(text, _)| wrap(&one_line(text), width.into()).len()).sum()
 }
 
 /// Your 12 words over the chat, from `/phrase`.
 fn draw_reveal(frame: &mut Frame, words: &Secret, area: Rect) {
     let words: Vec<&str> = words.expose().split_whitespace().collect();
     let block = Block::bordered().title(" your recovery words ");
-    let mut lines = vec![TextLine::from("Your 12 recovery words:"), TextLine::default()];
-    lines.extend(word_grid(&words, block.inner(area).width).into_iter().map(TextLine::from));
-    lines.push(TextLine::default());
-    lines.push(TextLine::styled("press any key to hide them", dim()));
+    let inner = block.inner(area);
+    let grid: Vec<TextLine> = word_grid(&words, inner.width).into_iter().map(TextLine::from).collect();
+    let hint = TextLine::styled("press any key to hide them", dim());
+    let fits = |rows: usize| rows <= inner.height.into();
+    let lines = if fits(grid.len() + 4) {
+        [vec![TextLine::from("Your 12 recovery words:"), TextLine::default()], grid, vec![TextLine::default(), hint]]
+            .concat()
+    } else if fits(grid.len() + 1) {
+        [grid, vec![hint]].concat()
+    } else {
+        vec![TextLine::styled(BIGGER_FOR_WORDS, tone(Tone::Warn)), hint]
+    };
     frame.render_widget(Clear, area);
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
@@ -681,6 +715,30 @@ mod tests {
         assert!(screen(&render(&state, 80, 24)).contains("press any key"));
         update(&mut state, Msg::Key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE)));
         assert!(!shows_words(&render(&state, 80, 24), &seed), "gone after a key");
+    }
+
+    #[test]
+    fn the_words_are_never_cut_off() {
+        let mut onboarding = State::onboarding(Onboarding::start(false, false));
+        for answer in ["n", "ana", "pw", "pw"] {
+            send(&mut onboarding, answer);
+        }
+        let Screen::Onboarding(o) = &onboarding.screen else { panic!() };
+        let seed = Seed::from_phrase(&o.words().unwrap().join(" ")).unwrap();
+        let mut main = busy_state();
+        main.reveal = Some(Secret::new(seed.phrase()));
+        for w in MIN_WIDTH..=120 {
+            for h in MIN_HEIGHT..=40 {
+                for state in [&onboarding, &main] {
+                    let buf = render(state, w, h);
+                    assert!(
+                        shows_all_words(&buf, &seed) || screen(&buf).contains(BIGGER_FOR_WORDS),
+                        "{w}×{h}:\n{}",
+                        screen(&buf)
+                    );
+                }
+            }
+        }
     }
 
     #[test]

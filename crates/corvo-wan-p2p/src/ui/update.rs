@@ -68,7 +68,7 @@ pub enum Effect {
 
 impl Effect {
     /// What to show while it runs, for the ones that take a moment.
-    fn busy(&self) -> Option<&'static str> {
+    pub fn busy(&self) -> Option<&'static str> {
         Some(match self {
             Effect::Unlock(_) => "unlocking…",
             Effect::Create { .. } => "making your account…",
@@ -147,6 +147,8 @@ fn action_for(key: KeyEvent) -> Option<Action> {
         KeyCode::Char('w') if ctrl => Action::KillWord,
         KeyCode::Char('j') if ctrl => Action::Newline,
         KeyCode::Char(c @ '1'..='9') if alt => Action::GoTab(c as usize - '1' as usize),
+        // Windows reports AltGr chords, like @ on a German keyboard, as Ctrl+Alt.
+        KeyCode::Char(c) if ctrl && alt => Action::Insert(c),
         KeyCode::Char(_) if ctrl || alt => return None,
         KeyCode::Char(c) => Action::Insert(c),
         KeyCode::Backspace => Action::Backspace,
@@ -176,6 +178,13 @@ pub fn update(state: &mut State, msg: Msg) -> Vec<Effect> {
             if let Some(action) = action_for(key) {
                 on_action(state, action, &mut effects);
             }
+        }
+        Msg::Paste(_) if state.reveal.is_some() => state.reveal = None,
+        // An answer is one line: a passphrase copied with its line break still
+        // works, and words pasted one per line become one line.
+        Msg::Paste(text) if state.ask().is_some() => {
+            let text = text.trim_end_matches(['\r', '\n']).replace("\r\n", " ").replace(['\r', '\n'], " ");
+            state.editor.insert_str(&text);
         }
         Msg::Paste(text) => state.editor.insert_str(&text),
         Msg::Mouse(mouse) => match mouse.kind {

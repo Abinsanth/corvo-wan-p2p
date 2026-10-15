@@ -16,15 +16,17 @@
 use std::iter::Peekable;
 use std::str::Chars;
 
+use corvo_wan_p2p_core::VERSION;
 use corvo_wan_p2p_core::identity::is_invisible;
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line as TextLine, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use super::state::{MAX_INPUT_ROWS, State, Tab, Tone};
+use super::onboarding::Onboarding;
+use super::state::{APP, MAX_INPUT_ROWS, Screen, Secret, State, Tab, Tone};
 
 /// Smaller than this, only [`TOO_SMALL`] is drawn.
 pub const MIN_WIDTH: u16 = 40;
@@ -34,6 +36,10 @@ pub const TOO_SMALL: &str = "make the window bigger";
 const FIXED_ROWS: u16 = 4;
 /// Before the input's first row, and the space before its others.
 const PROMPT: &str = "> ";
+/// How a masked answer's characters show.
+const MASK: char = '•';
+/// Columns for one of the 12 words: `12. ` and the longest word, 8 letters, then a gap.
+const WORD_CELL: usize = 14;
 
 /// Where each part of the screen goes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -184,8 +190,26 @@ pub fn wrap(text: &str, width: usize) -> Vec<String> {
     rows
 }
 
+/// The 12 words in numbered columns, as many as fit in `width` (2 to 4),
+/// numbered down each column.
+pub fn word_grid(words: &[&str], width: u16) -> Vec<String> {
+    let cols = (usize::from(width) / WORD_CELL).clamp(2, 4);
+    let rows = words.len().div_ceil(cols);
+    (0..rows)
+        .map(|r| {
+            let cells = (0..cols).filter_map(|c| words.get(c * rows + r).map(|w| (c * rows + r + 1, w)));
+            let row: String = cells.map(|(n, w)| format!("{n:>2}. {w:<width$}", width = WORD_CELL - 4)).collect();
+            row.trim_end().to_string()
+        })
+        .collect()
+}
+
 pub fn draw(frame: &mut Frame, state: &State) {
     let area = frame.area();
+    if let Screen::Onboarding(onboarding) = &state.screen {
+        draw_onboarding(frame, state, onboarding, area);
+        return;
+    }
     let Some(areas) = areas((area.width, area.height), input_rows(state)) else {
         frame.render_widget(Paragraph::new(TOO_SMALL).wrap(Wrap { trim: true }), area);
         return;
@@ -193,12 +217,69 @@ pub fn draw(frame: &mut Frame, state: &State) {
     draw_tabs(frame, state, areas.tabs);
     draw_sidebar(frame, state, areas.sidebar);
     draw_chat(frame, state, areas.chat);
-    if let Some(flash) = &state.flash {
-        frame.render_widget(Paragraph::new(clean(&flash.line.text)).style(tone(flash.line.tone)), areas.flash);
+    if let Some(words) = &state.reveal {
+        let body = Rect::new(0, areas.sidebar.y, area.width, areas.sidebar.height);
+        draw_reveal(frame, words, body);
     }
+    draw_flash(frame, state, areas.flash);
     frame.render_widget(Block::new().borders(Borders::TOP).border_style(dim()), areas.border);
     draw_input(frame, state, areas.input);
     draw_status(frame, state, areas.status);
+}
+
+/// What the app is busy with, or else the flash.
+fn draw_flash(frame: &mut Frame, state: &State, area: Rect) {
+    if let Some(busy) = state.busy {
+        frame.render_widget(Paragraph::new(busy).style(tone(Tone::Warn)), area);
+    } else if let Some(flash) = &state.flash {
+        frame.render_widget(Paragraph::new(clean(&flash.line.text)).style(tone(flash.line.tone)), area);
+    }
+}
+
+/// ```text
+///  corvo-wan-p2p 0.1.0                      title
+///                                           
+///  Choose a passphrase. It locks…           what this step says
+///   1. abandon      7. about                the words, when shown
+///  those didn't match                       notes
+/// unlocking…                                busy
+/// ────────────────────────────────────────
+/// passphrase: ••••_                         the question
+/// ```
+fn draw_onboarding(frame: &mut Frame, state: &State, onboarding: &Onboarding, area: Rect) {
+    let (w, h) = (area.width, area.height);
+    if w < MIN_WIDTH || h < MIN_HEIGHT {
+        frame.render_widget(Paragraph::new(TOO_SMALL).wrap(Wrap { trim: true }), area);
+        return;
+    }
+    let title = format!(" {APP} {VERSION}");
+    frame.render_widget(Paragraph::new(title).style(Style::new().add_modifier(Modifier::BOLD)), Rect::new(0, 0, w, 1));
+    let body = Rect::new(1, 2, w - 2, h - 5);
+    let mut lines: Vec<TextLine> = onboarding.guidance().iter().map(|l| TextLine::from(one_line(l))).collect();
+    if let Some(words) = onboarding.words() {
+        lines.push(TextLine::default());
+        lines.extend(word_grid(&words, body.width).into_iter().map(TextLine::from));
+    }
+    if !onboarding.notes.is_empty() {
+        lines.push(TextLine::default());
+        lines.extend(onboarding.notes.iter().map(|n| TextLine::styled(one_line(&n.text), tone(n.tone))));
+    }
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), body);
+    draw_flash(frame, state, Rect::new(0, h - 3, w, 1));
+    frame.render_widget(Block::new().borders(Borders::TOP).border_style(dim()), Rect::new(0, h - 2, w, 1));
+    draw_input(frame, state, Rect::new(0, h - 1, w, 1));
+}
+
+/// Your 12 words over the chat, from `/phrase`.
+fn draw_reveal(frame: &mut Frame, words: &Secret, area: Rect) {
+    let words: Vec<&str> = words.expose().split_whitespace().collect();
+    let block = Block::bordered().title(" your recovery words ");
+    let mut lines = vec![TextLine::from("Your 12 recovery words:"), TextLine::default()];
+    lines.extend(word_grid(&words, block.inner(area).width).into_iter().map(TextLine::from));
+    lines.push(TextLine::default());
+    lines.push(TextLine::styled("press any key to hide them", dim()));
+    frame.render_widget(Clear, area);
+    frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
 fn dim() -> Style {
@@ -275,28 +356,43 @@ fn draw_chat(frame: &mut Frame, state: &State, area: Rect) {
 }
 
 /// Your own typing, drawn one character per character so the cursor lines up:
-/// anything that isn't safe to draw shows as �.
-fn shown_char(c: char) -> char {
-    if c.is_control() || is_invisible(c) { '\u{FFFD}' } else { c }
+/// anything that isn't safe to draw shows as �, and all of a masked answer as •.
+fn shown_char(c: char, masked: bool) -> char {
+    if masked {
+        MASK
+    } else if c.is_control() || is_invisible(c) {
+        '\u{FFFD}'
+    } else {
+        c
+    }
 }
 
 fn draw_input(frame: &mut Frame, state: &State, area: Rect) {
+    let ask = state.ask();
+    let (prompt, masked) = ask.as_ref().map_or((PROMPT, false), |a| (a.label.as_str(), a.masked));
+    let prompt_w = prompt.width();
     let editor = &state.editor;
     if editor.is_empty() {
-        let hint = if state.on_corvo() { "/help lists commands" } else { "type a message" };
-        let line = TextLine::from(vec![Span::raw(PROMPT), Span::styled(hint, dim())]);
+        let hint = match ask {
+            Some(_) => "",
+            None if state.on_corvo() => "/help lists commands",
+            None => "type a message",
+        };
+        let line = TextLine::from(vec![Span::raw(prompt), Span::styled(hint, dim())]);
         frame.render_widget(Paragraph::new(line), area);
-        frame.set_cursor_position(Position::new(area.x + PROMPT.len() as u16, area.y));
+        let x = (area.x as usize + prompt_w).min(area.right().saturating_sub(1) as usize);
+        frame.set_cursor_position(Position::new(x as u16, area.y));
         return;
     }
     let visible = area.height as usize;
     let (cursor_row, cursor_col) = editor.cursor_pos();
     let first = cursor_row.saturating_sub(visible.saturating_sub(1));
-    let room = (area.width as usize).saturating_sub(PROMPT.len() + 1).max(1);
+    let room = (area.width as usize).saturating_sub(prompt_w + 1).max(1);
+    let indent = " ".repeat(prompt_w);
     let mut lines = Vec::new();
     for (i, row) in editor.rows().into_iter().enumerate().skip(first).take(visible) {
-        let chars: Vec<char> = row.chars().map(shown_char).collect();
-        let lead = if i == 0 { PROMPT } else { "  " };
+        let chars: Vec<char> = row.chars().map(|c| shown_char(c, masked)).collect();
+        let lead = if i == 0 { prompt } else { indent.as_str() };
         let mut skip = 0;
         if i == cursor_row {
             // Keeps the cursor in view on a row wider than the box.
@@ -304,7 +400,7 @@ fn draw_input(frame: &mut Frame, state: &State, area: Rect) {
                 skip += 1;
             }
             let x: usize = chars[skip..cursor_col].iter().map(|c| c.width().unwrap_or(0)).sum();
-            let x = (area.x as usize + PROMPT.len() + x).min(area.right().saturating_sub(1) as usize);
+            let x = (area.x as usize + prompt_w + x).min(area.right().saturating_sub(1) as usize);
             frame.set_cursor_position(Position::new(x as u16, area.y + (i - first) as u16));
         }
         lines.push(TextLine::from(format!("{lead}{}", chars[skip..].iter().collect::<String>())));
@@ -328,11 +424,14 @@ fn draw_status(frame: &mut Frame, state: &State, area: Rect) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ui::state::{Line, Peer};
+    use crate::ui::onboarding::Onboarding;
+    use crate::ui::state::{Line, Peer, Screen, Secret};
+    use crate::ui::update::{Msg, update};
     use corvo_wan_p2p_core::identity::Seed;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::buffer::Buffer;
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     #[test]
     fn clean_removes_escapes_controls_and_direction_marks() {
@@ -476,6 +575,129 @@ mod tests {
                         render(&state, w, h);
                     }
                 }
+            }
+        }
+    }
+
+    fn screen(buf: &Buffer) -> String {
+        (0..buf.area.height).map(|y| row(buf, y)).collect::<Vec<_>>().join("\n")
+    }
+
+    fn typed(state: &mut State, text: &str) {
+        for c in text.chars() {
+            update(state, Msg::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)));
+        }
+    }
+
+    fn send(state: &mut State, text: &str) {
+        typed(state, text);
+        update(state, Msg::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
+    }
+
+    /// True if the screen shows any of `seed`'s words numbered, as the word list does.
+    fn shows_words(buf: &Buffer, seed: &Seed) -> bool {
+        let screen = screen(buf);
+        seed.words().iter().enumerate().any(|(i, w)| screen.contains(&format!("{}. {w}", i + 1)))
+    }
+
+    fn shows_all_words(buf: &Buffer, seed: &Seed) -> bool {
+        let screen = screen(buf);
+        seed.words().iter().enumerate().all(|(i, w)| screen.contains(&format!("{}. {w}", i + 1)))
+    }
+
+    #[test]
+    fn the_onboarding_screen_shows_guidance_notes_and_the_question() {
+        let mut state = State::onboarding(Onboarding::start(false, false));
+        send(&mut state, "what");
+        let buf = render(&state, 80, 24);
+        assert!(row(&buf, 0).contains("corvo-wan-p2p"));
+        let all = screen(&buf);
+        assert!(all.contains("There's no account on this computer yet"));
+        assert!(all.contains("type n for a new account"), "the note about the wrong answer");
+        assert!(row(&buf, 23).starts_with("n or r: "), "{:?}", row(&buf, 23));
+    }
+
+    #[test]
+    fn busy_shows_above_the_input() {
+        let mut state = State::onboarding(Onboarding::start(true, false));
+        state.busy = Some("unlocking…");
+        assert!(row(&render(&state, 80, 24), 21).starts_with("unlocking…"));
+        let mut state = busy_state();
+        state.busy = Some("checking your passphrase…");
+        assert!(row(&render(&state, 80, 24), 20).starts_with("checking your passphrase…"));
+    }
+
+    #[test]
+    fn passphrases_never_appear_on_screen() {
+        let secret = "hunter2-secret";
+        let mut state = State::onboarding(Onboarding::start(false, false));
+        send(&mut state, "n");
+        send(&mut state, "ana");
+        typed(&mut state, secret);
+        let buf = render(&state, 80, 24);
+        assert!(!screen(&buf).contains("hunter2"));
+        assert!(row(&buf, 23).starts_with(&format!("passphrase: {}", "•".repeat(secret.len()))));
+        update(&mut state, Msg::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
+        typed(&mut state, secret);
+        assert!(!screen(&render(&state, 80, 24)).contains("hunter2"));
+
+        let mut state = State::onboarding(Onboarding::start(true, false));
+        typed(&mut state, secret);
+        assert!(!screen(&render(&state, 80, 24)).contains("hunter2"));
+        update(&mut state, Msg::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
+        assert!(!screen(&render(&state, 80, 24)).contains("hunter2"));
+
+        let mut state = busy_state();
+        for (command, questions) in [("/passphrase", 3), ("/phrase", 1), ("/phrase copy", 1)] {
+            send(&mut state, command);
+            for _ in 0..questions {
+                typed(&mut state, secret);
+                assert!(!screen(&render(&state, 80, 24)).contains("hunter2"), "{command}");
+                update(&mut state, Msg::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
+                assert!(!screen(&render(&state, 80, 24)).contains("hunter2"), "{command}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_words_show_only_while_they_are_meant_to() {
+        let mut state = State::onboarding(Onboarding::start(false, false));
+        send(&mut state, "n");
+        send(&mut state, "ana");
+        send(&mut state, "pw");
+        assert!(!shows_words(&render(&state, 80, 24), &Seed::generate()));
+        send(&mut state, "pw");
+        let Screen::Onboarding(onboarding) = &state.screen else { panic!() };
+        let seed = Seed::from_phrase(&onboarding.words().unwrap().join(" ")).unwrap();
+        for (w, h) in [(80, 24), (40, 24), (120, 40)] {
+            assert!(shows_all_words(&render(&state, w, h), &seed), "all 12 at {w}×{h}");
+        }
+        send(&mut state, "");
+        assert!(!shows_words(&render(&state, 80, 24), &seed), "hidden while typing them back");
+
+        let mut state = busy_state();
+        state.reveal = Some(Secret::new(seed.phrase()));
+        assert!(shows_all_words(&render(&state, 80, 24), &seed));
+        assert!(screen(&render(&state, 80, 24)).contains("press any key"));
+        update(&mut state, Msg::Key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE)));
+        assert!(!shows_words(&render(&state, 80, 24), &seed), "gone after a key");
+    }
+
+    #[test]
+    fn onboarding_and_the_words_never_panic_at_any_size() {
+        let mut onboarding = State::onboarding(Onboarding::start(false, false));
+        send(&mut onboarding, "n");
+        send(&mut onboarding, "ana");
+        send(&mut onboarding, "pw");
+        send(&mut onboarding, "pw");
+        let mut main = busy_state();
+        main.reveal = Some(Secret::new(Seed::generate().phrase()));
+        send(&mut main, "/phrase");
+        typed(&mut main, "日本語");
+        for w in 1..=120 {
+            for h in 1..=40 {
+                render(&onboarding, w, h);
+                render(&main, w, h);
             }
         }
     }

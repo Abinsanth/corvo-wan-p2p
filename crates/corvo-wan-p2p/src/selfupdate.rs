@@ -391,8 +391,16 @@ mod tests {
         assert_eq!(check_with(&urls, &v("9.0.0")).await.unwrap(), None);
         install_with(&urls, &found, &asset, &target).await.unwrap();
         assert_eq!(fs::read_to_string(&target).unwrap(), "new");
-        let left: Vec<_> = fs::read_dir(bin.path()).unwrap().map(|e| e.unwrap().file_name()).collect();
-        assert_eq!(left.len(), 1, "no temp files left beside it: {left:?}");
+        let mut left: Vec<String> =
+            fs::read_dir(bin.path()).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        left.sort();
+        // Windows can't delete a running exe, so the old one waits beside it
+        // until the next update clears it.
+        let expected = if cfg!(windows) { vec![BIN_NAME, "corvo-wan-p2p.old-0.exe"] } else { vec![BIN_NAME] };
+        assert_eq!(left, expected, "no temp files left beside it");
+        if cfg!(windows) {
+            assert_eq!(fs::read_to_string(bin.path().join("corvo-wan-p2p.old-0.exe")).unwrap(), "old");
+        }
     }
 
     #[tokio::test]

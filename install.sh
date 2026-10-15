@@ -4,8 +4,10 @@
 #   curl -fsSL https://raw.githubusercontent.com/Abinsanth/corvo-wan-p2p/release/install.sh | sh
 #
 # Installs the latest release to ~/.local/bin, or to $CORVO_WAN_P2P_INSTALL_DIR
-# if set. Set CORVO_WAN_P2P_VERSION (like v0.1.0-rc.1) for a particular
-# release, pre-releases included. Never uses sudo.
+# if set, and adds that folder to PATH in your shell's profile (~/.zshrc,
+# ~/.bash_profile or ~/.bashrc) unless CORVO_WAN_P2P_NO_MODIFY_PATH is set.
+# Set CORVO_WAN_P2P_VERSION (like v0.1.0-rc.1) for a particular release,
+# pre-releases included. Never uses sudo.
 set -eu
 
 REPO="Abinsanth/corvo-wan-p2p"
@@ -80,16 +82,49 @@ main() {
     mv -f "$install_dir/.$APP.new" "$install_dir/$APP"
 
     echo "installed $("$install_dir/$APP" --version) to $install_dir"
-    case ":$PATH:" in
-        *":$install_dir:"*) echo "run: $APP" ;;
-        *)
-            echo
-            echo "$install_dir isn't on your PATH. Add this line to your shell profile"
-            echo "(~/.zshrc or ~/.bashrc), then open a new terminal:"
-            echo
-            echo "    export PATH=\"$install_dir:\$PATH\""
+    add_to_path "$install_dir"
+}
+
+# The profile file your shell reads at start, or nothing for shells this
+# script doesn't edit (fish and others).
+profile_file() {
+    case "$(basename "${SHELL:-}")" in
+        zsh) echo "${ZDOTDIR:-$HOME}/.zshrc" ;;
+        bash)
+            # macOS terminals start login shells, which read .bash_profile.
+            if [ "$(uname -s)" = Darwin ]; then echo "$HOME/.bash_profile"; else echo "$HOME/.bashrc"; fi
             ;;
     esac
+}
+
+# Makes `corvo-wan-p2p` work in new terminals: adds the folder to PATH in the
+# shell's profile, once. Skipped with CORVO_WAN_P2P_NO_MODIFY_PATH=1.
+add_to_path() {
+    dir="$1"
+    case ":$PATH:" in
+        *":$dir:"*)
+            echo "run: $APP"
+            return
+            ;;
+    esac
+    line="export PATH=\"$dir:\$PATH\""
+    profile="$(profile_file)"
+    if [ -n "$profile" ] && [ -f "$profile" ] && grep -qF "$dir" "$profile"; then
+        echo "$dir is already in $profile: open a new terminal, then run: $APP"
+        return
+    fi
+    if [ -z "${CORVO_WAN_P2P_NO_MODIFY_PATH:-}" ] && [ -n "$profile" ] &&
+        printf '\n# added by the %s installer\n%s\n' "$APP" "$line" >> "$profile" 2> /dev/null; then
+        echo
+        echo "added $dir to your PATH in $profile."
+        echo "Open a new terminal (or run: . \"$profile\"), then run: $APP"
+        return
+    fi
+    echo
+    echo "$dir isn't on your PATH. Add this line to your shell profile"
+    echo "(~/.zshrc or ~/.bashrc), then open a new terminal:"
+    echo
+    echo "    $line"
 }
 
 main "$@"

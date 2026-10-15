@@ -84,7 +84,8 @@ jobs:
           $hash = (Get-FileHash -Algorithm SHA256 "$env:NAME.zip").Hash.ToLower()
           Set-Content -NoNewline -Path "$env:NAME.zip.sha256" -Value "$hash  $env:NAME.zip`n"
       # install.sh end to end against this build, served locally: a fresh
-      # install into a path with a space, then a reinstall over it.
+      # install into a path with a space, then a reinstall over it, adding
+      # the folder to the shell profile once.
       - name: Try install.sh
         if: runner.os != 'Windows' && matrix.target != 'x86_64-apple-darwin'
         env:
@@ -99,10 +100,16 @@ jobs:
           for _ in $(seq 30); do curl -fs "http://127.0.0.1:8765/$NAME.tar.gz.sha256" > /dev/null && break; sleep 0.5; done
           export CORVO_WAN_P2P_BASE_URL=http://127.0.0.1:8765
           export CORVO_WAN_P2P_INSTALL_DIR="$RUNNER_TEMP/corvo wan bin"
+          # A throwaway home, so the profile it edits is this test's.
+          export HOME="$RUNNER_TEMP/home" SHELL=/bin/bash
+          mkdir -p "$HOME"
           sh install.sh
           "$CORVO_WAN_P2P_INSTALL_DIR/corvo-wan-p2p" --version
           sh install.sh
           "$CORVO_WAN_P2P_INSTALL_DIR/corvo-wan-p2p" --version
+          if [ "$RUNNER_OS" = macOS ]; then profile="$HOME/.bash_profile"; else profile="$HOME/.bashrc"; fi
+          test "$(grep -c "export PATH=\"$CORVO_WAN_P2P_INSTALL_DIR:" "$profile")" = 1
+          test "$(bash -c ". '$profile'; command -v corvo-wan-p2p")" = "$CORVO_WAN_P2P_INSTALL_DIR/corvo-wan-p2p"
       # install.ps1 end to end against this build, served locally: a fresh
       # install into a path with a space, then a reinstall while the exe is
       # held open the way a running corvo-wan-p2p holds it.

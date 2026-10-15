@@ -2,6 +2,7 @@
 //! cleanly on every exit, including panics. One loop merges terminal input, a
 //! tick and messages from elsewhere, feeds them to `update` and draws.
 
+pub mod account;
 pub mod commands;
 pub mod onboarding;
 pub mod state;

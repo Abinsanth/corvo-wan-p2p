@@ -9,6 +9,7 @@ use corvo_wan_p2p_core::identity::{Code, Seed};
 use corvo_wan_p2p_core::store::StoreError;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind};
 
+use super::account::{self, PhraseDone, PhraseUse};
 use super::commands::{Cmd, HELP, Input, KEYS, parse};
 use super::state::{APP, Screen, Secret, State, Tone, WHEEL_STEP};
 use super::view::chat_page;
@@ -54,6 +55,15 @@ pub enum Effect {
         seed: Seed,
         overwrite: bool,
     },
+    ChangePassphrase {
+        old: Secret,
+        new: Secret,
+    },
+    /// Check the passphrase, then do `then` with the words.
+    Phrase {
+        passphrase: Secret,
+        then: PhraseUse,
+    },
 }
 
 impl Effect {
@@ -64,6 +74,8 @@ impl Effect {
             Effect::Create { .. } => "making your account…",
             Effect::Start => "starting…",
             Effect::Wipe => "deleting…",
+            Effect::ChangePassphrase { .. } => "changing your passphrase…",
+            Effect::Phrase { .. } => "checking your passphrase…",
             _ => return None,
         })
     }
@@ -86,6 +98,8 @@ pub enum Outcome {
     /// Where the recovery file is, if it's there.
     RecoveryFile(Option<PathBuf>),
     RecoveryWritten(Result<PathBuf, String>),
+    PassphraseChanged(Result<(), String>),
+    Phrase(Result<PhraseDone, String>),
     /// Something that leaves the app unusable, like the engine not starting.
     Fatal(String),
 }
@@ -156,6 +170,8 @@ fn action_for(key: KeyEvent) -> Option<Action> {
 pub fn update(state: &mut State, msg: Msg) -> Vec<Effect> {
     let mut effects = Vec::new();
     match msg {
+        // A key while the words are up only hides them.
+        Msg::Key(key) if state.reveal.is_some() && key.kind != KeyEventKind::Release => state.reveal = None,
         Msg::Key(key) => {
             if let Some(action) = action_for(key) {
                 on_action(state, action, &mut effects);
@@ -206,6 +222,8 @@ fn on_action(state: &mut State, action: Action, effects: &mut Vec<Effect>) {
             let line = editor.take();
             if let Screen::Onboarding(onboarding) = &mut state.screen {
                 effects.extend(onboarding.answer(Secret::new(line), editor));
+            } else if asking {
+                effects.extend(account::answer(state, Secret::new(line)));
             } else {
                 state.history.push(&line);
                 on_line(state, &line, effects);
@@ -250,6 +268,7 @@ fn on_action(state: &mut State, action: Action, effects: &mut Vec<Effect>) {
             let (total, height) = chat_page(state);
             state.scroll.page_down(total, height);
         }
+        Action::Esc if editor.is_empty() && state.pending.is_some() => account::cancel(state),
         Action::Esc if editor.is_empty() => state.scroll.follow_end(),
         Action::Esc => editor.clear(),
     }
@@ -278,6 +297,7 @@ fn on_command(state: &mut State, cmd: Cmd, effects: &mut Vec<Effect>) {
             state.select_tab(0);
         }
         Cmd::Clear => state.clear_tab(),
+        cmd @ (Cmd::Passphrase | Cmd::Phrase | Cmd::PhraseSave | Cmd::PhraseCopy) => account::begin(state, cmd),
         Cmd::Quit => effects.push(Effect::Quit),
         Cmd::Close => {
             if !state.close_tab() {
@@ -306,7 +326,7 @@ fn on_done(state: &mut State, outcome: Outcome, effects: &mut Vec<Effect>) {
         Outcome::Fatal(why) => effects.push(Effect::Exit(why)),
         other => match &mut state.screen {
             Screen::Onboarding(onboarding) => effects.extend(onboarding.done(other)),
-            Screen::Main => {}
+            Screen::Main => effects.extend(account::done(state, other)),
         },
     }
 }
@@ -542,8 +562,8 @@ mod tests {
         assert_eq!(s.flash.as_ref().unwrap().line, *last_corvo(&s));
         send(&mut s, "/contacts");
         assert_eq!(last_corvo(&s).text, "/contacts isn't available yet");
-        send(&mut s, "/phrase save");
-        assert_eq!(last_corvo(&s).text, "/phrase save isn't available yet");
+        send(&mut s, "/blocked");
+        assert_eq!(last_corvo(&s).text, "/blocked isn't available yet");
         send(&mut s, "hello");
         assert!(last_corvo(&s).text.starts_with("this is the corvo tab"));
         let before = s.tabs[0].lines.len();

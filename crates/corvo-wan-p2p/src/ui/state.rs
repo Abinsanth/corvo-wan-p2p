@@ -7,6 +7,7 @@ use std::fmt;
 use corvo_wan_p2p_core::identity::Code;
 use zeroize::Zeroizing;
 
+use super::account::Pending;
 use super::onboarding::Onboarding;
 
 pub const APP: &str = "corvo-wan-p2p";
@@ -362,6 +363,10 @@ pub struct State {
     pub title: String,
     /// What the app is doing while it can't take input, like "unlocking…".
     pub busy: Option<&'static str>,
+    /// A command asking its questions in the input box.
+    pub pending: Option<Pending>,
+    /// Your 12 words, shown over the chat until a key is pressed.
+    pub reveal: Option<Secret>,
 }
 
 impl State {
@@ -382,6 +387,8 @@ impl State {
             size: (80, 24),
             title: String::new(),
             busy: None,
+            pending: None,
+            reveal: None,
         }
     }
 
@@ -394,7 +401,7 @@ impl State {
     pub fn ask(&self) -> Option<Ask> {
         match &self.screen {
             Screen::Onboarding(onboarding) => Some(onboarding.ask()),
-            Screen::Main => None,
+            Screen::Main => self.pending.as_ref().map(Pending::ask),
         }
     }
 

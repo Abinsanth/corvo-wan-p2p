@@ -55,6 +55,15 @@ pub struct Ask {
     pub masked: bool,
 }
 
+/// Completion choices shown above the input.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Popup {
+    pub matches: Vec<String>,
+    pub selected: usize,
+    /// Byte offset in the input where the word being completed starts.
+    pub start: usize,
+}
+
 /// Which screen is up: the ones before the chat, or the chat itself.
 pub enum Screen {
     Onboarding(Onboarding),
@@ -89,6 +98,16 @@ impl Editor {
     pub fn take(&mut self) -> String {
         self.cursor = 0;
         std::mem::take(&mut self.text)
+    }
+
+    pub fn before_cursor(&self) -> &str {
+        &self.text[..self.cursor]
+    }
+
+    /// Replaces the text from `start` (a byte offset) to the cursor.
+    pub fn replace_before_cursor(&mut self, start: usize, with: &str) {
+        self.text.replace_range(start..self.cursor, with);
+        self.cursor = start + with.len();
     }
 
     pub fn insert(&mut self, c: char) {
@@ -391,6 +410,8 @@ pub struct State {
     pub focused: bool,
     /// Ticks since the engine started, to wait a little before saying "offline".
     pub since_start: u32,
+    /// The completion list, while open.
+    pub popup: Option<Popup>,
 }
 
 impl State {
@@ -419,6 +440,7 @@ impl State {
             chats: HashMap::new(),
             focused: true,
             since_start: 0,
+            popup: None,
         }
     }
 

@@ -12,6 +12,7 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, M
 use super::account::{self, PhraseDone, PhraseUse};
 use super::chat::{self, Loaded};
 use super::commands::{Cmd, HELP, Input, KEYS, parse};
+use super::complete;
 use super::people::{self, Act, Show};
 use super::state::{Screen, Secret, State, Tone, WHEEL_STEP};
 use super::view::chat_page;
@@ -168,6 +169,14 @@ enum Action {
     KillWord,
     Clear,
     Quit,
+    Complete,
+}
+
+impl Action {
+    /// Changes the text being typed.
+    fn edits(self) -> bool {
+        matches!(self, Action::Insert(_) | Action::Backspace | Action::Delete | Action::KillRow | Action::KillWord)
+    }
 }
 
 /// Shift+Enter needs a terminal that reports it; Alt+Enter and Ctrl-J work everywhere.
@@ -202,6 +211,7 @@ fn action_for(key: KeyEvent) -> Option<Action> {
         KeyCode::Up => Action::Up,
         KeyCode::Down => Action::Down,
         KeyCode::BackTab => Action::NextTab,
+        KeyCode::Tab => Action::Complete,
         KeyCode::PageUp => Action::PageUp,
         KeyCode::PageDown => Action::PageDown,
         KeyCode::Esc => Action::Esc,
@@ -226,7 +236,10 @@ pub fn update(state: &mut State, msg: Msg) -> Vec<Effect> {
             let text = text.trim_end_matches(['\r', '\n']).replace("\r\n", " ").replace(['\r', '\n'], " ");
             state.editor.insert_str(&text);
         }
-        Msg::Paste(text) => state.editor.insert_str(&text),
+        Msg::Paste(text) => {
+            state.popup = None;
+            state.editor.insert_str(&text);
+        }
         Msg::Mouse(mouse) => match mouse.kind {
             MouseEventKind::ScrollUp => scroll_by(state, -(WHEEL_STEP as isize)),
             MouseEventKind::ScrollDown => scroll_by(state, WHEEL_STEP as isize),
@@ -267,6 +280,26 @@ fn scroll_by(state: &mut State, delta: isize) {
 }
 
 fn on_action(state: &mut State, action: Action, effects: &mut Vec<Effect>) {
+    if state.popup.is_some() {
+        match action {
+            Action::Complete | Action::Down => return complete::step(state, 1),
+            Action::Up => return complete::step(state, -1),
+            Action::Send => return complete::accept(state),
+            Action::Esc => {
+                state.popup = None;
+                return;
+            }
+            a if a.edits() => {}
+            _ => state.popup = None,
+        }
+    }
+    on_key(state, action, effects);
+    if action.edits() {
+        complete::refresh(state);
+    }
+}
+
+fn on_key(state: &mut State, action: Action, effects: &mut Vec<Effect>) {
     let asking = state.ask().is_some();
     let editor = &mut state.editor;
     match action {
@@ -281,8 +314,9 @@ fn on_action(state: &mut State, action: Action, effects: &mut Vec<Effect>) {
                 on_line(state, &line, effects);
             }
         }
-        // An answer is one line, and earlier lines aren't answers.
-        Action::Newline | Action::Up | Action::Down if asking => {}
+        // An answer is one line, earlier lines aren't answers, and nothing in it completes.
+        Action::Newline | Action::Up | Action::Down | Action::Complete if asking => {}
+        Action::Complete => complete::tab(state),
         Action::Quit => effects.push(Effect::Quit),
         Action::Clear => state.clear_tab(),
         Action::Newline => editor.newline(),

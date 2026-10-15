@@ -64,20 +64,43 @@ pub(crate) fn private_file() -> OpenOptions {
 /// Writes `bytes` beside `path` and renames, so a crash never leaves a
 /// half-written file. The result is private (see [`private_file`]).
 pub(crate) fn write_private_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    write_private_atomic_with(path, bytes, |_| Ok(()))
+}
+
+/// Like [`write_private_atomic`], but runs `prepare` on the temp file while
+/// it's still empty, before `bytes` go in. If `prepare` fails, nothing is
+/// written and the temp file is removed.
+pub(crate) fn write_private_atomic_with(
+    path: &Path,
+    bytes: &[u8],
+    prepare: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
     let mut tmp = path.as_os_str().to_owned();
     tmp.push(".tmp");
     let tmp = PathBuf::from(tmp);
     // A leftover temp file would keep its old mode, so always start fresh.
-    match fs::remove_file(&tmp) {
-        Ok(()) => {}
-        Err(e) if e.kind() == ErrorKind::NotFound => {}
-        Err(e) => return Err(e),
-    }
+    remove_if_present(&tmp)?;
+    // Written through the handle that created it, so the bytes go into the
+    // very file `prepare` saw, whatever happens to the path meanwhile.
     let mut file = private_file().create_new(true).open(&tmp)?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
+    let written = prepare(&tmp).and_then(|()| {
+        file.write_all(bytes)?;
+        file.sync_all()
+    });
     drop(file);
+    if let Err(e) = written {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
     fs::rename(&tmp, path)
+}
+
+fn remove_if_present(path: &Path) -> std::io::Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
 }
 
 #[cfg(test)]

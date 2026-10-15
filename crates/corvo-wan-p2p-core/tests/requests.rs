@@ -66,7 +66,7 @@ async fn a_stranger_who_says_nothing_is_not_a_request() {
     let (mut send, _recv, theirs) = fake.hello(a.code, PROTO_VERSION).await.expect("strangers get a hello");
     assert!(matches!(theirs, Frame::Hello { .. }));
     write_frame(&mut send, &Frame::Name { name: "lurker".into() }).await.unwrap();
-    a.expect_none(QUIET, |e| !matches!(e, Event::Problem(_))).await;
+    a.expect_none(QUIET, |e| !matches!(e, Event::Problem(_) | Event::Network { .. })).await;
     assert!(a.client.people().await.unwrap().is_empty());
 }
 
@@ -101,7 +101,7 @@ async fn a_blocked_contact_sees_you_offline_and_nothing_queued_reaches_them() {
     let mut b = Peer::resume(&lookup, stopped).await;
     let id = b.client.send(ac, "are you there?").await.unwrap();
     b.expect_none(Duration::from_millis(1500), |e| *e == Event::Online(ac)).await;
-    a.expect_none(QUIET, |e| !matches!(e, Event::Problem(_))).await;
+    a.expect_none(QUIET, |e| !matches!(e, Event::Problem(_) | Event::Network { .. })).await;
     assert_eq!(b.client.history(ac).await.unwrap()[0].mark, Mark::Waiting);
 
     // Unblocked, they're a stranger again: their waiting message makes a request.

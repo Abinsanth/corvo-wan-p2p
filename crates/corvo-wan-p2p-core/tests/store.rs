@@ -195,3 +195,24 @@ fn the_same_passphrase_typed_differently_still_opens() {
     drop(Store::create(dir.path(), "caf\u{e9}", FAST, &seed, "abin").unwrap());
     assert_eq!(Store::open(dir.path(), "cafe\u{301}").unwrap().profile().unwrap().seed, seed);
 }
+
+#[test]
+fn the_passphrase_can_be_checked_while_the_store_is_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, _) = new_account(dir.path());
+    assert!(store.check_passphrase("first pass").unwrap());
+    assert!(!store.check_passphrase("first pas").unwrap());
+    assert!(!store.check_passphrase("").unwrap());
+    store.change_passphrase("second pass", FAST).unwrap();
+    assert!(store.check_passphrase("second pass").unwrap());
+    assert!(!store.check_passphrase("first pass").unwrap());
+}
+
+#[test]
+fn another_accounts_key_json_does_not_pass_the_check() {
+    let (mine, theirs) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let (store, _) = new_account(mine.path());
+    drop(new_account(theirs.path()));
+    fs::copy(theirs.path().join(KEY_FILE), mine.path().join(KEY_FILE)).unwrap();
+    assert!(!store.check_passphrase("first pass").unwrap());
+}

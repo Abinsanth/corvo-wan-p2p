@@ -24,6 +24,7 @@ pub const FAST: Config = Config {
     handshake_timeout: Duration::from_secs(5),
     retry_first: Duration::from_millis(200),
     retry_max: Duration::from_secs(1),
+    kdf: KdfParams::FAST_INSECURE,
 };
 
 /// How long a test waits for something before failing.

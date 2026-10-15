@@ -74,6 +74,20 @@ fn a_second_copy_of_the_app_cannot_open_the_same_account() {
 }
 
 #[test]
+fn a_lock_let_go_a_moment_later_is_taken() {
+    // A process started just before (curl, tar) briefly shares the lock's file
+    // until it runs its own program, so the lock can outlive its store by a moment.
+    let dir = tempfile::tempdir().unwrap();
+    let (first, _) = new_account(dir.path());
+    let releasing = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        drop(first);
+    });
+    assert!(Store::open(dir.path(), "first pass").is_ok());
+    releasing.join().unwrap();
+}
+
+#[test]
 fn a_new_name_is_tidied_and_survives_a_restart() {
     let dir = tempfile::tempdir().unwrap();
     let (store, _) = new_account(dir.path());

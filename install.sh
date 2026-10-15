@@ -91,8 +91,19 @@ profile_file() {
     case "$(basename "${SHELL:-}")" in
         zsh) echo "${ZDOTDIR:-$HOME}/.zshrc" ;;
         bash)
-            # macOS terminals start login shells, which read .bash_profile.
-            if [ "$(uname -s)" = Darwin ]; then echo "$HOME/.bash_profile"; else echo "$HOME/.bashrc"; fi
+            if [ "$(uname -s)" != Darwin ]; then
+                echo "$HOME/.bashrc"
+                return
+            fi
+            # macOS terminals start login shells, which read only the first of
+            # these that exists; making a new .bash_profile would hide the others.
+            for f in .bash_profile .bash_login .profile; do
+                if [ -f "$HOME/$f" ]; then
+                    echo "$HOME/$f"
+                    return
+                fi
+            done
+            echo "$HOME/.bash_profile"
             ;;
     esac
 }

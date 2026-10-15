@@ -1,0 +1,492 @@
+//! Every change to the screen's state, one message at a time. It never calls
+//! the engine and draws nothing: it returns [`Effect`]s for the loop to carry
+//! out, and their results come back as messages.
+
+use corvo_wan_p2p_core::chat::Event;
+use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind};
+
+use super::commands::{Cmd, HELP, Input, KEYS, parse};
+use super::state::{APP, State, Tone, WHEEL_STEP};
+use super::view::chat_page;
+
+#[derive(Debug)]
+pub enum Msg {
+    Key(KeyEvent),
+    Paste(String),
+    Mouse(MouseEvent),
+    Resize(u16, u16),
+    /// Four times a second, so flashes go away on time.
+    Tick,
+    Core(Event),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Effect {
+    Quit,
+    SetTitle(String),
+}
+
+/// What a key press means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Action {
+    Send,
+    Newline,
+    Insert(char),
+    Backspace,
+    Delete,
+    Left,
+    Right,
+    Home,
+    End,
+    Up,
+    Down,
+    NextTab,
+    PrevTab,
+    GoTab(usize),
+    PageUp,
+    PageDown,
+    Esc,
+    KillRow,
+    KillWord,
+    Clear,
+    Quit,
+}
+
+/// Shift+Enter needs a terminal that reports it; Alt+Enter and Ctrl-J work everywhere.
+fn action_for(key: KeyEvent) -> Option<Action> {
+    if key.kind == KeyEventKind::Release {
+        return None;
+    }
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+    Some(match key.code {
+        KeyCode::Enter if shift || alt => Action::Newline,
+        KeyCode::Enter => Action::Send,
+        KeyCode::Char('c') if ctrl => Action::Quit,
+        KeyCode::Char('l') if ctrl => Action::Clear,
+        KeyCode::Char('u') if ctrl => Action::KillRow,
+        KeyCode::Char('w') if ctrl => Action::KillWord,
+        KeyCode::Char('j') if ctrl => Action::Newline,
+        KeyCode::Char(c @ '1'..='9') if alt => Action::GoTab(c as usize - '1' as usize),
+        KeyCode::Char(_) if ctrl || alt => return None,
+        KeyCode::Char(c) => Action::Insert(c),
+        KeyCode::Backspace => Action::Backspace,
+        KeyCode::Delete => Action::Delete,
+        KeyCode::Left if alt => Action::PrevTab,
+        KeyCode::Right if alt => Action::NextTab,
+        KeyCode::Left => Action::Left,
+        KeyCode::Right => Action::Right,
+        KeyCode::Home => Action::Home,
+        KeyCode::End => Action::End,
+        KeyCode::Up => Action::Up,
+        KeyCode::Down => Action::Down,
+        KeyCode::BackTab => Action::NextTab,
+        KeyCode::PageUp => Action::PageUp,
+        KeyCode::PageDown => Action::PageDown,
+        KeyCode::Esc => Action::Esc,
+        _ => return None,
+    })
+}
+
+pub fn update(state: &mut State, msg: Msg) -> Vec<Effect> {
+    let mut effects = Vec::new();
+    match msg {
+        Msg::Key(key) => {
+            if let Some(action) = action_for(key) {
+                on_action(state, action, &mut effects);
+            }
+        }
+        Msg::Paste(text) => state.editor.insert_str(&text),
+        Msg::Mouse(mouse) => match mouse.kind {
+            MouseEventKind::ScrollUp => scroll_by(state, -(WHEEL_STEP as isize)),
+            MouseEventKind::ScrollDown => scroll_by(state, WHEEL_STEP as isize),
+            _ => {}
+        },
+        Msg::Resize(w, h) => state.size = (w, h),
+        Msg::Tick => {
+            if let Some(flash) = &mut state.flash {
+                flash.ticks_left = flash.ticks_left.saturating_sub(1);
+                if flash.ticks_left == 0 {
+                    state.flash = None;
+                }
+            }
+        }
+        Msg::Core(event) => on_core(state, event),
+    }
+    let title = APP.to_string();
+    if state.title != title {
+        state.title = title.clone();
+        effects.push(Effect::SetTitle(title));
+    }
+    effects
+}
+
+fn scroll_by(state: &mut State, delta: isize) {
+    let (total, height) = chat_page(state);
+    state.scroll.by(delta, total, height);
+}
+
+fn on_action(state: &mut State, action: Action, effects: &mut Vec<Effect>) {
+    let editor = &mut state.editor;
+    match action {
+        Action::Send => {
+            let line = editor.take();
+            state.history.push(&line);
+            on_line(state, &line, effects);
+        }
+        Action::Quit => effects.push(Effect::Quit),
+        Action::Clear => state.clear_tab(),
+        Action::Newline => editor.newline(),
+        Action::Insert(c) => editor.insert(c),
+        Action::Backspace => editor.backspace(),
+        Action::Delete => editor.delete(),
+        Action::Left => editor.left(),
+        Action::Right => editor.right(),
+        Action::Home => editor.home(),
+        Action::End => editor.end(),
+        Action::KillRow => editor.kill_to_row_start(),
+        Action::KillWord => editor.kill_word(),
+        Action::Up => {
+            if !editor.up()
+                && let Some(entry) = state.history.prev(editor.text())
+            {
+                editor.set(entry);
+            }
+        }
+        Action::Down => {
+            if !editor.down()
+                && let Some(entry) = state.history.next()
+            {
+                editor.set(entry);
+            }
+        }
+        Action::NextTab => state.step_tab(1),
+        Action::PrevTab => state.step_tab(-1),
+        Action::GoTab(i) => state.select_tab(i),
+        Action::PageUp => {
+            let (total, height) = chat_page(state);
+            state.scroll.page_up(total, height);
+        }
+        Action::PageDown => {
+            let (total, height) = chat_page(state);
+            state.scroll.page_down(total, height);
+        }
+        Action::Esc if editor.is_empty() => state.scroll.follow_end(),
+        Action::Esc => editor.clear(),
+    }
+}
+
+/// A line sent with Enter.
+fn on_line(state: &mut State, line: &str, effects: &mut Vec<Effect>) {
+    match parse(line) {
+        Input::Empty => {}
+        Input::Text(_) if state.on_corvo() => {
+            state.say(Tone::Bad, "this is the corvo tab: switch to a chat (Shift-Tab) to send messages")
+        }
+        Input::Text(_) => state.say(Tone::Warn, "sending messages isn't available yet"),
+        Input::Wrong(why) => state.say(Tone::Bad, why),
+        Input::Cmd(cmd) => on_command(state, cmd, effects),
+    }
+}
+
+fn on_command(state: &mut State, cmd: Cmd, effects: &mut Vec<Effect>) {
+    match cmd {
+        Cmd::Help => {
+            for (usage, what) in HELP {
+                state.say(Tone::Plain, format!("{usage:<18} {what}"));
+            }
+            state.say(Tone::Plain, KEYS);
+            state.select_tab(0);
+        }
+        Cmd::Clear => state.clear_tab(),
+        Cmd::Quit => effects.push(Effect::Quit),
+        Cmd::Close => {
+            if !state.close_tab() {
+                state.say(Tone::Bad, "the corvo tab stays open; /quit leaves the app");
+            }
+        }
+        other => state.say(Tone::Warn, format!("{} isn't available yet", other.typed())),
+    }
+}
+
+fn on_core(state: &mut State, event: Event) {
+    match event {
+        Event::Network { online } => state.online = Some(online),
+        Event::Problem(text) => state.say(Tone::Bad, text),
+        // Chats, people and their marks arrive with the chat screens.
+        _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ui::state::{FLASH_TICKS, Line, Tab};
+    use corvo_wan_p2p_core::identity::Seed;
+    use ratatui::crossterm::event::KeyEventState;
+
+    fn state() -> State {
+        let mut state = State::new("ana".into(), "abcdefgh".into());
+        for name in ["rahul", "maria"] {
+            state.tabs.push(Tab::chat(Seed::generate().code(), name.into()));
+        }
+        state
+    }
+
+    fn key(code: KeyCode, modifiers: KeyModifiers) -> Msg {
+        Msg::Key(KeyEvent::new(code, modifiers))
+    }
+
+    fn press(state: &mut State, code: KeyCode) -> Vec<Effect> {
+        update(state, key(code, KeyModifiers::NONE))
+    }
+
+    fn alt(state: &mut State, code: KeyCode) -> Vec<Effect> {
+        update(state, key(code, KeyModifiers::ALT))
+    }
+
+    fn ctrl(state: &mut State, c: char) -> Vec<Effect> {
+        update(state, key(KeyCode::Char(c), KeyModifiers::CONTROL))
+    }
+
+    fn type_text(state: &mut State, text: &str) {
+        for c in text.chars() {
+            press(state, KeyCode::Char(c));
+        }
+    }
+
+    fn send(state: &mut State, text: &str) -> Vec<Effect> {
+        type_text(state, text);
+        press(state, KeyCode::Enter)
+    }
+
+    fn last_corvo(state: &State) -> &Line {
+        state.tabs[0].lines.last().expect("the corvo tab has lines")
+    }
+
+    #[test]
+    fn typing_editing_and_alt_enter() {
+        let mut s = state();
+        type_text(&mut s, "helo");
+        press(&mut s, KeyCode::Left);
+        type_text(&mut s, "l");
+        press(&mut s, KeyCode::End);
+        alt(&mut s, KeyCode::Enter);
+        type_text(&mut s, "world");
+        assert_eq!(s.editor.text(), "hello\nworld");
+        update(&mut s, key(KeyCode::Enter, KeyModifiers::SHIFT));
+        ctrl(&mut s, 'j');
+        assert_eq!(s.editor.text(), "hello\nworld\n\n");
+        press(&mut s, KeyCode::Backspace);
+        press(&mut s, KeyCode::Backspace);
+        ctrl(&mut s, 'w');
+        assert_eq!(s.editor.text(), "hello\n");
+        press(&mut s, KeyCode::Esc);
+        assert!(s.editor.is_empty(), "Esc clears the input");
+    }
+
+    #[test]
+    fn key_releases_and_unknown_shortcuts_do_nothing() {
+        let mut s = state();
+        let mut release = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE);
+        release.kind = KeyEventKind::Release;
+        release.state = KeyEventState::NONE;
+        update(&mut s, Msg::Key(release));
+        ctrl(&mut s, 'x');
+        alt(&mut s, KeyCode::Char('x'));
+        assert!(s.editor.is_empty());
+    }
+
+    #[test]
+    fn up_and_down_browse_sent_lines_after_the_input_rows() {
+        let mut s = state();
+        send(&mut s, "/help");
+        send(&mut s, "/clear");
+        type_text(&mut s, "draft");
+        press(&mut s, KeyCode::Up);
+        assert_eq!(s.editor.text(), "/clear");
+        press(&mut s, KeyCode::Up);
+        assert_eq!(s.editor.text(), "/help");
+        press(&mut s, KeyCode::Down);
+        press(&mut s, KeyCode::Down);
+        assert_eq!(s.editor.text(), "draft");
+
+        s.editor.set("one\ntwo".into());
+        press(&mut s, KeyCode::Up);
+        assert_eq!(s.editor.text(), "one\ntwo", "first ↑ moves within the input");
+        assert_eq!(s.editor.cursor_pos().0, 0);
+    }
+
+    #[test]
+    fn every_tab_key() {
+        let mut s = state();
+        update(&mut s, key(KeyCode::BackTab, KeyModifiers::SHIFT));
+        assert_eq!(s.current, 1, "Shift-Tab goes to the next tab");
+        update(&mut s, key(KeyCode::BackTab, KeyModifiers::SHIFT));
+        update(&mut s, key(KeyCode::BackTab, KeyModifiers::SHIFT));
+        assert_eq!(s.current, 0, "and wraps around");
+        alt(&mut s, KeyCode::Left);
+        assert_eq!(s.current, 2, "Alt-← wraps backwards");
+        alt(&mut s, KeyCode::Right);
+        assert_eq!(s.current, 0);
+        alt(&mut s, KeyCode::Char('2'));
+        assert_eq!(s.current, 1);
+        alt(&mut s, KeyCode::Char('3'));
+        assert_eq!(s.current, 2);
+        alt(&mut s, KeyCode::Char('9'));
+        assert_eq!(s.current, 2, "no ninth tab: nothing changes");
+        alt(&mut s, KeyCode::Char('1'));
+        assert_eq!(s.current, 0);
+    }
+
+    #[test]
+    fn switching_tabs_returns_to_the_newest_lines() {
+        let mut s = state();
+        for i in 0..100 {
+            s.say(Tone::Plain, format!("line {i}"));
+        }
+        press(&mut s, KeyCode::PageUp);
+        assert!(s.scroll.is_scrolled());
+        alt(&mut s, KeyCode::Right);
+        alt(&mut s, KeyCode::Left);
+        assert!(!s.scroll.is_scrolled());
+    }
+
+    #[test]
+    fn page_keys_and_the_wheel_scroll() {
+        let mut s = state();
+        for i in 0..100 {
+            s.say(Tone::Plain, format!("line {i}"));
+        }
+        let (total, height) = chat_page(&s);
+        press(&mut s, KeyCode::PageUp);
+        assert_eq!(s.scroll.top(total, height), total - 2 * height);
+        press(&mut s, KeyCode::PageDown);
+        assert!(!s.scroll.is_scrolled());
+        let wheel = |kind| Msg::Mouse(MouseEvent { kind, column: 30, row: 5, modifiers: KeyModifiers::NONE });
+        update(&mut s, wheel(MouseEventKind::ScrollUp));
+        assert_eq!(s.scroll.top(total, height), total - height - WHEEL_STEP);
+        update(&mut s, wheel(MouseEventKind::ScrollDown));
+        assert!(!s.scroll.is_scrolled());
+        update(&mut s, wheel(MouseEventKind::ScrollUp));
+        press(&mut s, KeyCode::Esc);
+        assert!(!s.scroll.is_scrolled(), "Esc on an empty input goes back to the bottom");
+    }
+
+    #[test]
+    fn clear_and_ctrl_l_empty_the_open_tab() {
+        let mut s = state();
+        s.say(Tone::Plain, "old");
+        send(&mut s, "/clear");
+        assert_eq!(s.tabs[0].cleared, 1);
+        alt(&mut s, KeyCode::Char('2'));
+        s.tabs[1].lines.push(Line { text: "hi".into(), tone: Tone::Plain });
+        ctrl(&mut s, 'l');
+        assert_eq!(s.tabs[1].cleared, 1);
+        assert_eq!(s.tabs[0].lines.len(), 1, "nothing is deleted");
+    }
+
+    #[test]
+    fn quit_and_ctrl_c() {
+        let mut s = state();
+        assert!(send(&mut s, "/quit").contains(&Effect::Quit));
+        assert!(send(&mut s, "/q").contains(&Effect::Quit));
+        assert!(ctrl(&mut s, 'c').contains(&Effect::Quit));
+        assert!(!send(&mut s, "/help").contains(&Effect::Quit));
+    }
+
+    #[test]
+    fn pasting_keeps_line_breaks_as_newlines() {
+        let mut s = state();
+        type_text(&mut s, "> ");
+        update(&mut s, Msg::Paste("one\r\ntwo\rthree\n".into()));
+        assert_eq!(s.editor.text(), "> one\ntwo\nthree\n");
+        type_text(&mut s, "!");
+        assert!(s.editor.text().ends_with("\n!"), "the cursor is after the paste");
+    }
+
+    #[test]
+    fn help_lists_every_command_in_the_corvo_tab() {
+        let mut s = state();
+        alt(&mut s, KeyCode::Char('2'));
+        send(&mut s, "/h");
+        assert_eq!(s.current, 0, "help opens the corvo tab");
+        let text: Vec<&str> = s.tabs[0].lines.iter().map(|l| l.text.as_str()).collect();
+        for usage in ["/add <code>", "/accept [name]", "/phrase copy", "/quit  /q"] {
+            assert!(text.iter().any(|l| l.starts_with(usage)), "{usage} is listed");
+        }
+        assert!(text.last().unwrap().contains("Alt+Enter"));
+    }
+
+    #[test]
+    fn close_closes_a_chat_but_not_corvo() {
+        let mut s = state();
+        alt(&mut s, KeyCode::Char('3'));
+        send(&mut s, "/close");
+        assert_eq!(s.tabs.len(), 2);
+        assert_eq!(s.current, 1, "the tab before it opens");
+        send(&mut s, "/close");
+        send(&mut s, "/close");
+        assert_eq!(s.tabs.len(), 1);
+        assert_eq!(last_corvo(&s).tone, Tone::Bad);
+        assert!(last_corvo(&s).text.contains("corvo tab stays open"));
+    }
+
+    #[test]
+    fn mistakes_and_later_commands_are_said_and_flashed() {
+        let mut s = state();
+        send(&mut s, "/acept");
+        assert_eq!(last_corvo(&s).text, "unknown command /acept: did you mean /accept?");
+        assert_eq!(s.flash.as_ref().unwrap().line, *last_corvo(&s));
+        send(&mut s, "/contacts");
+        assert_eq!(last_corvo(&s).text, "/contacts isn't available yet");
+        send(&mut s, "/phrase save");
+        assert_eq!(last_corvo(&s).text, "/phrase save isn't available yet");
+        send(&mut s, "hello");
+        assert!(last_corvo(&s).text.starts_with("this is the corvo tab"));
+        let before = s.tabs[0].lines.len();
+        send(&mut s, "   ");
+        assert_eq!(s.tabs[0].lines.len(), before, "an empty line does nothing");
+    }
+
+    #[test]
+    fn a_flash_goes_away_after_its_ticks() {
+        let mut s = state();
+        send(&mut s, "/nope");
+        for _ in 1..FLASH_TICKS {
+            update(&mut s, Msg::Tick);
+        }
+        assert!(s.flash.is_some());
+        update(&mut s, Msg::Tick);
+        assert!(s.flash.is_none());
+    }
+
+    #[test]
+    fn the_title_is_set_once() {
+        let mut s = state();
+        assert_eq!(update(&mut s, Msg::Tick), vec![Effect::SetTitle(APP.into())]);
+        assert_eq!(update(&mut s, Msg::Tick), vec![]);
+    }
+
+    #[test]
+    fn network_and_problems_from_the_engine() {
+        let mut s = state();
+        assert_eq!(s.online, None);
+        update(&mut s, Msg::Core(Event::Network { online: true }));
+        assert_eq!(s.online, Some(true));
+        update(&mut s, Msg::Core(Event::Network { online: false }));
+        assert_eq!(s.online, Some(false));
+        update(&mut s, Msg::Core(Event::Problem("the store is full".into())));
+        assert_eq!(last_corvo(&s).text, "the store is full");
+        assert_eq!(last_corvo(&s).tone, Tone::Bad);
+    }
+
+    #[test]
+    fn resize_changes_the_page_size() {
+        let mut s = state();
+        update(&mut s, Msg::Resize(100, 40));
+        assert_eq!(s.size, (100, 40));
+        assert_eq!(chat_page(&s).1, 40 - 5);
+    }
+}

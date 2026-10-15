@@ -12,6 +12,27 @@ const STEPS: &[&str] = &[
         seed BLOB NOT NULL,
         name BLOB NOT NULL
     );",
+    // 2: contacts and messages. Rows are found by keyed tags (see `crypt::tag`)
+    // of the peer's key and the message id; every value is sealed and bound to
+    // its row. `waiting` (an unacked outgoing message) stays plain so the
+    // outbox can be found without decrypting everything.
+    "CREATE TABLE contacts (
+        peer      BLOB PRIMARY KEY,
+        key       BLOB NOT NULL,
+        name      BLOB NOT NULL,
+        last_seen BLOB,
+        read_upto BLOB
+    );
+    CREATE TABLE messages (
+        seq     INTEGER PRIMARY KEY AUTOINCREMENT,
+        peer    BLOB NOT NULL,
+        msg     BLOB NOT NULL,
+        body    BLOB NOT NULL,
+        mark    BLOB NOT NULL,
+        waiting INTEGER NOT NULL,
+        UNIQUE (peer, msg)
+    );
+    CREATE INDEX messages_waiting ON messages (peer, waiting);",
 ];
 
 /// What [`upgrade`] found.
@@ -53,6 +74,9 @@ mod tests {
         assert_eq!(version(&db), STEPS.len() as i64);
         assert_eq!(upgrade(&mut db).unwrap(), Upgrade::Done);
         db.execute("INSERT INTO profile (id, seed, name) VALUES (1, x'00', x'00')", []).unwrap();
+        db.execute("INSERT INTO contacts (peer, key, name) VALUES (x'01', x'00', x'00')", []).unwrap();
+        db.execute("INSERT INTO messages (peer, msg, body, mark, waiting) VALUES (x'01', x'02', x'00', x'00', 1)", [])
+            .unwrap();
     }
 
     #[test]

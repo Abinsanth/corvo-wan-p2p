@@ -7,8 +7,10 @@
 //!
 //! A `lock` file stops two copies of the app opening the same data at once.
 
+mod contacts;
 mod crypt;
 mod keyfile;
+mod messages;
 mod schema;
 
 use std::fs::{self, File, TryLockError};
@@ -18,8 +20,10 @@ use std::path::{Path, PathBuf};
 use rusqlite::{Connection, OptionalExtension, params};
 use zeroize::Zeroizing;
 
+pub use contacts::Contact;
 pub use crypt::KdfParams;
 use keyfile::KeyFile;
+pub use messages::{Mark, StoredMessage};
 
 use crate::files::{private_dir, private_file};
 use crate::identity::{NameError, Seed, clean_name};
@@ -32,6 +36,8 @@ const DB_SIDE_FILES: [&str; 3] = ["store.db-journal", "store.db-wal", "store.db-
 
 /// Label for the key that seals values in `store.db`.
 const FIELD_KEY_LABEL: &[u8] = b"corvo-wan-p2p store fields v1";
+/// Label for the key that makes row tags (see `crypt::tag`).
+const TAG_KEY_LABEL: &[u8] = b"corvo-wan-p2p store tags v1";
 
 /// Who you are, as saved in the store.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -72,6 +78,7 @@ pub struct Store {
     db: Connection,
     data_key: Zeroizing<[u8; 32]>,
     field_key: Zeroizing<[u8; 32]>,
+    tag_key: Zeroizing<[u8; 32]>,
     _lock: File,
 }
 
@@ -132,7 +139,8 @@ impl Store {
             return Err(StoreError::TooNew(db_path));
         }
         let field_key = crypt::subkey(&data_key, FIELD_KEY_LABEL);
-        Ok(Store { dir: dir.to_path_buf(), db, data_key, field_key, _lock: lock })
+        let tag_key = crypt::subkey(&data_key, TAG_KEY_LABEL);
+        Ok(Store { dir: dir.to_path_buf(), db, data_key, field_key, tag_key, _lock: lock })
     }
 
     /// Your seed and name.
@@ -183,9 +191,29 @@ impl Store {
         crypt::open(&self.field_key, place, sealed).ok_or_else(|| self.damaged("a value doesn't decrypt"))
     }
 
+    /// Like `seal`, but also bound to one row, so a value can't be moved to another row.
+    fn seal_at(&self, column: &[u8], row: &[&[u8]], plain: &[u8]) -> Vec<u8> {
+        crypt::seal(&self.field_key, &row_aad(column, row), plain)
+    }
+
+    fn open_at(&self, column: &[u8], row: &[&[u8]], sealed: &[u8]) -> Result<Zeroizing<Vec<u8>>, StoreError> {
+        self.open_value(&row_aad(column, row), sealed)
+    }
+
     fn damaged(&self, why: &str) -> StoreError {
         StoreError::Damaged { file: self.dir.join(DB_FILE), why: why.into() }
     }
+}
+
+/// Associated data for a value in one row: the column name, then each part of
+/// the row's key, each preceded by its length.
+fn row_aad(column: &[u8], row: &[&[u8]]) -> Vec<u8> {
+    let mut aad = column.to_vec();
+    for part in row {
+        aad.extend_from_slice(&(part.len() as u32).to_be_bytes());
+        aad.extend_from_slice(part);
+    }
+    aad
 }
 
 /// Takes the lock file in `dir`, or reports that another copy holds it.

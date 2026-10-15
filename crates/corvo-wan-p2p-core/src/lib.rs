@@ -4,6 +4,8 @@
 
 pub mod files;
 pub mod identity;
+pub mod net;
+pub mod proto;
 pub mod recovery;
 pub mod store;
 

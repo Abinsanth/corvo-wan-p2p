@@ -18,7 +18,7 @@ use super::commands::{Cmd, HELP, Input, KEYS, parse};
 use super::complete;
 use super::people::{self, Act, Show};
 use super::state::{Screen, Secret, State, Tone, WHEEL_STEP};
-use super::view::{areas, chat_page, input_rows, sidebar_rows, tab_at};
+use super::view::{areas, chat_page, input_rows, popup_area, sidebar_rows, tab_at};
 
 #[derive(Debug)]
 pub enum Msg {
@@ -291,6 +291,18 @@ fn click(state: &mut State, x: u16, y: u16) {
     if !matches!(state.screen, Screen::Main) {
         return;
     }
+    // The completion list sits over the sidebar and chat: a click on it is for it.
+    if let Some((list, first, rows)) = popup_area(state, areas.input)
+        && list.contains(Position::new(x, y))
+    {
+        if (list.y + 1..list.y + 1 + rows as u16).contains(&y)
+            && let Some(popup) = &mut state.popup
+        {
+            popup.selected = first + usize::from(y - list.y - 1);
+            complete::accept(state);
+        }
+        return;
+    }
     if y == areas.tabs.y {
         if let Some(tab) = tab_at(state, x) {
             state.select_tab(tab);
@@ -434,7 +446,9 @@ fn on_done(state: &mut State, outcome: Outcome, effects: &mut Vec<Effect>) {
             state.code = Some(code);
             state.say(Tone::Good, format!("welcome, {name}. Your code is {code}"));
             state.name = name;
+            // The wait for a first connection starts now, not during onboarding.
             state.since_start = 0;
+            state.online = None;
             effects.push(Effect::Load);
             if let Some(path) = recovery_file {
                 state.say(

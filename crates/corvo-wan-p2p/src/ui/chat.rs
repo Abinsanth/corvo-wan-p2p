@@ -9,6 +9,7 @@ use corvo_wan_p2p_core::store::{Mark, Person, Standing, StoredMessage};
 
 use super::state::{APP, Chat, Screen, State, Tone};
 use super::update::Effect;
+use super::view::{areas, input_rows};
 
 /// Wait this long (10 seconds of ticks) for the first connection before
 /// saying "offline": the engine reports offline at start, before its relay
@@ -51,6 +52,10 @@ pub fn on_event(state: &mut State, event: Event) {
         Event::Received { from, id, sent_at, text } => {
             know(state, from, "");
             let chat = state.chats.entry(from).or_default();
+            // Already read from the store at start (it arrived while loading).
+            if chat.messages.iter().any(|m| m.id == id) {
+                return;
+            }
             chat.messages.push(StoredMessage { id, sent_at, text, mark: Mark::Received });
             chat.unread += 1;
             if state.standing(&from) == Some(Standing::Contact) {
@@ -175,9 +180,16 @@ pub fn tick(state: &mut State) {
     }
 }
 
-/// Marks the open chat read when the window has focus and it has unread messages.
+/// Marks the open chat read when its newest messages are on screen: the
+/// window has focus, it's big enough to draw, the chat is scrolled to its end
+/// and nothing covers it.
 pub fn read_open_chat(state: &mut State, effects: &mut Vec<Effect>) {
-    if !state.focused || !matches!(state.screen, Screen::Main) {
+    let visible = state.focused
+        && matches!(state.screen, Screen::Main)
+        && areas(state.size, input_rows(state)).is_some()
+        && !state.scroll.is_scrolled()
+        && state.reveal.is_none();
+    if !visible {
         return;
     }
     if let Some(peer) = state.open_peer()
@@ -403,5 +415,48 @@ mod tests {
         let code = Seed::generate().code();
         let effects = update(&mut s, Msg::Done(Outcome::Started { name: "ana".into(), code, recovery_file: None }));
         assert!(effects.contains(&Effect::Load));
+    }
+
+    #[test]
+    fn a_slow_unlock_still_starts_as_connecting() {
+        let mut s = State::onboarding(crate::ui::onboarding::Onboarding::start(true, false));
+        for _ in 0..CONNECTING_TICKS + 5 {
+            update(&mut s, Msg::Tick);
+        }
+        let code = Seed::generate().code();
+        update(&mut s, Msg::Done(Outcome::Started { name: "ana".into(), code, recovery_file: None }));
+        assert_eq!(s.online, None, "the wait starts once the engine does");
+    }
+
+    #[test]
+    fn messages_not_on_screen_are_not_marked_read() {
+        let (mut s, rahul, _) = state();
+        s.size = (80, 24);
+        s.open_chat(rahul, true);
+        for i in 0..60 {
+            update(&mut s, received(rahul, &format!("{i:02}")));
+        }
+        key(&mut s, KeyCode::PageUp, KeyModifiers::NONE);
+        assert!(s.scroll.is_scrolled());
+        assert!(!update(&mut s, received(rahul, "x1")).contains(&Effect::MarkRead(rahul)), "scrolled up");
+        assert!(key(&mut s, KeyCode::Esc, KeyModifiers::NONE).contains(&Effect::MarkRead(rahul)), "back at the end");
+
+        s.reveal = Some(crate::ui::state::Secret::new("words".into()));
+        assert!(!update(&mut s, received(rahul, "x2")).contains(&Effect::MarkRead(rahul)), "the words cover it");
+        s.reveal = None;
+        update(&mut s, Msg::Resize(30, 8));
+        assert!(!update(&mut s, received(rahul, "x3")).contains(&Effect::MarkRead(rahul)), "too small to draw");
+        assert!(update(&mut s, Msg::Resize(80, 24)).contains(&Effect::MarkRead(rahul)));
+    }
+
+    #[test]
+    fn a_message_already_loaded_is_not_counted_twice() {
+        let (mut s, rahul, _) = state();
+        let people = s.known.clone();
+        let chats = vec![History { code: rahul, messages: vec![message("01", "a", Mark::Received)], read_upto: None }];
+        update(&mut s, Msg::Done(Outcome::Loaded(Ok(Loaded { people, chats }))));
+        update(&mut s, received(rahul, "01"));
+        assert_eq!(s.chats[&rahul].messages.len(), 1);
+        assert_eq!(s.chats[&rahul].unread, 1);
     }
 }

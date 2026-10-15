@@ -458,14 +458,14 @@ fn draw_sidebar(frame: &mut Frame, state: &State, area: Rect) {
 
 /// The completion list, just above the input and lined up with the word.
 /// Shrinks to the rows that fit below the tabs.
-fn draw_popup(frame: &mut Frame, state: &State, input: Rect) {
-    let Some(p) = &state.popup else {
-        return;
-    };
+/// Where the completion list goes above `input`: its area (border included),
+/// the first match shown and how many show. `None` when it isn't drawn.
+pub fn popup_area(state: &State, input: Rect) -> Option<(Rect, usize, usize)> {
+    let p = state.popup.as_ref()?;
     let room = usize::from(input.y).saturating_sub(3);
     let rows = p.matches.len().min(POPUP_ROWS).min(room);
     if rows == 0 || p.start > state.editor.before_cursor().len() {
-        return;
+        return None;
     }
     let height = rows as u16 + 2;
     let longest = p.matches.iter().map(|m| one_line(m).width()).max().unwrap_or(0) as u16;
@@ -473,8 +473,13 @@ fn draw_popup(frame: &mut Frame, state: &State, input: Rect) {
     let before = &state.editor.before_cursor()[..p.start];
     let col = before[before.rfind('\n').map_or(0, |i| i + 1)..].width() as u16;
     let x = (input.x + PROMPT.len() as u16 + col).min(input.x + input.width - width);
-    let area = Rect::new(x, input.y - height, width, height);
-    let first = p.selected.saturating_sub(rows - 1);
+    Some((Rect::new(x, input.y - height, width, height), p.selected.saturating_sub(rows - 1), rows))
+}
+
+fn draw_popup(frame: &mut Frame, state: &State, input: Rect) {
+    let (Some(p), Some((area, first, rows))) = (&state.popup, popup_area(state, input)) else {
+        return;
+    };
     let lines: Vec<TextLine> = p
         .matches
         .iter()
@@ -1026,5 +1031,28 @@ mod tests {
         update(&mut state, click(3, 4));
         update(&mut state, click(40, 10));
         assert_eq!(state.open_peer(), Some(rahul(&state)), "clicking elsewhere changes nothing");
+    }
+
+    #[test]
+    fn clicking_an_entry_in_the_completion_list_takes_it() {
+        use ratatui::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let mut state = busy_state();
+        state.size = (80, 24);
+        typed(&mut state, "/chat ");
+        update(&mut state, Msg::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)));
+        let names = state.popup.as_ref().unwrap().matches.clone();
+        let buf = render(&state, 80, 24);
+        let y = (0..24).find(|&y| row(&buf, y).contains(&format!("│{}", names[1]))).unwrap();
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 10,
+            row: y,
+            modifiers: KeyModifiers::NONE,
+        };
+        let before = state.open_peer();
+        update(&mut state, Msg::Mouse(click));
+        assert_eq!(state.editor.text(), format!("/chat {} ", names[1]));
+        assert_eq!(state.popup, None);
+        assert_eq!(state.open_peer(), before, "the sidebar under it isn't clicked");
     }
 }

@@ -193,6 +193,10 @@ pub fn acted(state: &mut State, code: Code, act: Act, result: Result<(), String>
         return;
     }
     let before = state.label(&code);
+    // The engine closes the connection without reporting them offline.
+    if matches!(act, Act::Block | Act::Unblock | Act::Remove { .. }) {
+        state.connected.remove(&code);
+    }
     if let Some(people) = people {
         state.set_people(people);
     }
@@ -566,5 +570,20 @@ mod tests {
         let (mut s, _) = state();
         send(&mut s, "/update");
         assert!(last(&s).contains("first release"));
+    }
+
+    #[test]
+    fn blocking_or_removing_someone_online_clears_their_dot() {
+        for (act_, standing) in [(Act::Block, Some(Standing::Blocked)), (Act::Remove { history: false }, None)] {
+            let (mut s, p) = state();
+            update(&mut s, Msg::Core(corvo_wan_p2p_core::chat::Event::Online(p.rahul)));
+            let people = after(&s, p.rahul, standing);
+            done(&mut s, Outcome::Acted { code: p.rahul, act: act_, result: Ok(()), people: Some(people) });
+            assert!(!s.connected.contains(&p.rahul), "{act_:?}");
+            // Added back later while they're offline, they mustn't show online.
+            let people = after(&s, p.rahul, Some(Standing::Contact));
+            done(&mut s, Outcome::Acted { code: p.rahul, act: Act::Add, result: Ok(()), people: Some(people) });
+            assert!(!s.people.iter().find(|x| x.code == p.rahul).unwrap().online, "{act_:?}");
+        }
     }
 }

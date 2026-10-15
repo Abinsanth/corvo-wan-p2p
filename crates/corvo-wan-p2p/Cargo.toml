@@ -1,0 +1,16 @@
+[package]
+name = "corvo-wan-p2p"
+description = "Peer-to-peer terminal chat over the internet"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+corvo-wan-p2p-core.workspace = true
+clap.workspace = true
+
+[lints]
+workspace = true

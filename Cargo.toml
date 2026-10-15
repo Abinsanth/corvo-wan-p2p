@@ -1,0 +1,27 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+license = "MIT"
+repository = "https://github.com/Abinsanth/corvo-wan-p2p"
+
+[workspace.dependencies]
+corvo-wan-p2p-core = { path = "crates/corvo-wan-p2p-core" }
+anyhow = "1.0.104"
+clap = { version = "4.6.7", features = ["derive"] }
+iroh = "1.3.0"
+tokio = { version = "1.53.3", features = ["full"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+dbg_macro = "warn"
+
+# Smaller downloads for the release binaries.
+[profile.release]
+strip = true

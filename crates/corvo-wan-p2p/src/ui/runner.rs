@@ -6,16 +6,18 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
-use corvo_wan_p2p_core::chat::{Client, Config, Event};
-use corvo_wan_p2p_core::identity::Seed;
+use corvo_wan_p2p_core::chat::{ChatError, Client, Config, Event};
+use corvo_wan_p2p_core::identity::{Code, Seed};
 use corvo_wan_p2p_core::net::internet_endpoint;
 use corvo_wan_p2p_core::recovery;
-use corvo_wan_p2p_core::store::Store;
+use corvo_wan_p2p_core::store::{Mark, Standing, Store, StoredMessage};
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::SetTitle;
 
 use super::account::{PhraseDone, PhraseUse};
+use super::chat::{History, Loaded};
 use super::clip::osc52;
+use super::people::Act;
 use super::state::Secret;
 use super::update::{Effect, Msg, Outcome};
 
@@ -26,9 +28,9 @@ const NOT_STARTED: &str = "the chat engine hasn't started";
 pub enum Net {
     /// n0's relays and discovery: the real thing.
     Internet,
-    /// This machine only, for tests.
+    /// This machine only, for tests: apps sharing a lookup find each other.
     #[cfg(test)]
-    Local,
+    Local(iroh::address_lookup::MemoryLookup),
 }
 
 /// What the loop does after an effect.
@@ -102,6 +104,43 @@ impl<W: Write> Runner<W> {
                 None => Err(NOT_STARTED.into()),
             }),
             Effect::Phrase { passphrase, then } => Outcome::Phrase(self.phrase(&passphrase, then).await),
+            Effect::Load => Outcome::Loaded(self.load().await.map_err(|e| e.to_string())),
+            Effect::Send { to, text } => {
+                let result = match self.client() {
+                    Ok(client) => client.send(to, &text).await.map_err(|e| e.to_string()),
+                    Err(e) => Err(e),
+                };
+                let result =
+                    result.map(|id| StoredMessage { id, sent_at: now_ms(), text: text.clone(), mark: Mark::Waiting });
+                Outcome::Sent { to, text, result }
+            }
+            Effect::MarkRead(peer) => match self.client() {
+                Ok(client) => match client.mark_read(peer).await {
+                    Ok(()) => return Ok(Flow::Next(None)),
+                    Err(e) => Outcome::Failed(e.to_string()),
+                },
+                Err(e) => Outcome::Failed(e),
+            },
+            Effect::Act { code, act } => {
+                let result = self.act(code, act).await;
+                // Everyone again, so the screen matches what the engine now has.
+                let people = match (&result, self.client()) {
+                    (Ok(()), Ok(client)) => client.people().await.ok(),
+                    _ => None,
+                };
+                Outcome::Acted { code, act, result, people }
+            }
+            Effect::SetName(name) => Outcome::Named(match self.client() {
+                Ok(client) => client.set_name(&name).await.map_err(|e| e.to_string()),
+                Err(e) => Err(e),
+            }),
+            Effect::Refresh(show) => Outcome::Refreshed {
+                show,
+                result: match self.client() {
+                    Ok(client) => client.people().await.map_err(|e| e.to_string()),
+                    Err(e) => Err(e),
+                },
+            },
         };
         Ok(Flow::Next(Some(Msg::Done(outcome))))
     }
@@ -122,6 +161,35 @@ impl<W: Write> Runner<W> {
         }
     }
 
+    fn client(&self) -> Result<&Client, String> {
+        self.client.as_ref().ok_or_else(|| NOT_STARTED.to_string())
+    }
+
+    /// Everyone, and the chats with contacts and requests.
+    async fn load(&self) -> Result<Loaded, ChatError> {
+        let client = self.client.as_ref().ok_or(ChatError::Stopped)?;
+        let people = client.people().await?;
+        let mut chats = Vec::new();
+        for p in people.iter().filter(|p| p.standing != Standing::Blocked) {
+            let messages = client.history(p.code).await?;
+            let read_upto = client.read_upto(p.code).await?;
+            chats.push(History { code: p.code, messages, read_upto });
+        }
+        Ok(Loaded { people, chats })
+    }
+
+    async fn act(&self, code: Code, act: Act) -> Result<(), String> {
+        let client = self.client()?;
+        let done = match act {
+            Act::Add => client.add_contact(code).await,
+            Act::Accept => client.accept(code).await,
+            Act::Block => client.block(code).await,
+            Act::Unblock => client.unblock(code).await,
+            Act::Remove { history } => client.remove(code, history).await,
+        };
+        done.map_err(|e| e.to_string())
+    }
+
     fn copy(&mut self, text: &str) -> std::io::Result<()> {
         let sequence = Secret::new(osc52(text));
         self.out.write_all(sequence.expose().as_bytes())?;
@@ -139,12 +207,13 @@ impl<W: Write> Runner<W> {
     async fn try_start(&mut self, store: Store) -> anyhow::Result<Outcome> {
         let profile = store.profile()?;
         let secret = profile.seed.secret_key();
-        let endpoint = match self.net {
+        let endpoint = match &self.net {
             Net::Internet => internet_endpoint(secret).await?,
             #[cfg(test)]
-            Net::Local => {
-                let lookup = iroh::address_lookup::MemoryLookup::new();
-                corvo_wan_p2p_core::net::local_endpoint(secret, lookup).await?
+            Net::Local(lookup) => {
+                let endpoint = corvo_wan_p2p_core::net::local_endpoint(secret, lookup.clone()).await?;
+                lookup.set_endpoint_info(corvo_wan_p2p_core::net::local_addr(&endpoint));
+                endpoint
             }
         };
         let client = Client::start(store, endpoint, self.config)?;
@@ -179,6 +248,11 @@ impl<W: Write> Runner<W> {
     }
 }
 
+/// Now, in Unix milliseconds.
+fn now_ms() -> i64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64)
+}
+
 /// Runs slow work (Argon2, file system) off the async threads.
 async fn blocking<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> anyhow::Result<T> {
     tokio::task::spawn_blocking(work).await.context("a background task failed")
@@ -208,7 +282,8 @@ mod tests {
     use crate::ui::update::update;
     use corvo_wan_p2p_core::identity::Seed;
     use corvo_wan_p2p_core::recovery;
-    use corvo_wan_p2p_core::store::{KdfParams, Store};
+    use corvo_wan_p2p_core::store::KdfParams;
+    use iroh::address_lookup::MemoryLookup;
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use std::collections::VecDeque;
     use tempfile::TempDir;
@@ -224,10 +299,48 @@ mod tests {
     impl App {
         /// Starts as `main` does, on the account in `data` (or none).
         fn open(data: &TempDir, home: &TempDir, recover: bool) -> App {
+            App::open_on(data, home, recover, &MemoryLookup::new())
+        }
+
+        /// Like `open`, finding other apps through `lookup`.
+        fn open_on(data: &TempDir, home: &TempDir, recover: bool, lookup: &MemoryLookup) -> App {
             let dir = data.path().join("corvo-wan-p2p");
             let state = State::onboarding(Onboarding::start(Store::exists(&dir), recover));
-            let runner = Runner::new(dir, Some(home.path().to_path_buf()), FAST, Net::Local, Vec::new());
+            let net = Net::Local(lookup.clone());
+            let runner = Runner::new(dir, Some(home.path().to_path_buf()), FAST, net, Vec::new());
             App { state, runner }
+        }
+
+        /// An account called `name` with passphrase `pw`, made straight in the
+        /// store, then unlocked as at a start.
+        async fn person(data: &TempDir, home: &TempDir, lookup: &MemoryLookup, name: &str) -> App {
+            Store::create(&data.path().join("corvo-wan-p2p"), "pw", KdfParams::FAST_INSECURE, &Seed::generate(), name)
+                .unwrap();
+            App::restart(data, home, lookup).await
+        }
+
+        /// Starts the app on an existing account and unlocks it.
+        async fn restart(data: &TempDir, home: &TempDir, lookup: &MemoryLookup) -> App {
+            let mut app = App::open_on(data, home, false, lookup);
+            assert_eq!(app.send("pw").await, None);
+            assert!(matches!(app.state.screen, Screen::Main));
+            app
+        }
+
+        fn code(&self) -> Code {
+            self.state.code.unwrap()
+        }
+
+        /// Handles engine events until `done` holds.
+        async fn until(&mut self, what: &str, done: impl Fn(&State) -> bool) {
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+            while !done(&self.state) {
+                let event = tokio::time::timeout_at(deadline, self.runner.next_event())
+                    .await
+                    .unwrap_or_else(|_| panic!("timed out waiting for {what}"))
+                    .expect("the engine is running");
+                self.handle(Msg::Core(event)).await;
+            }
         }
 
         /// Feeds `msg` to `update` and carries out every effect that follows.
@@ -413,5 +526,86 @@ mod tests {
         assert_eq!(date(951_782_400), "2000-02-29");
         assert_eq!(date(1_792_022_400), "2026-10-15");
         assert_eq!(date(1_792_108_799), "2026-10-15");
+    }
+
+    fn marks(app: &App, with: Code) -> Vec<Mark> {
+        app.state.chats.get(&with).map(|c| c.messages.iter().map(|m| m.mark).collect()).unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn two_people_chat_with_marks_unread_and_presence() {
+        let lookup = MemoryLookup::new();
+        let (ana_data, rahul_data, home) = (TempDir::new().unwrap(), TempDir::new().unwrap(), TempDir::new().unwrap());
+        let mut ana = App::person(&ana_data, &home, &lookup, "ana").await;
+        let mut rahul = App::person(&rahul_data, &home, &lookup, "rahul").await;
+        let (ana_code, rahul_code) = (ana.code(), rahul.code());
+
+        ana.send(&format!("/add {rahul_code}")).await;
+        assert_eq!(ana.state.open_peer(), Some(rahul_code), "adding opens the chat");
+        ana.send("hi rahul").await;
+        assert_eq!(marks(&ana, rahul_code), vec![Mark::Waiting]);
+
+        rahul.until("ana's request", |s| s.chats.get(&ana_code).is_some_and(|c| c.unread == 1)).await;
+        assert_eq!(rahul.state.standing(&ana_code), Some(Standing::Request));
+        assert_eq!(rahul.state.label(&ana_code), "ana");
+        assert_eq!(rahul.state.title, format!("(1) {}", crate::ui::state::APP));
+        ana.until("✓", |s| marks_in(s, rahul_code) == vec![Mark::Delivered]).await;
+
+        rahul.send("/chat ana").await;
+        rahul.send("/accept").await;
+        assert_eq!(rahul.state.standing(&ana_code), Some(Standing::Contact));
+        assert_eq!(rahul.state.chats[&ana_code].unread, 0, "the open chat is read");
+        ana.until("✓✓", |s| marks_in(s, rahul_code) == vec![Mark::Read]).await;
+        ana.until("rahul online", |s| s.people.iter().any(|p| p.code == rahul_code && p.online)).await;
+
+        rahul.send("hello ana").await;
+        ana.until("rahul's reply", |s| s.chats[&rahul_code].messages.len() == 2).await;
+        rahul.until("✓ on the reply", |s| marks_in(s, ana_code).last() == Some(&Mark::Delivered)).await;
+
+        // Unread counts survive a restart.
+        ana.send("/close").await;
+        rahul.send("one more").await;
+        ana.until("the next message", |s| s.chats[&rahul_code].unread == 1).await;
+        ana.runner.shutdown().await;
+        let mut ana = App::restart(&ana_data, &home, &lookup).await;
+        assert_eq!(ana.state.chats[&rahul_code].unread, 1);
+        assert_eq!(ana.state.chats[&rahul_code].messages.len(), 3);
+        assert_eq!(ana.state.title, format!("(1) {}", crate::ui::state::APP));
+        ana.send("/chat rahul").await;
+        assert_eq!(ana.state.chats[&rahul_code].unread, 0);
+        ana.runner.shutdown().await;
+        rahul.runner.shutdown().await;
+    }
+
+    fn marks_in(state: &State, with: Code) -> Vec<Mark> {
+        state.chats.get(&with).map(|c| c.messages.iter().map(|m| m.mark).collect()).unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn people_commands_reach_the_engine() {
+        let lookup = MemoryLookup::new();
+        let (data, home) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        let mut ana = App::person(&data, &home, &lookup, "ana").await;
+        let friend = Seed::generate().code();
+        ana.send(&format!("/add {friend}")).await;
+        assert_eq!(ana.state.standing(&friend), Some(Standing::Contact));
+        ana.send(&format!("/block {}", friend.short())).await;
+        assert_eq!(ana.state.standing(&friend), Some(Standing::Blocked));
+        ana.send(&format!("/unblock {}", friend.short())).await;
+        assert_eq!(ana.state.standing(&friend), None, "a stranger again");
+        ana.send(&format!("/add {friend}")).await;
+        ana.send(&format!("/remove {}", friend.short())).await;
+        ana.send("y").await;
+        assert_eq!(ana.state.standing(&friend), None);
+        assert!(!ana.state.chats.contains_key(&friend));
+        ana.send("/name Ana M").await;
+        assert_eq!(ana.state.name, "Ana M");
+        ana.send("/contacts").await;
+        assert_eq!(ana.said().last().unwrap(), "no contacts yet: /add <code> adds a friend");
+        ana.send(&format!("/add {}", ana.code())).await;
+        assert!(ana.said().last().unwrap().contains("your own code"));
+        ana.runner.shutdown().await;
+        let ana = App::restart(&data, &home, &lookup).await;
+        assert_eq!(ana.state.name, "Ana M", "the new name was saved");
     }
 }

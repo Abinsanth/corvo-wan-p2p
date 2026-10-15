@@ -11,6 +11,7 @@ publish = false
 [dependencies]
 corvo-wan-p2p-core.workspace = true
 anyhow.workspace = true
+chrono.workspace = true
 clap.workspace = true
 rand.workspace = true
 ratatui.workspace = true

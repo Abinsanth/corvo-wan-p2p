@@ -6,13 +6,19 @@ use std::path::PathBuf;
 
 use corvo_wan_p2p_core::chat::Event;
 use corvo_wan_p2p_core::identity::{Code, Seed};
-use corvo_wan_p2p_core::store::StoreError;
-use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind};
+use corvo_wan_p2p_core::store::{Person, StoreError, StoredMessage};
+use ratatui::crossterm::event::{
+    KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
+use ratatui::layout::Position;
 
 use super::account::{self, PhraseDone, PhraseUse};
+use super::chat::{self, Loaded};
 use super::commands::{Cmd, HELP, Input, KEYS, parse};
-use super::state::{APP, Screen, Secret, State, Tone, WHEEL_STEP};
-use super::view::chat_page;
+use super::complete;
+use super::people::{self, Act, Show};
+use super::state::{Screen, Secret, State, Tone, WHEEL_STEP};
+use super::view::{areas, chat_page, input_rows, popup_area, sidebar_rows, tab_at};
 
 #[derive(Debug)]
 pub enum Msg {
@@ -25,6 +31,8 @@ pub enum Msg {
     Core(Event),
     /// What came of an [`Effect`].
     Done(Outcome),
+    /// The window gained or lost focus.
+    Focus(bool),
 }
 
 /// Work for the loop: anything that touches the store, the engine, files or
@@ -64,6 +72,21 @@ pub enum Effect {
         passphrase: Secret,
         then: PhraseUse,
     },
+    /// Read everyone and every chat, at start.
+    Load,
+    Send {
+        to: Code,
+        text: String,
+    },
+    /// You've seen everything they sent.
+    MarkRead(Code),
+    Act {
+        code: Code,
+        act: Act,
+    },
+    SetName(String),
+    /// Read everyone again, then show `Show`.
+    Refresh(Show),
 }
 
 impl Effect {
@@ -100,6 +123,27 @@ pub enum Outcome {
     RecoveryWritten(Result<PathBuf, String>),
     PassphraseChanged(Result<(), String>),
     Phrase(Result<PhraseDone, String>),
+    Loaded(Result<Loaded, String>),
+    /// The message as saved, waiting to be sent; `text` is what was typed.
+    Sent {
+        to: Code,
+        text: String,
+        result: Result<StoredMessage, String>,
+    },
+    /// Something went wrong that the user should hear about.
+    Failed(String),
+    /// `people` is everyone, read again after acting (if that worked).
+    Acted {
+        code: Code,
+        act: Act,
+        result: Result<(), String>,
+        people: Option<Vec<Person>>,
+    },
+    Named(Result<String, String>),
+    Refreshed {
+        show: Show,
+        result: Result<Vec<Person>, String>,
+    },
     /// Something that leaves the app unusable, like the engine not starting.
     Fatal(String),
 }
@@ -128,6 +172,14 @@ enum Action {
     KillWord,
     Clear,
     Quit,
+    Complete,
+}
+
+impl Action {
+    /// Changes the text being typed.
+    fn edits(self) -> bool {
+        matches!(self, Action::Insert(_) | Action::Backspace | Action::Delete | Action::KillRow | Action::KillWord)
+    }
 }
 
 /// Shift+Enter needs a terminal that reports it; Alt+Enter and Ctrl-J work everywhere.
@@ -162,6 +214,7 @@ fn action_for(key: KeyEvent) -> Option<Action> {
         KeyCode::Up => Action::Up,
         KeyCode::Down => Action::Down,
         KeyCode::BackTab => Action::NextTab,
+        KeyCode::Tab => Action::Complete,
         KeyCode::PageUp => Action::PageUp,
         KeyCode::PageDown => Action::PageDown,
         KeyCode::Esc => Action::Esc,
@@ -171,6 +224,10 @@ fn action_for(key: KeyEvent) -> Option<Action> {
 
 pub fn update(state: &mut State, msg: Msg) -> Vec<Effect> {
     let mut effects = Vec::new();
+    // Typing means the window has focus, even where the terminal doesn't say.
+    if matches!(msg, Msg::Key(_) | Msg::Paste(_)) {
+        state.focused = true;
+    }
     match msg {
         // A key while the words are up only hides them.
         Msg::Key(key) if state.reveal.is_some() && key.kind != KeyEventKind::Release => state.reveal = None,
@@ -186,14 +243,23 @@ pub fn update(state: &mut State, msg: Msg) -> Vec<Effect> {
             let text = text.trim_end_matches(['\r', '\n']).replace("\r\n", " ").replace(['\r', '\n'], " ");
             state.editor.insert_str(&text);
         }
-        Msg::Paste(text) => state.editor.insert_str(&text),
+        Msg::Paste(text) => {
+            state.popup = None;
+            state.editor.insert_str(&text);
+        }
         Msg::Mouse(mouse) => match mouse.kind {
             MouseEventKind::ScrollUp => scroll_by(state, -(WHEEL_STEP as isize)),
             MouseEventKind::ScrollDown => scroll_by(state, WHEEL_STEP as isize),
+            MouseEventKind::Down(MouseButton::Left) => {
+                state.focused = true;
+                click(state, mouse.column, mouse.row);
+            }
             _ => {}
         },
         Msg::Resize(w, h) => state.size = (w, h),
+        Msg::Focus(focused) => state.focused = focused,
         Msg::Tick => {
+            chat::tick(state);
             if let Some(flash) = &mut state.flash {
                 flash.ticks_left = flash.ticks_left.saturating_sub(1);
                 if flash.ticks_left == 0 {
@@ -210,12 +276,42 @@ pub fn update(state: &mut State, msg: Msg) -> Vec<Effect> {
     if let Some(busy) = effects.iter().find_map(Effect::busy) {
         state.busy = Some(busy);
     }
-    let title = APP.to_string();
+    chat::read_open_chat(state, &mut effects);
+    let title = chat::title(state);
     if state.title != title {
         state.title = title.clone();
         effects.push(Effect::SetTitle(title));
     }
     effects
+}
+
+/// A left click: on a tab selects it, on a name in the sidebar opens the chat.
+fn click(state: &mut State, x: u16, y: u16) {
+    let Some(areas) = areas(state.size, input_rows(state)) else { return };
+    if !matches!(state.screen, Screen::Main) {
+        return;
+    }
+    // The completion list sits over the sidebar and chat: a click on it is for it.
+    if let Some((list, first, rows)) = popup_area(state, areas.input)
+        && list.contains(Position::new(x, y))
+    {
+        if (list.y + 1..list.y + 1 + rows as u16).contains(&y)
+            && let Some(popup) = &mut state.popup
+        {
+            popup.selected = first + usize::from(y - list.y - 1);
+            complete::accept(state);
+        }
+        return;
+    }
+    if y == areas.tabs.y {
+        if let Some(tab) = tab_at(state, x) {
+            state.select_tab(tab);
+        }
+    } else if areas.sidebar.contains(Position::new(x, y))
+        && let Some(Some(code)) = sidebar_rows(state).get(usize::from(y - areas.sidebar.y))
+    {
+        state.open_chat(*code, true);
+    }
 }
 
 fn scroll_by(state: &mut State, delta: isize) {
@@ -224,6 +320,26 @@ fn scroll_by(state: &mut State, delta: isize) {
 }
 
 fn on_action(state: &mut State, action: Action, effects: &mut Vec<Effect>) {
+    if state.popup.is_some() {
+        match action {
+            Action::Complete | Action::Down => return complete::step(state, 1),
+            Action::Up => return complete::step(state, -1),
+            Action::Send => return complete::accept(state),
+            Action::Esc => {
+                state.popup = None;
+                return;
+            }
+            a if a.edits() => {}
+            _ => state.popup = None,
+        }
+    }
+    on_key(state, action, effects);
+    if action.edits() {
+        complete::refresh(state);
+    }
+}
+
+fn on_key(state: &mut State, action: Action, effects: &mut Vec<Effect>) {
     let asking = state.ask().is_some();
     let editor = &mut state.editor;
     match action {
@@ -238,8 +354,9 @@ fn on_action(state: &mut State, action: Action, effects: &mut Vec<Effect>) {
                 on_line(state, &line, effects);
             }
         }
-        // An answer is one line, and earlier lines aren't answers.
-        Action::Newline | Action::Up | Action::Down if asking => {}
+        // An answer is one line, earlier lines aren't answers, and nothing in it completes.
+        Action::Newline | Action::Up | Action::Down | Action::Complete if asking => {}
+        Action::Complete => complete::tab(state),
         Action::Quit => effects.push(Effect::Quit),
         Action::Clear => state.clear_tab(),
         Action::Newline => editor.newline(),
@@ -290,7 +407,11 @@ fn on_line(state: &mut State, line: &str, effects: &mut Vec<Effect>) {
         Input::Text(_) if state.on_corvo() => {
             state.say(Tone::Bad, "this is the corvo tab: switch to a chat (Shift-Tab) to send messages")
         }
-        Input::Text(_) => state.say(Tone::Warn, "sending messages isn't available yet"),
+        Input::Text(text) => {
+            if let Some(to) = state.open_peer() {
+                chat::send(state, to, text, effects);
+            }
+        }
         Input::Wrong(why) => state.say(Tone::Bad, why),
         Input::Cmd(cmd) => on_command(state, cmd, effects),
     }
@@ -313,7 +434,7 @@ fn on_command(state: &mut State, cmd: Cmd, effects: &mut Vec<Effect>) {
                 state.say(Tone::Bad, "the corvo tab stays open; /quit leaves the app");
             }
         }
-        other => state.say(Tone::Warn, format!("{} isn't available yet", other.typed())),
+        other => people::command(state, other, effects),
     }
 }
 
@@ -325,6 +446,10 @@ fn on_done(state: &mut State, outcome: Outcome, effects: &mut Vec<Effect>) {
             state.code = Some(code);
             state.say(Tone::Good, format!("welcome, {name}. Your code is {code}"));
             state.name = name;
+            // The wait for a first connection starts now, not during onboarding.
+            state.since_start = 0;
+            state.online = None;
+            effects.push(Effect::Load);
             if let Some(path) = recovery_file {
                 state.say(
                     Tone::Warn,
@@ -333,6 +458,12 @@ fn on_done(state: &mut State, outcome: Outcome, effects: &mut Vec<Effect>) {
             }
         }
         Outcome::Fatal(why) => effects.push(Effect::Exit(why)),
+        Outcome::Failed(why) => state.say(Tone::Bad, why),
+        Outcome::Loaded(result) => chat::loaded(state, result),
+        Outcome::Sent { to, text, result } => chat::sent(state, to, text, result),
+        Outcome::Acted { code, act, result, people } => people::acted(state, code, act, result, people),
+        Outcome::Named(result) => people::named(state, result),
+        Outcome::Refreshed { show, result } => people::refreshed(state, show, result),
         other => match &mut state.screen {
             Screen::Onboarding(onboarding) => effects.extend(onboarding.done(other)),
             Screen::Main => effects.extend(account::done(state, other)),
@@ -341,18 +472,13 @@ fn on_done(state: &mut State, outcome: Outcome, effects: &mut Vec<Effect>) {
 }
 
 fn on_core(state: &mut State, event: Event) {
-    match event {
-        Event::Network { online } => state.online = Some(online),
-        Event::Problem(text) => state.say(Tone::Bad, text),
-        // Chats, people and their marks arrive with the chat screens.
-        _ => {}
-    }
+    chat::on_event(state, event);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ui::state::{FLASH_TICKS, Line, Tab};
+    use crate::ui::state::{APP, FLASH_TICKS, Line, Tab};
     use corvo_wan_p2p_core::identity::Seed;
     use ratatui::crossterm::event::KeyEventState;
 
@@ -511,7 +637,13 @@ mod tests {
         send(&mut s, "/clear");
         assert_eq!(s.tabs[0].cleared, 1);
         alt(&mut s, KeyCode::Char('2'));
-        s.tabs[1].lines.push(Line { text: "hi".into(), tone: Tone::Plain });
+        let peer = s.tabs[1].peer.unwrap();
+        s.chats.entry(peer).or_default().messages.push(corvo_wan_p2p_core::store::StoredMessage {
+            id: "01".into(),
+            sent_at: 0,
+            text: "hi".into(),
+            mark: corvo_wan_p2p_core::store::Mark::Received,
+        });
         ctrl(&mut s, 'l');
         assert_eq!(s.tabs[1].cleared, 1);
         assert_eq!(s.tabs[0].lines.len(), 1, "nothing is deleted");
@@ -564,15 +696,12 @@ mod tests {
     }
 
     #[test]
-    fn mistakes_and_later_commands_are_said_and_flashed() {
+    fn mistakes_are_said_and_flashed() {
         let mut s = state();
         send(&mut s, "/acept");
         assert_eq!(last_corvo(&s).text, "unknown command /acept: did you mean /accept?");
         assert_eq!(s.flash.as_ref().unwrap().line, *last_corvo(&s));
-        send(&mut s, "/contacts");
-        assert_eq!(last_corvo(&s).text, "/contacts isn't available yet");
-        send(&mut s, "/blocked");
-        assert_eq!(last_corvo(&s).text, "/blocked isn't available yet");
+        s.select_tab(0);
         send(&mut s, "hello");
         assert!(last_corvo(&s).text.starts_with("this is the corvo tab"));
         let before = s.tabs[0].lines.len();

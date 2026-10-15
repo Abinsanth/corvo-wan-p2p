@@ -3,7 +3,10 @@
 
 use std::path::PathBuf;
 
+use corvo_wan_p2p_core::identity::Code;
+
 use super::commands::Cmd;
+use super::people::Act;
 use super::state::{Ask, Secret, State, Tone};
 use super::update::{Effect, Outcome};
 
@@ -41,6 +44,8 @@ pub enum Pending {
     Checking { passphrase: Secret },
     /// `/phrase save`: it's there; replace it?
     Replace { passphrase: Secret },
+    /// `/remove`: delete the history with them too?
+    Remove { code: Code },
 }
 
 impl Pending {
@@ -51,6 +56,7 @@ impl Pending {
             Pending::Repeat { .. } => ("again: ", true),
             Pending::Passphrase(_) | Pending::Checking { .. } => ("your passphrase: ", true),
             Pending::Replace { .. } => ("replace it? y/n: ", false),
+            Pending::Remove { .. } => ("delete your history too? y/n: ", false),
         };
         Ask { label: label.into(), masked }
     }
@@ -123,6 +129,20 @@ pub fn answer(state: &mut State, text: Secret) -> Vec<Effect> {
             _ => {
                 state.say(Tone::Bad, "type y or n");
                 Some(Pending::Replace { passphrase })
+            }
+        },
+        Pending::Remove { code } => match text.expose().trim().to_lowercase().as_str() {
+            "y" | "yes" => {
+                effects.push(Effect::Act { code, act: Act::Remove { history: true } });
+                None
+            }
+            "n" | "no" => {
+                effects.push(Effect::Act { code, act: Act::Remove { history: false } });
+                None
+            }
+            _ => {
+                state.say(Tone::Bad, "type y or n");
+                Some(Pending::Remove { code })
             }
         },
         // Nothing is asked while waiting.

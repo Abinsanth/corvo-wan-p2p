@@ -17,8 +17,10 @@ case "$(uname -m)" in
   *) echo "Unsupported CPU: $(uname -m)" >&2; exit 1 ;;
 esac
 
-dir=$(mktemp -d)
-trap 'rm -rf "$dir"' EXIT INT TERM
+# A recognisable name, so a leftover folder is easy to find (see "Remove" in the README).
+dir=$(mktemp -d "${TMPDIR:-/tmp}/iroh-spike.XXXXXX")
+# HUP too: closing the terminal window must also clean up.
+trap 'rm -rf "$dir"' EXIT HUP INT TERM
 echo "Downloading the connection test for $arch-$os..."
 curl -fsSL "$base/iroh-spike-$arch-$os.tar.gz" | tar -xzf - -C "$dir"
 

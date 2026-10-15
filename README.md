@@ -31,6 +31,21 @@ It asks for a key:
 - **If not,** press Enter. It shows a key: send that key to the other person
   and leave the window open until they've connected (Ctrl-C to stop).
 
+**Where it goes:** a temporary folder named `iroh-spike…` in your system's
+temp directory (`$TMPDIR` on macOS, `/tmp` on Linux, `%TEMP%` on Windows). It's
+deleted when the test ends, when you press Ctrl-C, or when you close the window.
+
+**Remove:** there's nothing installed to uninstall. If a test was ever cut off
+some other way (a crash, a power cut), this deletes any leftover folder:
+
+```bash
+find "${TMPDIR:-/tmp}" -maxdepth 1 -name 'iroh-spike.*' -exec rm -rf {} +   # macOS or Linux
+```
+
+```powershell
+Remove-Item -Recurse -Force "$env:TEMP\iroh-spike-*" -ErrorAction SilentlyContinue   # Windows
+```
+
 ## Development
 
 ```bash

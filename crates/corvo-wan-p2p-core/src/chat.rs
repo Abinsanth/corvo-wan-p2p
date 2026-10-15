@@ -16,18 +16,19 @@ mod link;
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use iroh::Endpoint;
-use iroh::endpoint::Connection;
+use iroh::endpoint::{Connection, RelayStatus};
+use iroh::{Endpoint, Watcher};
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
+use zeroize::Zeroizing;
 
 use crate::VERSION;
-use crate::identity::{Code, NameError, clean_name};
+use crate::identity::{Code, NameError, Seed, clean_name};
 use crate::net::ALPN;
 use crate::proto::{Frame, MAX_FRAME, MAX_TEXT, PROTO_VERSION, encode};
-use crate::store::{Person, Standing, Store, StoreError, StoredMessage};
+use crate::store::{KdfParams, Person, Standing, Store, StoreError, StoredMessage};
 use link::Role;
 
 /// The most requests waiting for an answer. Strangers are refused beyond it.
@@ -37,6 +38,9 @@ pub const MAX_REQUESTS: usize = 20;
 pub const MAX_REQUEST_MESSAGES: usize = 20;
 /// The most connections open at once from people who aren't contacts.
 pub const MAX_GUESTS: usize = 20;
+/// How many times a request may change its name on one connection. Later
+/// changes are ignored, so a stranger can't flood the screen with renames.
+pub const MAX_REQUEST_RENAMES: usize = 5;
 /// The most messages sent to one peer and not yet acked; the rest wait their turn.
 pub const WINDOW: usize = 32;
 /// Frames waiting to be written to one peer. A peer that lets this fill isn't
@@ -60,7 +64,8 @@ mod close {
     pub const FLOOD: u32 = 7;
 }
 
-/// Timings. [`Config::DEFAULT`] is what the app uses; tests use shorter ones.
+/// Timings and passphrase settings. [`Config::DEFAULT`] is what the app uses;
+/// tests use shorter and cheaper ones.
 #[derive(Debug, Clone, Copy)]
 pub struct Config {
     /// How long one attempt to reach someone may take.
@@ -71,6 +76,8 @@ pub struct Config {
     pub retry_first: Duration,
     /// …up to this.
     pub retry_max: Duration,
+    /// How a new passphrase is stretched (`/passphrase`).
+    pub kdf: KdfParams,
 }
 
 impl Config {
@@ -79,6 +86,7 @@ impl Config {
         handshake_timeout: Duration::from_secs(10),
         retry_first: Duration::from_secs(5),
         retry_max: Duration::from_secs(300),
+        kdf: KdfParams::DEFAULT,
     };
 }
 
@@ -105,6 +113,9 @@ pub enum Event {
     /// A contact's app speaks a different protocol version, so nothing can be
     /// exchanged until one of you updates. Messages keep waiting.
     VersionMismatch { peer: Code, theirs: u32 },
+    /// Whether this app can reach the internet (it's connected to a relay).
+    /// Sent once at start and again whenever it changes.
+    Network { online: bool },
     /// Something went wrong that the user should hear about.
     Problem(String),
 }
@@ -129,6 +140,8 @@ pub enum ChatError {
     Empty,
     #[error("that message is too long; the most is 16 KB")]
     TooLong,
+    #[error("wrong passphrase")]
+    WrongPassphrase,
     #[error("the chat engine has stopped")]
     Stopped,
 }
@@ -147,6 +160,9 @@ enum Command {
     People(Reply<Vec<Person>>),
     Contacts(Reply<Vec<Person>>),
     History(Code, Reply<Vec<StoredMessage>>),
+    ReadUpto(Code, Reply<Option<String>>),
+    ChangePassphrase { old: Zeroizing<String>, new: Zeroizing<String>, reply: Reply<()> },
+    Phrase(Zeroizing<String>, Reply<Seed>),
     Shutdown,
 }
 
@@ -184,6 +200,8 @@ enum Internal {
         id: u64,
         role: Role,
     },
+    /// Whether the endpoint is connected to a relay now.
+    Network(bool),
 }
 
 /// The UI's handle on the chat engine.
@@ -217,6 +235,7 @@ impl Client {
             dialing: HashSet::new(),
             retry: HashMap::new(),
             next_link: 0,
+            online: None,
         };
         let task = tokio::spawn(core.run(commands_rx, internal_rx));
         Ok(Client { commands, events, me, task })
@@ -292,6 +311,24 @@ impl Client {
         self.ask(|r| Command::History(peer, r)).await
     }
 
+    /// The newest message of `peer`'s that you've read, if any: everything
+    /// they sent after it is unread.
+    pub async fn read_upto(&self, peer: Code) -> Result<Option<String>, ChatError> {
+        self.ask(|r| Command::ReadUpto(peer, r)).await
+    }
+
+    /// Locks your history with `new` instead, if `old` is your passphrase now.
+    pub async fn change_passphrase(&self, old: &str, new: &str) -> Result<(), ChatError> {
+        let (old, new) = (Zeroizing::new(old.to_string()), Zeroizing::new(new.to_string()));
+        self.ask(|reply| Command::ChangePassphrase { old, new, reply }).await
+    }
+
+    /// Your seed (and so your 12 words), if `passphrase` is yours.
+    pub async fn phrase(&self, passphrase: &str) -> Result<Seed, ChatError> {
+        let passphrase = Zeroizing::new(passphrase.to_string());
+        self.ask(|r| Command::Phrase(passphrase, r)).await
+    }
+
     /// Closes every connection and stops. The store is released when this returns.
     pub async fn shutdown(self) {
         let _ = self.commands.send(Command::Shutdown);
@@ -315,6 +352,8 @@ struct Link {
     in_flight: HashSet<String>,
     /// The name a guest's app sent, kept in case they become a request.
     heard_name: Option<String>,
+    /// Name changes taken from a request on this connection.
+    renames: usize,
 }
 
 impl Link {
@@ -355,11 +394,14 @@ struct Core {
     dialing: HashSet<Code>,
     retry: HashMap<Code, Retry>,
     next_link: u64,
+    /// Whether the endpoint was connected to a relay, as last reported.
+    online: Option<bool>,
 }
 
 impl Core {
     async fn run(mut self, mut commands: mpsc::UnboundedReceiver<Command>, mut internal: mpsc::Receiver<Internal>) {
         let accept = tokio::spawn(accept_loop(self.endpoint.clone(), self.internal.clone()));
+        let network = tokio::spawn(watch_network(self.endpoint.clone(), self.internal.clone()));
         match self.store.contacts() {
             Ok(contacts) => {
                 for contact in contacts {
@@ -380,6 +422,7 @@ impl Core {
             }
         }
         accept.abort();
+        network.abort();
         for link in self.links.values() {
             link.conn.close(close::BYE.into(), b"bye");
         }
@@ -420,6 +463,15 @@ impl Core {
             }
             Command::History(peer, reply) => {
                 let _ = reply.send(self.store.history(&peer).map_err(ChatError::from));
+            }
+            Command::ReadUpto(peer, reply) => {
+                let _ = reply.send(self.store.read_upto(&peer).map_err(ChatError::from));
+            }
+            Command::ChangePassphrase { old, new, reply } => {
+                let _ = reply.send(self.change_passphrase(&old, &new));
+            }
+            Command::Phrase(passphrase, reply) => {
+                let _ = reply.send(self.check_passphrase(&passphrase).and_then(|()| Ok(self.store.profile()?.seed)));
             }
             Command::Shutdown => {}
         }
@@ -525,6 +577,18 @@ impl Core {
         Ok(())
     }
 
+    fn check_passphrase(&self, passphrase: &str) -> Result<(), ChatError> {
+        if self.store.check_passphrase(passphrase)? { Ok(()) } else { Err(ChatError::WrongPassphrase) }
+    }
+
+    fn change_passphrase(&self, old: &str, new: &str) -> Result<(), ChatError> {
+        if new.is_empty() {
+            return Err(StoreError::EmptyPassphrase.into());
+        }
+        self.check_passphrase(old)?;
+        Ok(self.store.change_passphrase(new, self.config.kdf)?)
+    }
+
     fn set_name(&mut self, name: &str) -> Result<String, ChatError> {
         let name = self.store.set_name(name)?;
         self.name = name.clone();
@@ -570,7 +634,8 @@ impl Core {
         match message {
             Internal::Incoming(conn) => self.incoming(conn),
             Internal::Ready { peer, id, conn, role, hello, out, verdict } => {
-                let link = Link { id, out, conn, initiator: peer, in_flight: HashSet::new(), heard_name: None };
+                let link =
+                    Link { id, out, conn, initiator: peer, in_flight: HashSet::new(), heard_name: None, renames: 0 };
                 self.ready(peer, role, hello, link, verdict);
             }
             Internal::Frame { peer, frame } => self.frame(peer, frame),
@@ -587,6 +652,11 @@ impl Core {
                 if role == Role::Dialer {
                     self.dialing.remove(&peer);
                     self.back_off(peer, None);
+                }
+            }
+            Internal::Network(online) => {
+                if self.online.replace(online) != Some(online) {
+                    self.emit(Event::Network { online });
                 }
             }
         }
@@ -815,8 +885,15 @@ impl Core {
                 }
             }
             Some(Standing::Blocked) => {}
-            Some(Standing::Contact | Standing::Request) => {
+            Some(standing @ (Standing::Contact | Standing::Request)) => {
                 if self.store.person(&peer)?.is_some_and(|p| p.name != name) {
+                    if standing == Standing::Request {
+                        let Some(link) = self.links.get_mut(&peer) else { return Ok(()) };
+                        if link.renames >= MAX_REQUEST_RENAMES {
+                            return Ok(());
+                        }
+                        link.renames += 1;
+                    }
                     self.store.set_contact_name(&peer, &name)?;
                     self.emit(Event::Name { of: peer, name });
                 }
@@ -931,6 +1008,23 @@ async fn accept_loop(endpoint: Endpoint, internal: mpsc::Sender<Internal>) {
                 let _ = internal.send(Internal::Incoming(conn)).await;
             }
         });
+    }
+}
+
+/// Tells the core whether the endpoint is connected to a relay: now, and on
+/// every change. Without one, only peers on the same network can be reached.
+async fn watch_network(endpoint: Endpoint, internal: mpsc::Sender<Internal>) {
+    let mut watcher = endpoint.home_relay_status();
+    let mut relays = watcher.get();
+    loop {
+        let online = relays.iter().any(RelayStatus::is_connected);
+        if internal.send(Internal::Network(online)).await.is_err() {
+            return;
+        }
+        match watcher.updated().await {
+            Ok(now) => relays = now,
+            Err(_) => return, // the endpoint is gone
+        }
     }
 }
 

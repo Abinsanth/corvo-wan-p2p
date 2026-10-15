@@ -172,6 +172,17 @@ impl Store {
         KeyFile::lock(&self.data_key, new_passphrase, params)?.write(&self.dir.join(KEY_FILE))
     }
 
+    /// Whether `passphrase` unlocks this account (for commands that ask for it
+    /// again). Another account's `key.json` never passes, whatever it's locked with.
+    pub fn check_passphrase(&self, passphrase: &str) -> Result<bool, StoreError> {
+        let key_path = self.dir.join(KEY_FILE);
+        match KeyFile::read(&key_path)?.unlock(passphrase, &key_path) {
+            Ok(key) => Ok(*key == *self.data_key),
+            Err(StoreError::WrongPassphrase) => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
     /// Deletes the account in `dir` (for `--recover` after a forgotten passphrase).
     /// `key.json` goes first, so a wipe cut short leaves no account.
     pub fn wipe(dir: &Path) -> Result<(), StoreError> {

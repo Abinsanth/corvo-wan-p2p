@@ -38,7 +38,7 @@ pub const MAX_REQUESTS: usize = 20;
 pub const MAX_REQUEST_MESSAGES: usize = 20;
 /// The most connections open at once from people who aren't contacts.
 pub const MAX_GUESTS: usize = 20;
-/// How many times a request may change its name on one connection. Later
+/// How many times a request may change its name before you answer it. Later
 /// changes are ignored, so a stranger can't flood the screen with renames.
 pub const MAX_REQUEST_RENAMES: usize = 5;
 /// The most messages sent to one peer and not yet acked; the rest wait their turn.
@@ -236,6 +236,7 @@ impl Client {
             retry: HashMap::new(),
             next_link: 0,
             online: None,
+            renames: HashMap::new(),
         };
         let task = tokio::spawn(core.run(commands_rx, internal_rx));
         Ok(Client { commands, events, me, task })
@@ -352,8 +353,6 @@ struct Link {
     in_flight: HashSet<String>,
     /// The name a guest's app sent, kept in case they become a request.
     heard_name: Option<String>,
-    /// Name changes taken from a request on this connection.
-    renames: usize,
 }
 
 impl Link {
@@ -396,6 +395,9 @@ struct Core {
     next_link: u64,
     /// Whether the endpoint was connected to a relay, as last reported.
     online: Option<bool>,
+    /// Name changes taken from each request, until it's answered. Kept per
+    /// person, not per connection, so reconnecting doesn't earn more.
+    renames: HashMap<Code, usize>,
 }
 
 impl Core {
@@ -504,6 +506,7 @@ impl Core {
     /// `peer` just became a contact. If they're connected (as a guest), that
     /// connection becomes a contact's; otherwise they're dialed now.
     fn welcome(&mut self, peer: Code) -> Result<(), StoreError> {
+        self.renames.remove(&peer);
         let Some(link) = self.links.get(&peer) else {
             self.retry_in(peer, Duration::ZERO);
             return Ok(());
@@ -540,6 +543,7 @@ impl Core {
 
     /// Closes the connection to `peer`, if any, and stops dialing them.
     fn drop_link(&mut self, peer: &Code, code: u32) {
+        self.renames.remove(peer);
         if let Some(link) = self.links.remove(peer) {
             link.conn.close(code.into(), b"");
             self.guests.remove(&link.id);
@@ -568,12 +572,15 @@ impl Core {
     }
 
     fn mark_read(&mut self, peer: Code) -> Result<(), ChatError> {
-        if !self.store.is_contact(&peer)? {
-            return Ok(()); // requests never get read receipts
-        }
+        let Some(standing @ (Standing::Contact | Standing::Request)) = self.store.standing(&peer)? else {
+            return Ok(());
+        };
         let Some(up_to) = self.store.last_received(&peer)? else { return Ok(()) };
         self.store.note_read(&peer, &up_to)?;
-        self.send_frame(&peer, Frame::Read { up_to });
+        // Remembered either way, but requests never get read receipts.
+        if standing == Standing::Contact {
+            self.send_frame(&peer, Frame::Read { up_to });
+        }
         Ok(())
     }
 
@@ -634,8 +641,7 @@ impl Core {
         match message {
             Internal::Incoming(conn) => self.incoming(conn),
             Internal::Ready { peer, id, conn, role, hello, out, verdict } => {
-                let link =
-                    Link { id, out, conn, initiator: peer, in_flight: HashSet::new(), heard_name: None, renames: 0 };
+                let link = Link { id, out, conn, initiator: peer, in_flight: HashSet::new(), heard_name: None };
                 self.ready(peer, role, hello, link, verdict);
             }
             Internal::Frame { peer, frame } => self.frame(peer, frame),
@@ -888,11 +894,11 @@ impl Core {
             Some(standing @ (Standing::Contact | Standing::Request)) => {
                 if self.store.person(&peer)?.is_some_and(|p| p.name != name) {
                     if standing == Standing::Request {
-                        let Some(link) = self.links.get_mut(&peer) else { return Ok(()) };
-                        if link.renames >= MAX_REQUEST_RENAMES {
+                        let renames = self.renames.entry(peer).or_default();
+                        if *renames >= MAX_REQUEST_RENAMES {
                             return Ok(());
                         }
-                        link.renames += 1;
+                        *renames += 1;
                     }
                     self.store.set_contact_name(&peer, &name)?;
                     self.emit(Event::Name { of: peer, name });

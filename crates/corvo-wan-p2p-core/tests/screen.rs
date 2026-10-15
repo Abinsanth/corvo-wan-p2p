@@ -98,3 +98,35 @@ async fn a_contact_can_rename_as_often_as_they_like() {
         a.expect(|e| *e == want).await;
     }
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn reconnecting_does_not_give_a_request_more_renames() {
+    let lookup = MemoryLookup::new();
+    let mut a = Peer::start(&lookup, "abin").await;
+    let fake = Fake::new(&lookup).await;
+    let (mut send, _recv, _) = fake.hello(a.code, PROTO_VERSION).await.unwrap();
+    write_frame(&mut send, &Frame::Name { name: "x0".into() }).await.unwrap();
+    say(&mut send, "m1", "hi").await;
+    a.expect(|e| matches!(e, Event::Request { .. })).await;
+    for i in 1..=MAX_REQUEST_RENAMES {
+        write_frame(&mut send, &Frame::Name { name: format!("x{i}") }).await.unwrap();
+        let want = Event::Name { of: fake.code, name: format!("x{i}") };
+        a.expect(|e| *e == want).await;
+    }
+    let (mut again, _recv2, _) = fake.hello(a.code, PROTO_VERSION).await.unwrap();
+    write_frame(&mut again, &Frame::Name { name: "renamed again".into() }).await.unwrap();
+    a.expect_none(QUIET, |e| matches!(e, Event::Name { .. })).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn reading_a_request_is_remembered_without_telling_them() {
+    let lookup = MemoryLookup::new();
+    let mut a = Peer::start(&lookup, "abin").await;
+    let mut b = Peer::start(&lookup, "rahul").await;
+    b.client.add_contact(a.code).await.unwrap();
+    b.client.send(a.code, "hi").await.unwrap();
+    let Event::Received { id, .. } = a.expect(|e| matches!(e, Event::Received { .. })).await else { unreachable!() };
+    a.client.mark_read(b.code).await.unwrap();
+    assert_eq!(a.client.read_upto(b.code).await.unwrap(), Some(id));
+    b.expect_none(QUIET, |e| matches!(e, Event::Read { .. })).await;
+}

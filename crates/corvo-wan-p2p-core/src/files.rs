@@ -80,12 +80,14 @@ pub(crate) fn write_private_atomic_with(
     let tmp = PathBuf::from(tmp);
     // A leftover temp file would keep its old mode, so always start fresh.
     remove_if_present(&tmp)?;
-    drop(private_file().create_new(true).open(&tmp)?);
+    // Written through the handle that created it, so the bytes go into the
+    // very file `prepare` saw, whatever happens to the path meanwhile.
+    let mut file = private_file().create_new(true).open(&tmp)?;
     let written = prepare(&tmp).and_then(|()| {
-        let mut file = OpenOptions::new().write(true).open(&tmp)?;
         file.write_all(bytes)?;
         file.sync_all()
     });
+    drop(file);
     if let Err(e) = written {
         let _ = fs::remove_file(&tmp);
         return Err(e);

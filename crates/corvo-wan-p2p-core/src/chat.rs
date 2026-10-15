@@ -774,17 +774,23 @@ impl Core {
         sent_at: i64,
         text: String,
     ) -> Result<(), StoreError> {
+        if standing == Some(Standing::Blocked) {
+            return Ok(());
+        }
+        // A repeat (our ack was lost, maybe before you removed them): ack it
+        // again, without writing anything or opening a request. Checking first
+        // matters: even an insert that changes nothing costs a disk sync.
+        if self.store.has_message(&peer, &id)? {
+            self.send_frame(&peer, Frame::Ack { id });
+            return Ok(());
+        }
         match standing {
-            Some(Standing::Contact) => {}
-            Some(Standing::Blocked) => return Ok(()),
+            Some(Standing::Contact | Standing::Blocked) => {}
             Some(Standing::Request) => {
-                let full = self.store.request_messages(&peer)? >= MAX_REQUEST_MESSAGES;
-                if full && !self.store.has_message(&peer, &id)? {
+                if self.store.request_messages(&peer)? >= MAX_REQUEST_MESSAGES {
                     return Ok(());
                 }
             }
-            // Sent again (their ack was lost before you removed them): no request for that.
-            None if self.store.has_message(&peer, &id)? => {}
             None => {
                 if self.requests()? >= MAX_REQUESTS {
                     return Ok(());
@@ -797,7 +803,6 @@ impl Core {
         if self.store.add_incoming(&peer, &id, sent_at, &text)? {
             self.emit(Event::Received { from: peer, id: id.clone(), sent_at, text });
         }
-        // Ack even a repeat: our earlier ack may have been lost.
         self.send_frame(&peer, Frame::Ack { id });
         Ok(())
     }

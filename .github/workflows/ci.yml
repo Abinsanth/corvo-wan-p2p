@@ -1,12 +1,11 @@
 name: CI
 
-# Docs-only changes skip CI.
+# Every push and PR runs CI, docs-only ones too: a skipped run never reports its
+# checks, so once they're required, a docs-only PR could never merge.
 on:
   push:
     branches: [main]
-    paths-ignore: ['**.md', LICENSE]
   pull_request:
-    paths-ignore: ['**.md', LICENSE]
 
 # A newer push to the same pull request cancels the older run; runs on main always finish.
 concurrency:

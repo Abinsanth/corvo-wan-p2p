@@ -4,6 +4,7 @@
 
 pub mod files;
 pub mod identity;
+pub mod recovery;
 pub mod store;
 
 /// The app version, shared by every crate in the workspace.

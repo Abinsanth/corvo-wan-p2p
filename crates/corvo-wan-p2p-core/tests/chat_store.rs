@@ -4,7 +4,7 @@ use std::fs;
 use std::path::Path;
 
 use corvo_wan_p2p_core::identity::{Code, Seed};
-use corvo_wan_p2p_core::store::{DB_FILE, KdfParams, Mark, Store, StoreError};
+use corvo_wan_p2p_core::store::{DB_FILE, KdfParams, Mark, Standing, Store, StoreError};
 
 fn store(dir: &Path) -> Store {
     Store::create(dir, "pass", KdfParams::FAST_INSECURE, &Seed::generate(), "abin").unwrap()
@@ -41,9 +41,9 @@ fn contact_names_and_last_seen_survive_a_restart() {
         s.set_last_seen(&rahul, 1_760_000_000_123).unwrap();
     }
     let s = Store::open(dir.path(), "pass").unwrap();
-    let c = s.contact(&rahul).unwrap().unwrap();
+    let c = s.person(&rahul).unwrap().unwrap();
     assert_eq!((c.name.as_str(), c.last_seen), ("rahul", Some(1_760_000_000_123)));
-    assert_eq!(s.contact(&someone()).unwrap(), None);
+    assert_eq!(s.person(&someone()).unwrap(), None);
 }
 
 #[test]
@@ -160,4 +160,136 @@ fn a_value_moved_to_another_row_does_not_open() {
     drop(db);
     let s = Store::open(dir.path(), "pass").unwrap();
     assert!(matches!(s.history(&rahul), Err(StoreError::Damaged { .. })));
+}
+
+#[test]
+fn a_request_can_be_accepted_and_its_messages_are_counted() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = store(dir.path());
+    let rahul = someone();
+    s.add_incoming(&rahul, "old", 1, "from before you removed them").unwrap();
+    assert!(s.add_request(&rahul, "rahul").unwrap());
+    assert!(!s.add_request(&rahul, "again").unwrap());
+    assert_eq!(s.standing(&rahul).unwrap(), Some(Standing::Request));
+    assert!(!s.is_contact(&rahul).unwrap());
+    assert_eq!(s.request_messages(&rahul).unwrap(), 0, "older history doesn't count");
+    s.add_incoming(&rahul, "new", 2, "hi").unwrap();
+    assert_eq!(s.request_messages(&rahul).unwrap(), 1);
+    assert!(s.has_message(&rahul, "new").unwrap());
+    assert!(!s.has_message(&rahul, "nope").unwrap());
+    let p = s.person(&rahul).unwrap().unwrap();
+    assert_eq!((p.name.as_str(), p.standing), ("rahul", Standing::Request));
+
+    assert!(s.accept(&rahul).unwrap());
+    assert!(!s.accept(&rahul).unwrap(), "already a contact");
+    assert!(s.is_contact(&rahul).unwrap());
+    assert_eq!(s.request_messages(&rahul).unwrap(), 0);
+    assert!(!s.accept(&someone()).unwrap());
+}
+
+#[test]
+fn blocking_drops_the_outbox_and_keeps_history() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = store(dir.path());
+    let (rahul, stranger) = (someone(), someone());
+    s.add_contact(&rahul).unwrap();
+    s.set_contact_name(&rahul, "rahul").unwrap();
+    s.add_outgoing(&rahul, "sent", 1, "delivered one").unwrap();
+    s.mark_delivered(&rahul, "sent").unwrap();
+    s.add_outgoing(&rahul, "queued", 2, "never sent").unwrap();
+    s.block(&rahul).unwrap();
+    s.block(&rahul).unwrap(); // twice is fine
+    s.block(&stranger).unwrap(); // someone you never knew
+    assert_eq!(s.standing(&rahul).unwrap(), Some(Standing::Blocked));
+    assert_eq!(s.standing(&stranger).unwrap(), Some(Standing::Blocked));
+    assert!(s.waiting(&rahul).unwrap().is_empty());
+    assert_eq!(s.history(&rahul).unwrap().iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), ["sent"]);
+    assert_eq!(s.person(&rahul).unwrap().unwrap().name, "rahul", "the name stays for the blocked list");
+    assert!(s.contacts().unwrap().is_empty());
+    assert!(!s.remove(&rahul, true).unwrap(), "blocked people stay blocked");
+
+    assert!(s.unblock(&rahul).unwrap());
+    assert!(!s.unblock(&rahul).unwrap());
+    assert_eq!(s.standing(&rahul).unwrap(), None);
+    assert_eq!(s.history(&rahul).unwrap().len(), 1);
+}
+
+#[test]
+fn removing_forgets_them_and_optionally_the_history() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = store(dir.path());
+    let (rahul, meera) = (someone(), someone());
+    for (who, id) in [(&rahul, "r"), (&meera, "m")] {
+        s.add_contact(who).unwrap();
+        s.add_incoming(who, &format!("{id}-in"), 1, "theirs").unwrap();
+        s.add_outgoing(who, &format!("{id}-out"), 2, "waiting").unwrap();
+    }
+    assert!(s.remove(&rahul, false).unwrap());
+    assert!(s.remove(&meera, true).unwrap());
+    assert!(!s.remove(&meera, true).unwrap());
+    assert_eq!((s.standing(&rahul).unwrap(), s.standing(&meera).unwrap()), (None, None));
+    assert_eq!(s.history(&rahul).unwrap().iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), ["r-in"]);
+    assert!(s.history(&meera).unwrap().is_empty());
+}
+
+#[test]
+fn people_lists_everyone_and_contacts_only_contacts() {
+    let dir = tempfile::tempdir().unwrap();
+    let (friend, asker, pest) = (someone(), someone(), someone());
+    {
+        let s = store(dir.path());
+        s.add_contact(&friend).unwrap();
+        s.add_request(&asker, "asker").unwrap();
+        s.block(&pest).unwrap();
+    }
+    let s = Store::open(dir.path(), "pass").unwrap();
+    let people: Vec<(Code, Standing)> = s.people().unwrap().iter().map(|p| (p.code, p.standing)).collect();
+    assert_eq!(people, [(friend, Standing::Contact), (asker, Standing::Request), (pest, Standing::Blocked)]);
+    assert_eq!(s.contacts().unwrap().iter().map(|p| p.code).collect::<Vec<_>>(), [friend]);
+}
+
+#[test]
+fn the_outbox_can_be_read_a_few_at_a_time() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = store(dir.path());
+    let rahul = someone();
+    for i in 0..5 {
+        s.add_outgoing(&rahul, &format!("m{i}"), i, "x").unwrap();
+    }
+    s.mark_delivered(&rahul, "m0").unwrap();
+    let first: Vec<String> = s.oldest_waiting(&rahul, 2).unwrap().into_iter().map(|m| m.id).collect();
+    assert_eq!(first, ["m1", "m2"]);
+}
+
+#[test]
+fn a_contact_saved_before_requests_existed_is_still_a_contact() {
+    let dir = tempfile::tempdir().unwrap();
+    let rahul = someone();
+    drop(store(dir.path()));
+    {
+        let s = Store::open(dir.path(), "pass").unwrap();
+        s.add_contact(&rahul).unwrap();
+    }
+    let db = rusqlite::Connection::open(dir.path().join(DB_FILE)).unwrap();
+    db.execute("UPDATE contacts SET standing = NULL", []).unwrap();
+    drop(db);
+    let s = Store::open(dir.path(), "pass").unwrap();
+    assert_eq!(s.standing(&rahul).unwrap(), Some(Standing::Contact));
+}
+
+#[test]
+fn a_standing_moved_to_another_row_does_not_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let (rahul, pest) = (someone(), someone());
+    {
+        let s = store(dir.path());
+        s.add_contact(&rahul).unwrap();
+        s.block(&pest).unwrap();
+    }
+    let db = rusqlite::Connection::open(dir.path().join(DB_FILE)).unwrap();
+    db.execute("UPDATE contacts SET standing = (SELECT standing FROM contacts WHERE rowid = 2) WHERE rowid = 1", [])
+        .unwrap();
+    drop(db);
+    let s = Store::open(dir.path(), "pass").unwrap();
+    assert!(matches!(s.standing(&rahul), Err(StoreError::Damaged { .. })));
 }

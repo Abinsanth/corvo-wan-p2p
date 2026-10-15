@@ -202,10 +202,14 @@ pub enum CodeError {
 pub const NAME_MAX_CHARS: usize = 32;
 
 /// Tidies a display name: trims it and turns runs of spaces into one.
-/// It must end up 1 to 32 characters, with no control characters.
+/// It must end up 1 to 32 characters, with no control characters and nothing
+/// invisible (see [`is_invisible`]).
 pub fn clean_name(raw: &str) -> Result<String, NameError> {
     if raw.chars().any(char::is_control) {
         return Err(NameError::ControlCharacter);
+    }
+    if let Some(c) = raw.chars().find(|&c| is_invisible(c)) {
+        return Err(NameError::Invisible(c));
     }
     let name = raw.split_whitespace().collect::<Vec<_>>().join(" ");
     match name.chars().count() {
@@ -213,6 +217,33 @@ pub fn clean_name(raw: &str) -> Result<String, NameError> {
         n if n > NAME_MAX_CHARS => Err(NameError::TooLong(n)),
         _ => Ok(name),
     }
+}
+
+/// Characters that never belong in a name: they show nothing, or they turn
+/// the text around them backwards, so a name can pass for someone else's.
+/// The zero-width joiners U+200C and U+200D, variation selectors and the tag
+/// characters of subdivision flags are allowed, because emoji and Indic and Persian
+/// writing need them; `names` ignores them when comparing.
+pub fn is_invisible(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00AD}' // soft hyphen
+            | '\u{034F}' // combining grapheme joiner
+            | '\u{061C}' // Arabic letter mark
+            | '\u{115F}' | '\u{1160}' | '\u{3164}' | '\u{FFA0}' // Hangul fillers
+            | '\u{17B4}' | '\u{17B5}' // Khmer inherent vowels
+            | '\u{180B}'..='\u{180F}' // Mongolian variation selectors and vowel separator
+            | '\u{200B}' // zero-width space
+            | '\u{200E}' | '\u{200F}' // left-to-right and right-to-left marks
+            | '\u{202A}'..='\u{202E}' // direction embeddings and overrides
+            | '\u{2060}'..='\u{206F}' // word joiner, invisible operators, direction isolates
+            | '\u{FEFF}' // byte-order mark
+            | '\u{FFF9}'..='\u{FFFB}' // interlinear annotation
+            | '\u{2800}' // braille blank
+            | '\u{1BCA0}'..='\u{1BCA3}' // shorthand format controls
+            | '\u{1D173}'..='\u{1D17A}' // musical formatting
+            | '\u{E0001}' // language tag
+    )
 }
 
 /// Why a display name was refused.
@@ -224,6 +255,8 @@ pub enum NameError {
     TooLong(usize),
     #[error("a name can't contain tabs, line breaks or other control characters")]
     ControlCharacter,
+    #[error("a name can't contain invisible or text-direction characters (U+{:04X})", u32::from(*.0))]
+    Invisible(char),
 }
 
 #[cfg(test)]
@@ -333,5 +366,28 @@ mod tests {
         assert_eq!(clean_name(&"é".repeat(33)), Err(NameError::TooLong(33)));
         assert_eq!(clean_name("bad\tname"), Err(NameError::ControlCharacter));
         assert_eq!(clean_name("two\nlines"), Err(NameError::ControlCharacter));
+    }
+
+    #[test]
+    fn invisible_and_backwards_names_are_refused() {
+        assert_eq!(clean_name("rahu\u{200B}l"), Err(NameError::Invisible('\u{200B}')));
+        assert_eq!(clean_name("\u{202E}luhar"), Err(NameError::Invisible('\u{202E}')));
+        assert_eq!(clean_name("\u{2067}abin\u{2069}"), Err(NameError::Invisible('\u{2067}')));
+        assert_eq!(clean_name("\u{3164}"), Err(NameError::Invisible('\u{3164}')));
+        for blank in ['\u{2800}', '\u{1D173}', '\u{1BCA0}', '\u{E0001}'] {
+            assert_eq!(
+                clean_name(&format!("rahul{blank}")),
+                Err(NameError::Invisible(blank)),
+                "U+{:04X}",
+                u32::from(blank)
+            );
+        }
+        assert_eq!(
+            NameError::Invisible('\u{200B}').to_string(),
+            "a name can't contain invisible or text-direction characters (U+200B)"
+        );
+        // Joiners are part of real writing and emoji.
+        assert_eq!(clean_name("👩\u{200D}💻").unwrap(), "👩\u{200D}💻");
+        assert_eq!(clean_name("می\u{200C}خواهم").unwrap(), "می\u{200C}خواهم");
     }
 }

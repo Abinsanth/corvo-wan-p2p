@@ -1,13 +1,17 @@
 //! One connection to one peer: the hello exchange, then a reader loop here and
 //! a writer task, so a slow read never blocks a write (and reads are never
 //! cancelled half-way).
+//!
+//! Nothing is read past their hello, and an accepted connection gets no hello
+//! of ours, until the core has looked at it and said yes. So a connection the
+//! core turns down never delivers a frame, and never sees us answer.
 
 use std::time::Duration;
 
 use iroh::endpoint::{Connection, ConnectionError, RecvStream, SendStream};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
-use super::{DUPLICATE, Internal};
+use super::{Internal, OUT_QUEUE, close};
 use crate::identity::Code;
 use crate::proto::{Frame, FrameError, read_frame, write_frame};
 
@@ -27,7 +31,7 @@ pub(super) struct Start {
     pub id: u64,
     pub hello: Frame,
     pub handshake_timeout: Duration,
-    pub internal: mpsc::UnboundedSender<Internal>,
+    pub internal: mpsc::Sender<Internal>,
 }
 
 /// Runs the link until the connection ends, reporting to the core through `internal`.
@@ -37,31 +41,41 @@ pub(super) async fn run(start: Start) {
     let (send, mut recv, theirs) = match handshake {
         Ok(Ok(parts)) => parts,
         _ => {
-            conn.close(1u32.into(), b"handshake failed");
-            if role == Role::Dialer {
-                let _ = internal.send(Internal::DialFailed { peer });
-            }
+            conn.close(close::HANDSHAKE.into(), b"handshake failed");
+            let _ = internal.send(Internal::Failed { peer, id, role }).await;
             return;
         }
     };
-    let (out, out_rx) = mpsc::unbounded_channel();
-    tokio::spawn(write_loop(send, out_rx));
-    let ready = Internal::Ready { peer, id, conn: conn.clone(), role, hello: theirs, out };
-    if internal.send(ready).is_err() {
-        return;
+    let (out, out_rx) = mpsc::channel(OUT_QUEUE);
+    if role == Role::Acceptor {
+        // Our hello is the first thing written, and only once the core says
+        // yes: someone turned away (blocked, say) never gets one.
+        let _ = out.try_send(hello);
     }
+    let (verdict, accepted) = oneshot::channel();
+    let ready = Internal::Ready { peer, id, conn: conn.clone(), role, hello: theirs, out, verdict };
+    if internal.send(ready).await.is_err() || accepted.await != Ok(true) {
+        return; // the core turned it down and has closed it
+    }
+    tokio::spawn(write_loop(send, out_rx));
     while let Ok(frame) = read_frame(&mut recv).await {
-        if internal.send(Internal::Frame { peer, frame }).is_err() {
+        if matches!(frame, Frame::Hello { .. }) {
+            conn.close(close::BAD_HELLO.into(), b"unexpected hello");
+            break;
+        }
+        // Waits while the core is busy, so a peer sending faster than we can
+        // save just stops being read (and QUIC slows them down).
+        if internal.send(Internal::Frame { peer, frame }).await.is_err() {
             break;
         }
     }
     // Closed by them as the losing half of a double dial, not because they left.
     let duplicate = matches!(
         conn.close_reason(),
-        Some(ConnectionError::ApplicationClosed(close)) if close.error_code == DUPLICATE.into()
+        Some(ConnectionError::ApplicationClosed(c)) if c.error_code == close::DUPLICATE.into()
     );
-    conn.close(0u32.into(), b"bye");
-    let _ = internal.send(Internal::Closed { peer, id, duplicate });
+    conn.close(close::BYE.into(), b"bye");
+    let _ = internal.send(Internal::Closed { peer, id, duplicate }).await;
 }
 
 async fn shake_hands(
@@ -78,15 +92,15 @@ async fn shake_hands(
             Ok((send, recv, theirs))
         }
         Role::Acceptor => {
-            let (mut send, mut recv) = conn.accept_bi().await.map_err(|e| connection(&e))?;
+            // Our hello waits for the core's verdict (see `run`).
+            let (send, mut recv) = conn.accept_bi().await.map_err(|e| connection(&e))?;
             let theirs = read_frame(&mut recv).await?;
-            write_frame(&mut send, hello).await?;
             Ok((send, recv, theirs))
         }
     }
 }
 
-async fn write_loop(mut send: SendStream, mut frames: mpsc::UnboundedReceiver<Frame>) {
+async fn write_loop(mut send: SendStream, mut frames: mpsc::Receiver<Frame>) {
     while let Some(frame) = frames.recv().await {
         if write_frame(&mut send, &frame).await.is_err() {
             break;

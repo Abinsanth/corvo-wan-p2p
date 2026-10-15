@@ -157,12 +157,16 @@ async fn a_different_protocol_version_is_reported_and_messages_wait() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn strangers_are_turned_away() {
+async fn a_contact_that_answers_wrongly_is_retried_with_back_off() {
     let lookup = MemoryLookup::new();
-    let mut a = Peer::start(&lookup, "abin").await;
     let fake = Fake::new(&lookup).await;
-    assert!(fake.hello(a.code, PROTO_VERSION).await.is_none(), "a stranger gets no hello back");
-    a.expect_none(Duration::from_millis(500), |e| matches!(e, Event::Online(_) | Event::Received { .. })).await;
+    let dials = fake.answer_with(Frame::Ack { id: "not a hello".into() });
+    let a = Peer::start(&lookup, "abin").await;
+    a.client.add_contact(fake.code).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    // Back-off from 200 ms doubling to 1 s allows about 3 tries in 1.5 s.
+    let n = dials.load(std::sync::atomic::Ordering::SeqCst);
+    assert!((1..=6).contains(&n), "{n} dials in 1.5 s");
 }
 
 #[tokio::test(flavor = "multi_thread")]

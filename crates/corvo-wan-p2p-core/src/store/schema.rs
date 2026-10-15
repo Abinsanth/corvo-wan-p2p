@@ -33,6 +33,10 @@ const STEPS: &[&str] = &[
         UNIQUE (peer, msg)
     );
     CREATE INDEX messages_waiting ON messages (peer, waiting);",
+    // 3: requests and blocking. The contacts table now holds everyone you know
+    // of; `standing` (sealed) says whether each is a contact, a request or
+    // blocked. Rows from before this step have none: they're contacts.
+    "ALTER TABLE contacts ADD COLUMN standing BLOB;",
 ];
 
 /// What [`upgrade`] found.
@@ -74,7 +78,7 @@ mod tests {
         assert_eq!(version(&db), STEPS.len() as i64);
         assert_eq!(upgrade(&mut db).unwrap(), Upgrade::Done);
         db.execute("INSERT INTO profile (id, seed, name) VALUES (1, x'00', x'00')", []).unwrap();
-        db.execute("INSERT INTO contacts (peer, key, name) VALUES (x'01', x'00', x'00')", []).unwrap();
+        db.execute("INSERT INTO contacts (peer, key, name, standing) VALUES (x'01', x'00', x'00', x'00')", []).unwrap();
         db.execute("INSERT INTO messages (peer, msg, body, mark, waiting) VALUES (x'01', x'02', x'00', x'00', 1)", [])
             .unwrap();
     }

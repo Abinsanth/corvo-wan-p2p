@@ -4,6 +4,8 @@
 
 #![allow(dead_code)] // each test file uses a different part of this
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use corvo_wan_p2p_core::chat::{Client, Config, Event};
@@ -11,9 +13,9 @@ use corvo_wan_p2p_core::identity::{Code, Seed};
 use corvo_wan_p2p_core::net::{ALPN, local_addr, local_endpoint};
 use corvo_wan_p2p_core::proto::{Frame, read_frame, write_frame};
 use corvo_wan_p2p_core::store::{KdfParams, Store};
-use iroh::Endpoint;
 use iroh::address_lookup::MemoryLookup;
-use iroh::endpoint::{RecvStream, SendStream};
+use iroh::endpoint::{QuicTransportConfig, RecvStream, SendStream, VarInt, presets};
+use iroh::{Endpoint, RelayMode};
 use tempfile::TempDir;
 
 /// Short timings, so a test doesn't wait minutes for a retry.
@@ -86,6 +88,12 @@ impl Peer {
         }
     }
 
+    /// Skips every event that has already happened. After a command returns,
+    /// that's everything from before it.
+    pub async fn skip_pending(&mut self) {
+        while let Ok(Some(_)) = tokio::time::timeout(Duration::ZERO, self.client.next_event()).await {}
+    }
+
     /// Fails if `unwanted` happens within `within`.
     pub async fn expect_none(&mut self, within: Duration, unwanted: impl Fn(&Event) -> bool) {
         let deadline = tokio::time::Instant::now() + within;
@@ -126,14 +134,67 @@ impl Fake {
     /// and the hello that came back. `None` if the app refused the connection,
     /// which it may do at any point of the exchange.
     pub async fn hello(&self, to: Code, proto: u32) -> Option<(SendStream, RecvStream, Frame)> {
+        self.hello_with(to, proto, &[]).await
+    }
+
+    /// Like [`Fake::hello`], but sends `then` straight after the hello,
+    /// without waiting for the app's answer.
+    pub async fn hello_with(&self, to: Code, proto: u32, then: &[Frame]) -> Option<(SendStream, RecvStream, Frame)> {
         let exchange = async {
             let conn = self.endpoint.connect(to.key(), ALPN).await.ok()?;
             let (mut send, mut recv) = conn.open_bi().await.ok()?;
             write_frame(&mut send, &Frame::Hello { proto, app_version: "test".into() }).await.ok()?;
+            for frame in then {
+                write_frame(&mut send, frame).await.ok()?;
+            }
             let theirs = read_frame(&mut recv).await.ok()?;
             Some((send, recv, theirs))
         };
         tokio::time::timeout(PATIENCE, exchange).await.expect("the exchange took too long")
+    }
+}
+
+impl Fake {
+    /// A fake that takes in at most `bytes` at a time from a connection, so
+    /// whatever it doesn't read backs up on the sender's side.
+    pub async fn with_small_window(lookup: &MemoryLookup, bytes: u32) -> Fake {
+        let seed = Seed::generate();
+        let transport = QuicTransportConfig::builder()
+            .stream_receive_window(VarInt::from_u32(bytes))
+            .receive_window(VarInt::from_u32(bytes))
+            .build();
+        let endpoint = Endpoint::builder(presets::Minimal)
+            .secret_key(seed.secret_key())
+            .alpns(vec![ALPN.to_vec()])
+            .relay_mode(RelayMode::Disabled)
+            .address_lookup(lookup.clone())
+            .transport_config(transport)
+            .bind()
+            .await
+            .unwrap();
+        lookup.set_endpoint_info(local_addr(&endpoint));
+        Fake { code: seed.code(), endpoint }
+    }
+
+    /// Answers every connection with `reply` where a hello should be, keeps it
+    /// open, and counts the connections.
+    pub fn answer_with(&self, reply: Frame) -> Arc<AtomicUsize> {
+        let count = Arc::new(AtomicUsize::new(0));
+        let (endpoint, counter) = (self.endpoint.clone(), count.clone());
+        tokio::spawn(async move {
+            while let Some(incoming) = endpoint.accept().await {
+                counter.fetch_add(1, Ordering::SeqCst);
+                let reply = reply.clone();
+                tokio::spawn(async move {
+                    let Ok(conn) = incoming.await else { return };
+                    let Ok((mut send, mut recv)) = conn.accept_bi().await else { return };
+                    let _ = read_frame(&mut recv).await;
+                    let _ = write_frame(&mut send, &reply).await;
+                    conn.closed().await;
+                });
+            }
+        });
+        count
     }
 }
 
@@ -145,6 +206,31 @@ pub async fn next_frame(recv: &mut RecvStream, wanted: impl Fn(&Frame) -> bool) 
             return frame;
         }
     }
+}
+
+/// Sends a message frame.
+pub async fn say(send: &mut SendStream, id: &str, text: &str) {
+    write_frame(send, &Frame::Msg { id: id.into(), sent_at: 1, text: text.into() }).await.unwrap();
+}
+
+/// The next `n` frames, whatever they are.
+pub async fn next_frames(recv: &mut RecvStream, n: usize) -> Vec<Frame> {
+    let mut frames = Vec::new();
+    for _ in 0..n {
+        frames.push(next_frame(recv, |_| true).await);
+    }
+    frames
+}
+
+/// Every frame that arrives until none has for `quiet`. Only for checking
+/// that nothing more comes: on a slow machine even the first frame can take
+/// longer than `quiet`, so wait for expected frames with `next_frame`.
+pub async fn frames_until_quiet(recv: &mut RecvStream, quiet: Duration) -> Vec<Frame> {
+    let mut frames = Vec::new();
+    while let Ok(Ok(frame)) = tokio::time::timeout(quiet, read_frame(recv)).await {
+        frames.push(frame);
+    }
+    frames
 }
 
 /// Whether the other side closes the connection (reads until it fails).

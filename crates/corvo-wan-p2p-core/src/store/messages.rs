@@ -98,17 +98,52 @@ impl Store {
 
     /// Your messages to `to` that their app hasn't confirmed yet, oldest first.
     pub fn waiting(&self, to: &Code) -> Result<Vec<StoredMessage>, StoreError> {
-        self.select(to, "AND waiting = 1")
+        self.select(to, "AND waiting = 1", "")
+    }
+
+    /// The oldest `n` of [`Store::waiting`], without reading the rest.
+    pub fn oldest_waiting(&self, to: &Code, n: usize) -> Result<Vec<StoredMessage>, StoreError> {
+        self.select(to, "AND waiting = 1", &format!("LIMIT {n}"))
     }
 
     /// Everything between you and `peer`, oldest first.
     pub fn history(&self, peer: &Code) -> Result<Vec<StoredMessage>, StoreError> {
-        self.select(peer, "")
+        self.select(peer, "", "")
     }
 
-    fn select(&self, peer: &Code, filter: &str) -> Result<Vec<StoredMessage>, StoreError> {
+    /// Whether a message with this id from or to `peer` is saved.
+    pub fn has_message(&self, peer: &Code, id: &str) -> Result<bool, StoreError> {
+        let found = self
+            .db
+            .query_row(
+                "SELECT 1 FROM messages WHERE peer = ?1 AND msg = ?2",
+                params![self.peer_tag(peer), self.msg_tag(id)],
+                |_| Ok(()),
+            )
+            .optional()?;
+        Ok(found.is_some())
+    }
+
+    /// The `seq` of the newest message saved with anyone (0 if none).
+    pub(super) fn last_seq(&self) -> Result<i64, StoreError> {
+        Ok(self.db.query_row("SELECT COALESCE(MAX(seq), 0) FROM messages", [], |r| r.get(0))?)
+    }
+
+    /// Drops your messages to `to` that haven't gone out yet.
+    pub(super) fn delete_waiting(&self, to: &Code) -> Result<(), StoreError> {
+        self.db.execute("DELETE FROM messages WHERE peer = ?1 AND waiting = 1", [self.peer_tag(to)])?;
+        Ok(())
+    }
+
+    /// Deletes every message between you and `peer`.
+    pub(super) fn delete_history(&self, peer: &Code) -> Result<(), StoreError> {
+        self.db.execute("DELETE FROM messages WHERE peer = ?1", [self.peer_tag(peer)])?;
+        Ok(())
+    }
+
+    fn select(&self, peer: &Code, filter: &str, limit: &str) -> Result<Vec<StoredMessage>, StoreError> {
         let peer = self.peer_tag(peer);
-        let sql = format!("SELECT msg, body, mark FROM messages WHERE peer = ?1 {filter} ORDER BY seq");
+        let sql = format!("SELECT msg, body, mark FROM messages WHERE peer = ?1 {filter} ORDER BY seq {limit}");
         let mut query = self.db.prepare(&sql)?;
         let rows = query
             .query_map([peer], |r| Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, Vec<u8>>(1)?, r.get::<_, Vec<u8>>(2)?)))?;

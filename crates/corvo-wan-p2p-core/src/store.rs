@@ -7,10 +7,10 @@
 //!
 //! A `lock` file stops two copies of the app opening the same data at once.
 
-mod contacts;
 mod crypt;
 mod keyfile;
 mod messages;
+mod people;
 mod schema;
 
 use std::fs::{self, File, TryLockError};
@@ -20,10 +20,10 @@ use std::path::{Path, PathBuf};
 use rusqlite::{Connection, OptionalExtension, params};
 use zeroize::Zeroizing;
 
-pub use contacts::Contact;
 pub use crypt::KdfParams;
 use keyfile::KeyFile;
 pub use messages::{Mark, StoredMessage};
+pub use people::{Person, Standing};
 
 use crate::files::{private_dir, private_file};
 use crate::identity::{NameError, Seed, clean_name};

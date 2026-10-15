@@ -7,6 +7,7 @@ pub mod chat;
 pub mod clip;
 pub mod commands;
 pub mod onboarding;
+pub mod people;
 pub mod runner;
 pub mod state;
 pub mod update;

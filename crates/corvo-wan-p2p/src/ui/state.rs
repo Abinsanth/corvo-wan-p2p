@@ -494,6 +494,18 @@ impl State {
         }
     }
 
+    /// Closes the chat with `code`, if it's open.
+    pub fn close_chat(&mut self, code: Code) {
+        let Some(at) = self.tabs.iter().position(|t| t.peer == Some(code)) else { return };
+        let was = self.current;
+        self.tabs.remove(at);
+        if was == at {
+            self.select_tab(at - 1);
+        } else if was > at {
+            self.current = was - 1;
+        }
+    }
+
     /// The person in the open tab, if it's a chat.
     pub fn open_peer(&self) -> Option<Code> {
         self.tab().peer

@@ -6,12 +6,13 @@ use std::path::PathBuf;
 
 use corvo_wan_p2p_core::chat::Event;
 use corvo_wan_p2p_core::identity::{Code, Seed};
-use corvo_wan_p2p_core::store::{StoreError, StoredMessage};
+use corvo_wan_p2p_core::store::{Person, StoreError, StoredMessage};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind};
 
 use super::account::{self, PhraseDone, PhraseUse};
 use super::chat::{self, Loaded};
 use super::commands::{Cmd, HELP, Input, KEYS, parse};
+use super::people::{self, Act, Show};
 use super::state::{Screen, Secret, State, Tone, WHEEL_STEP};
 use super::view::chat_page;
 
@@ -75,6 +76,13 @@ pub enum Effect {
     },
     /// You've seen everything they sent.
     MarkRead(Code),
+    Act {
+        code: Code,
+        act: Act,
+    },
+    SetName(String),
+    /// Read everyone again, then show `Show`.
+    Refresh(Show),
 }
 
 impl Effect {
@@ -120,6 +128,18 @@ pub enum Outcome {
     },
     /// Something went wrong that the user should hear about.
     Failed(String),
+    /// `people` is everyone, read again after acting (if that worked).
+    Acted {
+        code: Code,
+        act: Act,
+        result: Result<(), String>,
+        people: Option<Vec<Person>>,
+    },
+    Named(Result<String, String>),
+    Refreshed {
+        show: Show,
+        result: Result<Vec<Person>, String>,
+    },
     /// Something that leaves the app unusable, like the engine not starting.
     Fatal(String),
 }
@@ -340,7 +360,7 @@ fn on_command(state: &mut State, cmd: Cmd, effects: &mut Vec<Effect>) {
                 state.say(Tone::Bad, "the corvo tab stays open; /quit leaves the app");
             }
         }
-        other => state.say(Tone::Warn, format!("{} isn't available yet", other.typed())),
+        other => people::command(state, other, effects),
     }
 }
 
@@ -365,6 +385,9 @@ fn on_done(state: &mut State, outcome: Outcome, effects: &mut Vec<Effect>) {
         Outcome::Failed(why) => state.say(Tone::Bad, why),
         Outcome::Loaded(result) => chat::loaded(state, result),
         Outcome::Sent { to, text, result } => chat::sent(state, to, text, result),
+        Outcome::Acted { code, act, result, people } => people::acted(state, code, act, result, people),
+        Outcome::Named(result) => people::named(state, result),
+        Outcome::Refreshed { show, result } => people::refreshed(state, show, result),
         other => match &mut state.screen {
             Screen::Onboarding(onboarding) => effects.extend(onboarding.done(other)),
             Screen::Main => effects.extend(account::done(state, other)),
@@ -591,15 +614,12 @@ mod tests {
     }
 
     #[test]
-    fn mistakes_and_later_commands_are_said_and_flashed() {
+    fn mistakes_are_said_and_flashed() {
         let mut s = state();
         send(&mut s, "/acept");
         assert_eq!(last_corvo(&s).text, "unknown command /acept: did you mean /accept?");
         assert_eq!(s.flash.as_ref().unwrap().line, *last_corvo(&s));
-        send(&mut s, "/contacts");
-        assert_eq!(last_corvo(&s).text, "/contacts isn't available yet");
-        send(&mut s, "/blocked");
-        assert_eq!(last_corvo(&s).text, "/blocked isn't available yet");
+        s.select_tab(0);
         send(&mut s, "hello");
         assert!(last_corvo(&s).text.starts_with("this is the corvo tab"));
         let before = s.tabs[0].lines.len();

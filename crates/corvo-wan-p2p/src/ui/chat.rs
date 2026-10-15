@@ -1,6 +1,7 @@
 //! Chatting: what the engine says (messages, marks, people coming and going,
 //! the network), sending, and unread counts.
 
+use chrono::{DateTime, Local};
 use corvo_wan_p2p_core::chat::Event;
 use corvo_wan_p2p_core::identity::Code;
 use corvo_wan_p2p_core::proto::PROTO_VERSION;
@@ -154,6 +155,16 @@ pub fn loaded(state: &mut State, result: Result<Loaded, String>) {
 fn unread_after(messages: &[StoredMessage], read_upto: Option<&str>) -> usize {
     let after = read_upto.and_then(|id| messages.iter().position(|m| m.id == id)).map_or(0, |at| at + 1);
     messages[after..].iter().filter(|m| m.mark == Mark::Received).count()
+}
+
+/// A time in Unix milliseconds in the local time zone.
+pub fn local(ms: i64) -> Option<DateTime<Local>> {
+    DateTime::from_timestamp_millis(ms).map(|t| t.with_timezone(&Local))
+}
+
+/// A day and time, like `Thu 15 Oct 14:02`.
+pub fn day_and_time(ms: i64) -> String {
+    local(ms).map_or_else(|| "--".into(), |t| t.format("%a %-d %b %H:%M").to_string())
 }
 
 /// Four times a second.

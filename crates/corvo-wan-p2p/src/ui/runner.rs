@@ -102,7 +102,12 @@ impl<W: Write> Runner<W> {
                 None => Err(NOT_STARTED.into()),
             }),
             Effect::Phrase { passphrase, then } => Outcome::Phrase(self.phrase(&passphrase, then).await),
-            Effect::Load | Effect::Send { .. } | Effect::MarkRead(_) => return Ok(Flow::Next(None)),
+            Effect::Load
+            | Effect::Send { .. }
+            | Effect::MarkRead(_)
+            | Effect::Act { .. }
+            | Effect::SetName(_)
+            | Effect::Refresh(_) => return Ok(Flow::Next(None)),
         };
         Ok(Flow::Next(Some(Msg::Done(outcome))))
     }

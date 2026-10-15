@@ -517,9 +517,9 @@ mod tests {
         let mut state = State::new("ana".into(), "abcdefgh".into());
         let rahul = Seed::generate().code();
         state.people = vec![
-            Peer { code: rahul, label: "rahul".into(), online: true, request: false },
-            Peer { code: Seed::generate().code(), label: "maria".into(), online: false, request: false },
-            Peer { code: Seed::generate().code(), label: "bob·m4x8".into(), online: false, request: true },
+            Peer { code: rahul, label: "rahul".into(), online: true, request: false, unread: 0 },
+            Peer { code: Seed::generate().code(), label: "maria".into(), online: false, request: false, unread: 0 },
+            Peer { code: Seed::generate().code(), label: "bob·m4x8".into(), online: false, request: true, unread: 0 },
         ];
         let mut chat = Tab::chat(rahul, "rahul".into());
         for i in 0..40 {

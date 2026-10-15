@@ -2,9 +2,12 @@
 //! scrolling, the sidebar, the flash and the status line. Only `update`
 //! changes it; `view` only reads it.
 
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use corvo_wan_p2p_core::identity::Code;
+use corvo_wan_p2p_core::names;
+use corvo_wan_p2p_core::store::{Person, Standing, StoredMessage};
 use zeroize::Zeroizing;
 
 use super::account::Pending;
@@ -330,6 +333,16 @@ pub struct Peer {
     pub online: bool,
     /// Not a contact yet: listed under *Requests*.
     pub request: bool,
+    /// Their messages you haven't seen.
+    pub unread: usize,
+}
+
+/// One conversation: its messages, oldest first, and how many of theirs you
+/// haven't seen.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Chat {
+    pub messages: Vec<StoredMessage>,
+    pub unread: usize,
 }
 
 /// A short message under the chat area that goes away by itself.
@@ -367,6 +380,17 @@ pub struct State {
     pub pending: Option<Pending>,
     /// Your 12 words, shown over the chat until a key is pressed.
     pub reveal: Option<Secret>,
+    /// Everyone you know of, blocked people too.
+    pub known: Vec<Person>,
+    /// What each of `known` is called on screen (see `names::labels`).
+    pub labels: HashMap<Code, String>,
+    /// Contacts connected right now.
+    pub connected: HashSet<Code>,
+    pub chats: HashMap<Code, Chat>,
+    /// Whether the window has focus: messages are only marked read while it does.
+    pub focused: bool,
+    /// Ticks since the engine started, to wait a little before saying "offline".
+    pub since_start: u32,
 }
 
 impl State {
@@ -389,6 +413,12 @@ impl State {
             busy: None,
             pending: None,
             reveal: None,
+            known: Vec::new(),
+            labels: HashMap::new(),
+            connected: HashSet::new(),
+            chats: HashMap::new(),
+            focused: true,
+            since_start: 0,
         }
     }
 
@@ -403,6 +433,75 @@ impl State {
             Screen::Onboarding(onboarding) => Some(onboarding.ask()),
             Screen::Main => self.pending.as_ref().map(Pending::ask),
         }
+    }
+
+    /// How `code` is shown: their label, or the start of their code if unknown.
+    pub fn label(&self, code: &Code) -> String {
+        self.labels.get(code).cloned().unwrap_or_else(|| code.short())
+    }
+
+    pub fn standing(&self, code: &Code) -> Option<Standing> {
+        self.known.iter().find(|p| p.code == *code).map(|p| p.standing)
+    }
+
+    /// Replaces everyone known, then relabels.
+    pub fn set_people(&mut self, people: Vec<Person>) {
+        self.known = people;
+        self.relabel();
+    }
+
+    /// Recomputes the labels after a change to `known`, and with them the
+    /// sidebar and the chat tabs' titles.
+    pub fn relabel(&mut self) {
+        self.labels = names::labels(&self.known);
+        for i in 1..self.tabs.len() {
+            if let Some(code) = self.tabs[i].peer {
+                self.tabs[i].title = self.label(&code);
+            }
+        }
+        self.refresh_sidebar();
+    }
+
+    /// Rebuilds the sidebar: contacts, then requests, each by label.
+    pub fn refresh_sidebar(&mut self) {
+        let mut people: Vec<Peer> = self
+            .known
+            .iter()
+            .filter(|p| p.standing != Standing::Blocked)
+            .map(|p| Peer {
+                code: p.code,
+                label: self.label(&p.code),
+                online: self.connected.contains(&p.code),
+                request: p.standing == Standing::Request,
+                unread: self.chats.get(&p.code).map_or(0, |c| c.unread),
+            })
+            .collect();
+        people.sort_by_key(|p| (p.request, p.label.to_lowercase()));
+        self.people = people;
+    }
+
+    /// The tab for a chat with `code`, opened if needed; selected if `switch`.
+    pub fn open_chat(&mut self, code: Code, switch: bool) {
+        let at = match self.tabs.iter().position(|t| t.peer == Some(code)) {
+            Some(at) => at,
+            None => {
+                self.tabs.push(Tab::chat(code, self.label(&code)));
+                self.tabs.len() - 1
+            }
+        };
+        if switch {
+            self.select_tab(at);
+        }
+    }
+
+    /// The person in the open tab, if it's a chat.
+    pub fn open_peer(&self) -> Option<Code> {
+        self.tab().peer
+    }
+
+    /// Unread messages from contacts and requests.
+    pub fn unread_total(&self) -> usize {
+        self.people.iter().map(|p| p.unread).sum()
     }
 
     pub fn tab(&self) -> &Tab {

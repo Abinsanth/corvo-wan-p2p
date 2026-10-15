@@ -6,12 +6,13 @@ use std::path::PathBuf;
 
 use corvo_wan_p2p_core::chat::Event;
 use corvo_wan_p2p_core::identity::{Code, Seed};
-use corvo_wan_p2p_core::store::StoreError;
+use corvo_wan_p2p_core::store::{StoreError, StoredMessage};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind};
 
 use super::account::{self, PhraseDone, PhraseUse};
+use super::chat::{self, Loaded};
 use super::commands::{Cmd, HELP, Input, KEYS, parse};
-use super::state::{APP, Screen, Secret, State, Tone, WHEEL_STEP};
+use super::state::{Screen, Secret, State, Tone, WHEEL_STEP};
 use super::view::chat_page;
 
 #[derive(Debug)]
@@ -25,6 +26,8 @@ pub enum Msg {
     Core(Event),
     /// What came of an [`Effect`].
     Done(Outcome),
+    /// The window gained or lost focus.
+    Focus(bool),
 }
 
 /// Work for the loop: anything that touches the store, the engine, files or
@@ -64,6 +67,14 @@ pub enum Effect {
         passphrase: Secret,
         then: PhraseUse,
     },
+    /// Read everyone and every chat, at start.
+    Load,
+    Send {
+        to: Code,
+        text: String,
+    },
+    /// You've seen everything they sent.
+    MarkRead(Code),
 }
 
 impl Effect {
@@ -100,6 +111,15 @@ pub enum Outcome {
     RecoveryWritten(Result<PathBuf, String>),
     PassphraseChanged(Result<(), String>),
     Phrase(Result<PhraseDone, String>),
+    Loaded(Result<Loaded, String>),
+    /// The message as saved, waiting to be sent; `text` is what was typed.
+    Sent {
+        to: Code,
+        text: String,
+        result: Result<StoredMessage, String>,
+    },
+    /// Something went wrong that the user should hear about.
+    Failed(String),
     /// Something that leaves the app unusable, like the engine not starting.
     Fatal(String),
 }
@@ -193,7 +213,9 @@ pub fn update(state: &mut State, msg: Msg) -> Vec<Effect> {
             _ => {}
         },
         Msg::Resize(w, h) => state.size = (w, h),
+        Msg::Focus(focused) => state.focused = focused,
         Msg::Tick => {
+            chat::tick(state);
             if let Some(flash) = &mut state.flash {
                 flash.ticks_left = flash.ticks_left.saturating_sub(1);
                 if flash.ticks_left == 0 {
@@ -210,7 +232,8 @@ pub fn update(state: &mut State, msg: Msg) -> Vec<Effect> {
     if let Some(busy) = effects.iter().find_map(Effect::busy) {
         state.busy = Some(busy);
     }
-    let title = APP.to_string();
+    chat::read_open_chat(state, &mut effects);
+    let title = chat::title(state);
     if state.title != title {
         state.title = title.clone();
         effects.push(Effect::SetTitle(title));
@@ -290,7 +313,11 @@ fn on_line(state: &mut State, line: &str, effects: &mut Vec<Effect>) {
         Input::Text(_) if state.on_corvo() => {
             state.say(Tone::Bad, "this is the corvo tab: switch to a chat (Shift-Tab) to send messages")
         }
-        Input::Text(_) => state.say(Tone::Warn, "sending messages isn't available yet"),
+        Input::Text(text) => {
+            if let Some(to) = state.open_peer() {
+                chat::send(state, to, text, effects);
+            }
+        }
         Input::Wrong(why) => state.say(Tone::Bad, why),
         Input::Cmd(cmd) => on_command(state, cmd, effects),
     }
@@ -325,6 +352,8 @@ fn on_done(state: &mut State, outcome: Outcome, effects: &mut Vec<Effect>) {
             state.code = Some(code);
             state.say(Tone::Good, format!("welcome, {name}. Your code is {code}"));
             state.name = name;
+            state.since_start = 0;
+            effects.push(Effect::Load);
             if let Some(path) = recovery_file {
                 state.say(
                     Tone::Warn,
@@ -333,6 +362,9 @@ fn on_done(state: &mut State, outcome: Outcome, effects: &mut Vec<Effect>) {
             }
         }
         Outcome::Fatal(why) => effects.push(Effect::Exit(why)),
+        Outcome::Failed(why) => state.say(Tone::Bad, why),
+        Outcome::Loaded(result) => chat::loaded(state, result),
+        Outcome::Sent { to, text, result } => chat::sent(state, to, text, result),
         other => match &mut state.screen {
             Screen::Onboarding(onboarding) => effects.extend(onboarding.done(other)),
             Screen::Main => effects.extend(account::done(state, other)),
@@ -341,18 +373,13 @@ fn on_done(state: &mut State, outcome: Outcome, effects: &mut Vec<Effect>) {
 }
 
 fn on_core(state: &mut State, event: Event) {
-    match event {
-        Event::Network { online } => state.online = Some(online),
-        Event::Problem(text) => state.say(Tone::Bad, text),
-        // Chats, people and their marks arrive with the chat screens.
-        _ => {}
-    }
+    chat::on_event(state, event);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ui::state::{FLASH_TICKS, Line, Tab};
+    use crate::ui::state::{APP, FLASH_TICKS, Line, Tab};
     use corvo_wan_p2p_core::identity::Seed;
     use ratatui::crossterm::event::KeyEventState;
 

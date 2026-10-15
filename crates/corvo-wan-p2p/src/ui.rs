@@ -3,6 +3,7 @@
 //! tick and messages from elsewhere, feeds them to `update` and draws.
 
 pub mod account;
+pub mod chat;
 pub mod clip;
 pub mod commands;
 pub mod onboarding;
@@ -255,7 +256,7 @@ pub async fn demo() -> anyhow::Result<()> {
     let mut state = State::new("you".into(), me.short());
     let people = [("rahul", true, false), ("ana maria", false, false), ("bob·m4x8", false, true)];
     for (label, online, request) in people {
-        state.people.push(Peer { code: Seed::generate().code(), label: label.into(), online, request });
+        state.people.push(Peer { code: Seed::generate().code(), label: label.into(), online, request, unread: 0 });
     }
     let chat = |peer: &Peer, lines: &[&str]| {
         let mut tab = Tab::chat(peer.code, peer.label.clone());

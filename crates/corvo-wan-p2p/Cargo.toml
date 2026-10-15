@@ -18,5 +18,9 @@ tokio.workspace = true
 unicode-width.workspace = true
 zeroize.workspace = true
 
+[dev-dependencies]
+iroh.workspace = true
+tempfile.workspace = true
+
 [lints]
 workspace = true

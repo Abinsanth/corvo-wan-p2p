@@ -3,8 +3,10 @@
 //! tick and messages from elsewhere, feeds them to `update` and draws.
 
 pub mod account;
+pub mod clip;
 pub mod commands;
 pub mod onboarding;
+pub mod runner;
 pub mod state;
 pub mod update;
 pub mod view;

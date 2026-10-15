@@ -87,6 +87,12 @@ pub enum Effect {
     SetName(String),
     /// Read everyone again, then show `Show`.
     Refresh(Show),
+    /// Look for a newer release; with `yes`, install it without asking.
+    CheckUpdate {
+        yes: bool,
+    },
+    /// Install the release the last check found.
+    InstallUpdate,
 }
 
 impl Effect {
@@ -99,6 +105,8 @@ impl Effect {
             Effect::Wipe => "deleting…",
             Effect::ChangePassphrase { .. } => "changing your passphrase…",
             Effect::Phrase { .. } => "checking your passphrase…",
+            Effect::CheckUpdate { .. } => "checking for updates…",
+            Effect::InstallUpdate => "updating…",
             _ => return None,
         })
     }
@@ -144,6 +152,13 @@ pub enum Outcome {
         show: Show,
         result: Result<Vec<Person>, String>,
     },
+    /// The newer version found, if any.
+    UpdateChecked {
+        yes: bool,
+        result: Result<Option<String>, String>,
+    },
+    /// The version now installed.
+    Updated(Result<String, String>),
     /// Something that leaves the app unusable, like the engine not starting.
     Fatal(String),
 }
@@ -429,6 +444,7 @@ fn on_command(state: &mut State, cmd: Cmd, effects: &mut Vec<Effect>) {
         Cmd::Clear => state.clear_tab(),
         cmd @ (Cmd::Passphrase | Cmd::Phrase | Cmd::PhraseSave | Cmd::PhraseCopy) => account::begin(state, cmd),
         Cmd::Quit => effects.push(Effect::Quit),
+        Cmd::Update { yes } => effects.push(Effect::CheckUpdate { yes }),
         Cmd::Close => {
             if !state.close_tab() {
                 state.say(Tone::Bad, "the corvo tab stays open; /quit leaves the app");

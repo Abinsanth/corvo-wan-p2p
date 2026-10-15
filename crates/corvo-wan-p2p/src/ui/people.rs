@@ -142,9 +142,6 @@ pub fn command(state: &mut State, cmd: Cmd, effects: &mut Vec<Effect>) {
             }
         }
         Cmd::Name(name) => effects.push(Effect::SetName(name)),
-        Cmd::Update { .. } => {
-            state.say(Tone::Plain, "updates arrive with the first release; for now there's nothing to update")
-        }
         _ => {}
     }
 }
@@ -563,13 +560,6 @@ mod tests {
         );
         assert_eq!(last(&s), "they haven't sent you a request");
         assert_eq!(last_line_tone(&s), Tone::Bad);
-    }
-
-    #[test]
-    fn update_waits_for_the_first_release() {
-        let (mut s, _) = state();
-        send(&mut s, "/update");
-        assert!(last(&s).contains("first release"));
     }
 
     #[test]

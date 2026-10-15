@@ -9,6 +9,7 @@ use super::commands::Cmd;
 use super::people::Act;
 use super::state::{Ask, Secret, State, Tone};
 use super::update::{Effect, Outcome};
+use crate::selfupdate;
 
 /// What `/phrase` does with your words once your passphrase checks out.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,6 +47,8 @@ pub enum Pending {
     Replace { passphrase: Secret },
     /// `/remove`: delete the history with them too?
     Remove { code: Code },
+    /// `/update`: install the newer version found?
+    Update,
 }
 
 impl Pending {
@@ -57,6 +60,7 @@ impl Pending {
             Pending::Passphrase(_) | Pending::Checking { .. } => ("your passphrase: ", true),
             Pending::Replace { .. } => ("replace it? y/n: ", false),
             Pending::Remove { .. } => ("delete your history too? y/n: ", false),
+            Pending::Update => ("update now? y/n: ", false),
         };
         Ask { label: label.into(), masked }
     }
@@ -145,6 +149,20 @@ pub fn answer(state: &mut State, text: Secret) -> Vec<Effect> {
                 Some(Pending::Remove { code })
             }
         },
+        Pending::Update => match text.expose().trim().to_lowercase().as_str() {
+            "y" | "yes" => {
+                effects.push(Effect::InstallUpdate);
+                None
+            }
+            "n" | "no" => {
+                state.say(Tone::Plain, "not updating; /update asks again");
+                None
+            }
+            _ => {
+                state.say(Tone::Bad, "type y or n");
+                Some(Pending::Update)
+            }
+        },
         // Nothing is asked while waiting.
         checking @ Pending::Checking { .. } => Some(checking),
     };
@@ -188,6 +206,23 @@ pub fn done(state: &mut State, outcome: Outcome) -> Vec<Effect> {
                 }
             }
         }
+        Outcome::UpdateChecked { result: Ok(None), .. } => {
+            state.say(Tone::Plain, format!("you're up to date ({})", selfupdate::current()))
+        }
+        Outcome::UpdateChecked { yes: true, result: Ok(Some(_)) } => effects.push(Effect::InstallUpdate),
+        Outcome::UpdateChecked { yes: false, result: Ok(Some(version)) } => {
+            state.select_tab(0);
+            state.say(
+                Tone::Plain,
+                format!("v{version} is available (you have {}). Update now? (Esc cancels)", selfupdate::current()),
+            );
+            state.pending = Some(Pending::Update);
+        }
+        Outcome::UpdateChecked { result: Err(why), .. } => state.say(Tone::Bad, why),
+        Outcome::Updated(Ok(version)) => {
+            state.say(Tone::Good, format!("updated to v{version}: /quit and start corvo-wan-p2p again to use it"))
+        }
+        Outcome::Updated(Err(why)) => state.say(Tone::Bad, why),
         _ => {}
     }
     effects
@@ -402,5 +437,61 @@ mod tests {
         update(&mut s, Msg::Paste("hello".into()));
         assert_eq!(s.reveal, None);
         assert!(s.editor.is_empty());
+    }
+
+    fn current() -> String {
+        crate::selfupdate::current().to_string()
+    }
+
+    #[test]
+    fn update_says_when_you_are_up_to_date() {
+        let mut s = state();
+        assert_eq!(send(&mut s, "/update"), vec![Effect::CheckUpdate { yes: false }]);
+        assert_eq!(s.busy, Some("checking for updates…"));
+        done(&mut s, Outcome::UpdateChecked { yes: false, result: Ok(None) });
+        assert_eq!(last(&s).text, format!("you're up to date ({})", current()));
+        assert_eq!(s.ask(), None);
+    }
+
+    #[test]
+    fn update_asks_before_installing_a_newer_version() {
+        let mut s = state();
+        send(&mut s, "/update");
+        assert!(done(&mut s, Outcome::UpdateChecked { yes: false, result: Ok(Some("9.0.0".into())) }).is_empty());
+        assert!(last(&s).text.starts_with(&format!("v9.0.0 is available (you have {})", current())));
+        assert_eq!(label(&s), "update now? y/n: ");
+        assert!(!s.ask().unwrap().masked);
+        assert!(send(&mut s, "maybe").is_empty());
+        assert_eq!(label(&s), "update now? y/n: ");
+        assert!(send(&mut s, "n").is_empty());
+        assert_eq!(s.ask(), None);
+        assert_eq!(last(&s).text, "not updating; /update asks again");
+
+        send(&mut s, "/update");
+        done(&mut s, Outcome::UpdateChecked { yes: false, result: Ok(Some("9.0.0".into())) });
+        assert_eq!(send(&mut s, "y"), vec![Effect::InstallUpdate]);
+        assert_eq!(s.busy, Some("updating…"));
+        done(&mut s, Outcome::Updated(Ok("9.0.0".into())));
+        assert_eq!(last(&s).tone, Tone::Good);
+        assert_eq!(last(&s).text, "updated to v9.0.0: /quit and start corvo-wan-p2p again to use it");
+    }
+
+    #[test]
+    fn update_yes_installs_without_asking() {
+        let mut s = state();
+        assert_eq!(send(&mut s, "/update yes"), vec![Effect::CheckUpdate { yes: true }]);
+        let effects = done(&mut s, Outcome::UpdateChecked { yes: true, result: Ok(Some("9.0.0".into())) });
+        assert_eq!(effects, vec![Effect::InstallUpdate]);
+        assert_eq!(s.ask(), None);
+    }
+
+    #[test]
+    fn update_failures_say_why() {
+        let mut s = state();
+        done(&mut s, Outcome::UpdateChecked { yes: false, result: Err("no connection to GitHub".into()) });
+        assert_eq!(*last(&s), Line { text: "no connection to GitHub".into(), tone: Tone::Bad });
+        done(&mut s, Outcome::Updated(Err("the download didn't match its checksum; nothing changed".into())));
+        assert_eq!(last(&s).tone, Tone::Bad);
+        assert!(last(&s).text.contains("nothing changed"));
     }
 }

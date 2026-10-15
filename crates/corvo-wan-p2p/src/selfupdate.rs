@@ -100,11 +100,6 @@ impl Default for Urls {
     }
 }
 
-/// The newest release above this binary, if there is one.
-pub async fn check() -> Result<Option<Release>, String> {
-    check_with(&Urls::default(), &current()).await
-}
-
 /// The newest release above `current`, if there is one.
 pub async fn check_with(urls: &Urls, current: &Version) -> Result<Option<Release>, String> {
     let agent = format!("User-Agent: corvo-wan-p2p/{current}");
@@ -114,14 +109,6 @@ pub async fn check_with(urls: &Urls, current: &Version) -> Result<Option<Release
         .map_err(|e| format!("couldn't check for updates: {e}"))?;
     let json = String::from_utf8(body).map_err(|_| "unexpected reply from GitHub".to_string())?;
     Ok(newest_above(current, parse_releases(&json)?))
-}
-
-/// Puts `release`'s build for this system in place of the running binary.
-pub async fn install(release: &Release) -> Result<(), String> {
-    let (os, arch) = (std::env::consts::OS, std::env::consts::ARCH);
-    let asset = asset_name(os, arch).ok_or_else(|| format!("no release build for {os}/{arch}; build from source"))?;
-    let target = running_exe().map_err(|e| format!("couldn't find the running app: {e}"))?;
-    install_with(&Urls::default(), release, &asset, &target).await
 }
 
 /// Puts `release`'s `asset` in place of `target`: downloads into a temp folder
@@ -294,10 +281,56 @@ where
     })
 }
 
+/// A fake release in a temp folder, served through `file://`.
 #[cfg(test)]
-mod tests {
+pub mod testing {
     use super::*;
     use sha2::{Digest, Sha256};
+    use std::fs;
+
+    /// A `file://` URL for `path`, which curl reads like a download.
+    pub fn file_url(path: &Path) -> String {
+        let path = path.display().to_string().replace('\\', "/");
+        if path.starts_with('/') { format!("file://{path}") } else { format!("file:///{path}") }
+    }
+
+    /// A release v9.0.0 in `site`, its archive holding a "binary" that says
+    /// `new`. Returns the URLs and the asset's name.
+    pub fn publish(site: &Path, checksum_ok: bool) -> (Urls, String) {
+        let asset = "corvo-wan-p2p-test.tar.gz".to_string();
+        let staging = site.join("staging");
+        fs::create_dir_all(&staging).unwrap();
+        fs::write(staging.join(BIN_NAME), "new").unwrap();
+        let dir = site.join("download").join("v9.0.0");
+        fs::create_dir_all(&dir).unwrap();
+        let status = std::process::Command::new("tar")
+            .arg("-czf")
+            .arg(dir.join(&asset))
+            .arg("-C")
+            .arg(&staging)
+            .arg(BIN_NAME)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let hash = Sha256::digest(fs::read(dir.join(&asset)).unwrap());
+        let mut hex: String = hash.iter().map(|b| format!("{b:02x}")).collect();
+        if !checksum_ok {
+            hex = "0".repeat(64);
+        }
+        fs::write(dir.join(format!("{asset}.sha256")), format!("{hex}  {asset}\n")).unwrap();
+        let json = format!(
+            r#"[{{"tag_name": "v9.0.0", "draft": false, "prerelease": false, "assets": [{{"name": "{asset}", "size": 1}}]}}]"#
+        );
+        fs::write(site.join("releases.json"), json).unwrap();
+        let urls = Urls { api: file_url(&site.join("releases.json")), download: file_url(&site.join("download")) };
+        (urls, asset)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::testing::{file_url, publish};
+    use super::*;
     use std::fs;
 
     fn v(s: &str) -> Version {
@@ -345,42 +378,6 @@ mod tests {
         assert_eq!(asset_name("windows", "x86_64").as_deref(), Some("corvo-wan-p2p-x86_64-pc-windows-msvc.zip"));
         assert_eq!(asset_name("windows", "aarch64"), None);
         assert_eq!(asset_name("freebsd", "x86_64"), None);
-    }
-
-    /// A `file://` URL for `path`, which curl reads like a download.
-    fn file_url(path: &Path) -> String {
-        let path = path.display().to_string().replace('\\', "/");
-        if path.starts_with('/') { format!("file://{path}") } else { format!("file:///{path}") }
-    }
-
-    /// A release v9.0.0 in `site`, its archive holding a "binary" that says
-    /// `new`. Returns the URLs and the asset's name.
-    fn publish(site: &Path, checksum_ok: bool) -> (Urls, String) {
-        let asset = "corvo-wan-p2p-test.tar.gz".to_string();
-        let staging = site.join("staging");
-        fs::create_dir_all(&staging).unwrap();
-        fs::write(staging.join(BIN_NAME), "new").unwrap();
-        let dir = site.join("download").join("v9.0.0");
-        fs::create_dir_all(&dir).unwrap();
-        let status = std::process::Command::new("tar")
-            .arg("-czf")
-            .arg(dir.join(&asset))
-            .arg("-C")
-            .arg(&staging)
-            .arg(BIN_NAME)
-            .status()
-            .unwrap();
-        assert!(status.success());
-        let hash = Sha256::digest(fs::read(dir.join(&asset)).unwrap());
-        let mut hex: String = hash.iter().map(|b| format!("{b:02x}")).collect();
-        if !checksum_ok {
-            hex = "0".repeat(64);
-        }
-        fs::write(dir.join(format!("{asset}.sha256")), format!("{hex}  {asset}\n")).unwrap();
-        let json = format!(r#"[{{"tag_name": "v9.0.0", "draft": false, "prerelease": false, "assets": [{{"name": "{asset}", "size": 1}}]}}]"#);
-        fs::write(site.join("releases.json"), json).unwrap();
-        let urls = Urls { api: file_url(&site.join("releases.json")), download: file_url(&site.join("download")) };
-        (urls, asset)
     }
 
     #[tokio::test]

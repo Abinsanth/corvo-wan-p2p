@@ -20,6 +20,7 @@ use super::clip::osc52;
 use super::people::Act;
 use super::state::Secret;
 use super::update::{Effect, Msg, Outcome};
+use crate::selfupdate::{self, Release, Urls};
 
 /// For commands that need the engine, before it has started.
 const NOT_STARTED: &str = "the chat engine hasn't started";
@@ -43,6 +44,17 @@ pub enum Flow {
     Exit(String),
 }
 
+/// Where `/update` looks, and what it found.
+struct Updates {
+    urls: Urls,
+    /// The binary to replace; the running one when `None`.
+    target: Option<PathBuf>,
+    /// The asset to install; this system's when `None`.
+    asset: Option<String>,
+    /// The release the last check found.
+    found: Option<Release>,
+}
+
 pub struct Runner<W: Write> {
     dir: PathBuf,
     home: Option<PathBuf>,
@@ -53,12 +65,35 @@ pub struct Runner<W: Write> {
     /// An account just made, until the engine starts on it.
     store: Option<Store>,
     client: Option<Client>,
+    updates: Updates,
 }
 
 impl<W: Write> Runner<W> {
     /// `dir` is the data folder; `home` is where the recovery file goes.
     pub fn new(dir: PathBuf, home: Option<PathBuf>, config: Config, net: Net, out: W) -> Runner<W> {
-        Runner { dir, home, config, net, out, store: None, client: None }
+        let updates = Updates { urls: Urls::default(), target: None, asset: None, found: None };
+        Runner { dir, home, config, net, out, store: None, client: None, updates }
+    }
+
+    /// Points `/update` at `urls`, installing `asset` over `target`.
+    #[cfg(test)]
+    fn with_updates(mut self, urls: Urls, asset: String, target: PathBuf) -> Self {
+        self.updates = Updates { urls, target: Some(target), asset: Some(asset), found: None };
+        self
+    }
+
+    async fn install_update(&self, release: &Release) -> Result<(), String> {
+        let (os, arch) = (std::env::consts::OS, std::env::consts::ARCH);
+        let asset = match &self.updates.asset {
+            Some(asset) => asset.clone(),
+            None => selfupdate::asset_name(os, arch)
+                .ok_or_else(|| format!("no release build for {os}/{arch}; build from source"))?,
+        };
+        let target = match &self.updates.target {
+            Some(target) => target.clone(),
+            None => selfupdate::running_exe().map_err(|e| format!("couldn't find the running app: {e}"))?,
+        };
+        selfupdate::install_with(&self.updates.urls, release, &asset, &target).await
     }
 
     /// Does `effect`. An error here is the terminal failing; everything else
@@ -133,6 +168,19 @@ impl<W: Write> Runner<W> {
             Effect::SetName(name) => Outcome::Named(match self.client() {
                 Ok(client) => client.set_name(&name).await.map_err(|e| e.to_string()),
                 Err(e) => Err(e),
+            }),
+            Effect::CheckUpdate { yes } => {
+                let found = selfupdate::check_with(&self.updates.urls, &selfupdate::current()).await;
+                let result = found.map(|found| {
+                    let version = found.as_ref().map(|r| r.version.to_string());
+                    self.updates.found = found;
+                    version
+                });
+                Outcome::UpdateChecked { yes, result }
+            }
+            Effect::InstallUpdate => Outcome::Updated(match self.updates.found.take() {
+                Some(release) => self.install_update(&release).await.map(|()| release.version.to_string()),
+                None => Err("nothing to install: /update looks for a newer version first".into()),
             }),
             Effect::Refresh(show) => Outcome::Refreshed {
                 show,
@@ -607,5 +655,23 @@ mod tests {
         ana.runner.shutdown().await;
         let ana = App::restart(&data, &home, &lookup).await;
         assert_eq!(ana.state.name, "Ana M", "the new name was saved");
+    }
+
+    #[tokio::test]
+    async fn update_installs_a_newer_release_after_yes() {
+        let (data, home, site, bin) =
+            (TempDir::new().unwrap(), TempDir::new().unwrap(), TempDir::new().unwrap(), TempDir::new().unwrap());
+        let lookup = MemoryLookup::new();
+        let mut app = App::person(&data, &home, &lookup, "ana").await;
+        let (urls, asset) = crate::selfupdate::testing::publish(site.path(), true);
+        let target = bin.path().join("corvo-wan-p2p");
+        std::fs::write(&target, "old").unwrap();
+        app.runner = app.runner.with_updates(urls, asset, target.clone());
+        app.send("/update").await;
+        assert!(app.said().last().unwrap().starts_with("v9.0.0 is available"));
+        app.send("y").await;
+        assert_eq!(app.said().last().unwrap(), "updated to v9.0.0: /quit and start corvo-wan-p2p again to use it");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "new");
+        app.runner.shutdown().await;
     }
 }

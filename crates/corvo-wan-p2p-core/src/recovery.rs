@@ -81,18 +81,30 @@ fn restrict_to_owner(_path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Windows: drop inherited permissions and grant only the current user, using
-/// the built-in `icacls`.
+/// Windows: drop inherited permissions and grant only the current user, then
+/// remove SYSTEM (`S-1-5-18`) and Administrators (`S-1-5-32-544`), which a new
+/// file can also get as explicit (not inherited) entries. Uses the built-in `icacls`.
 #[cfg(windows)]
 fn restrict_to_owner(path: &Path) -> Result<(), String> {
     let user = std::env::var("USERNAME").map_err(|_| "USERNAME isn't set".to_string())?;
+    icacls(path, &["/inheritance:r".into(), "/grant:r".into(), format!("{user}:F")])?;
+    icacls(path, &["/remove:g".into(), "*S-1-5-18".into(), "*S-1-5-32-544".into()])
+}
+
+#[cfg(windows)]
+fn icacls(path: &Path, args: &[String]) -> Result<(), String> {
     let out = std::process::Command::new("icacls")
         .arg(path)
-        .args(["/inheritance:r", "/grant:r"])
-        .arg(format!("{user}:F"))
+        .args(args)
         .output()
         .map_err(|e| format!("couldn't run icacls: {e}"))?;
-    if out.status.success() { Ok(()) } else { Err(String::from_utf8_lossy(&out.stderr).trim().to_string()) }
+    if out.status.success() {
+        Ok(())
+    } else {
+        // icacls reports some failures on stdout and some on stderr.
+        let said = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        Err(said.trim().to_string())
+    }
 }
 
 #[cfg(test)]

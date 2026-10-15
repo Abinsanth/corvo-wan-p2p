@@ -20,7 +20,7 @@ use crate::VERSION;
 use crate::identity::{Code, NameError, clean_name};
 use crate::net::ALPN;
 use crate::proto::{Frame, MAX_FRAME, MAX_TEXT, PROTO_VERSION, encode};
-use crate::store::{Contact, Store, StoreError, StoredMessage};
+use crate::store::{Person, Store, StoreError, StoredMessage};
 use link::Role;
 
 /// The close code for the connection dropped when both sides dialed at once.
@@ -95,7 +95,7 @@ enum Command {
     Send(Code, String, Reply<String>),
     MarkRead(Code, Reply<()>),
     SetName(String, Reply<String>),
-    Contacts(Reply<Vec<Contact>>),
+    Contacts(Reply<Vec<Person>>),
     History(Code, Reply<Vec<StoredMessage>>),
     Shutdown,
 }
@@ -173,7 +173,7 @@ impl Client {
         self.ask(|r| Command::SetName(name.to_string(), r)).await
     }
 
-    pub async fn contacts(&self) -> Result<Vec<Contact>, ChatError> {
+    pub async fn contacts(&self) -> Result<Vec<Person>, ChatError> {
         self.ask(Command::Contacts).await
     }
 
@@ -439,7 +439,7 @@ impl Core {
     }
 
     fn their_name(&mut self, peer: Code, name: String) {
-        match self.store.contact(&peer) {
+        match self.store.person(&peer) {
             Ok(Some(contact)) if contact.name == name => {}
             Ok(_) => match self.store.set_contact_name(&peer, &name) {
                 Ok(()) => self.emit(Event::Name { of: peer, name }),

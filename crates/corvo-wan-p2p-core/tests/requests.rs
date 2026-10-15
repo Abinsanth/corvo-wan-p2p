@@ -5,7 +5,7 @@ mod common;
 
 use std::time::Duration;
 
-use common::{Fake, Peer, eventually, frames_until_quiet, friends, is_cut_off, next_frame, say};
+use common::{Fake, Peer, eventually, frames_until_quiet, friends, is_cut_off, next_frame, next_frames, say};
 use corvo_wan_p2p_core::chat::{ChatError, Event, MAX_GUESTS, MAX_REQUEST_MESSAGES, MAX_REQUESTS, WINDOW};
 use corvo_wan_p2p_core::identity::Seed;
 use corvo_wan_p2p_core::proto::{Frame, PROTO_VERSION, write_frame};
@@ -193,9 +193,11 @@ async fn a_request_saves_only_so_many_messages() {
         say(&mut send, &format!("m{i}"), "spam").await;
     }
     say(&mut send, "m0", "spam").await; // a repeat is still acked
-    let acks = frames_until_quiet(&mut recv, QUIET).await;
-    assert_eq!(acks.len(), MAX_REQUEST_MESSAGES + 1);
+    let acks = next_frames(&mut recv, MAX_REQUEST_MESSAGES + 1).await;
     assert!(acks.iter().all(|f| matches!(f, Frame::Ack { .. })), "a request gets acks only: {acks:?}");
+    assert_eq!(acks.last(), Some(&Frame::Ack { id: "m0".into() }));
+    let more = frames_until_quiet(&mut recv, QUIET).await;
+    assert!(more.is_empty(), "messages past the limit were acked: {more:?}");
     assert_eq!(a.client.history(fake.code).await.unwrap().len(), MAX_REQUEST_MESSAGES);
     a.expect(|e| matches!(e, Event::Request { .. })).await;
 }
@@ -264,12 +266,15 @@ async fn at_most_a_window_of_messages_is_unacked_at_once() {
         a.client.send(fake.code, &format!("message {i}")).await.unwrap();
     }
     let (mut send, mut recv, _) = fake.hello(a.code, PROTO_VERSION).await.unwrap();
-    let msgs: Vec<String> = frames_until_quiet(&mut recv, QUIET)
-        .await
-        .into_iter()
-        .filter_map(|f| if let Frame::Msg { id, .. } = f { Some(id) } else { None })
-        .collect();
-    assert_eq!(msgs.len(), WINDOW, "sent before any ack");
+    let mut msgs = Vec::new();
+    for _ in 0..WINDOW {
+        let Frame::Msg { id, .. } = next_frame(&mut recv, |f| matches!(f, Frame::Msg { .. })).await else {
+            unreachable!()
+        };
+        msgs.push(id);
+    }
+    let more = frames_until_quiet(&mut recv, QUIET).await;
+    assert!(!more.iter().any(|f| matches!(f, Frame::Msg { .. })), "more than a window went out before any ack");
     write_frame(&mut send, &Frame::Ack { id: msgs[0].clone() }).await.unwrap();
     let next = next_frame(&mut recv, |f| matches!(f, Frame::Msg { .. })).await;
     assert!(matches!(next, Frame::Msg { text, .. } if text == format!("message {WINDOW}")));
@@ -303,8 +308,10 @@ async fn a_peer_that_stops_reading_is_cut_off_and_others_carry_on() {
     let fc = fake.code;
     a.expect(|e| *e == Event::Online(fc)).await;
     // Acks pile up unread on a's side until its queue for the fake is full.
-    for i in 0..2000 {
-        let frame = Frame::Msg { id: format!("f{i}"), sent_at: 1, text: "flood".into() };
+    // The same message over and over: each repeat is acked without a disk
+    // write, so this is quick even where saving is slow.
+    let frame = Frame::Msg { id: "f".into(), sent_at: 1, text: "flood".into() };
+    for _ in 0..5000 {
         if write_frame(&mut send, &frame).await.is_err() {
             break;
         }

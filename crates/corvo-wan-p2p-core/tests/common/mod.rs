@@ -213,7 +213,18 @@ pub async fn say(send: &mut SendStream, id: &str, text: &str) {
     write_frame(send, &Frame::Msg { id: id.into(), sent_at: 1, text: text.into() }).await.unwrap();
 }
 
-/// Every frame that arrives until none has for `quiet`.
+/// The next `n` frames, whatever they are.
+pub async fn next_frames(recv: &mut RecvStream, n: usize) -> Vec<Frame> {
+    let mut frames = Vec::new();
+    for _ in 0..n {
+        frames.push(next_frame(recv, |_| true).await);
+    }
+    frames
+}
+
+/// Every frame that arrives until none has for `quiet`. Only for checking
+/// that nothing more comes: on a slow machine even the first frame can take
+/// longer than `quiet`, so wait for expected frames with `next_frame`.
 pub async fn frames_until_quiet(recv: &mut RecvStream, quiet: Duration) -> Vec<Frame> {
     let mut frames = Vec::new();
     while let Ok(Ok(frame)) = tokio::time::timeout(quiet, read_frame(recv)).await {

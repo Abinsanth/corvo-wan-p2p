@@ -5,7 +5,7 @@ use std::fmt::Write as _;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
-use crate::files::write_private_atomic;
+use crate::files::write_private_atomic_with;
 use crate::identity::Seed;
 
 pub const FILE_NAME: &str = "corvo-wan-p2p-recovery.txt";
@@ -54,16 +54,35 @@ pub fn contents(seed: &Seed, made: &str) -> String {
 /// Writes the recovery file, readable only by you. An existing file is
 /// replaced only if `overwrite` is true (the app asks first).
 pub fn write(home: &Path, seed: &Seed, made: &str, overwrite: bool) -> Result<PathBuf, RecoveryError> {
+    write_with(home, seed, made, overwrite, restrict_to_owner)
+}
+
+/// [`write`], with `restrict` making the still-empty temp file private before
+/// the words go in. If it can't, nothing is left behind and an existing file
+/// stays as it was.
+fn write_with(
+    home: &Path,
+    seed: &Seed,
+    made: &str,
+    overwrite: bool,
+    restrict: impl FnOnce(&Path) -> Result<(), String>,
+) -> Result<PathBuf, RecoveryError> {
     let path = path(home);
     if !overwrite && path.exists() {
         return Err(RecoveryError::AlreadyExists(path));
     }
-    write_private_atomic(&path, contents(seed, made).as_bytes())?;
-    if let Err(why) = restrict_to_owner(&path) {
-        let _ = std::fs::remove_file(&path);
-        return Err(RecoveryError::NotPrivate(path, why));
+    let mut refused = None;
+    let result = write_private_atomic_with(&path, contents(seed, made).as_bytes(), |tmp| {
+        restrict(tmp).map_err(|why| {
+            refused = Some(why);
+            std::io::Error::other("not private")
+        })
+    });
+    match (result, refused) {
+        (Ok(()), _) => Ok(path),
+        (Err(_), Some(why)) => Err(RecoveryError::NotPrivate(path, why)),
+        (Err(e), None) => Err(e.into()),
     }
-    Ok(path)
 }
 
 /// Deletes the recovery file if it's there.
@@ -81,30 +100,91 @@ fn restrict_to_owner(_path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Windows: drop inherited permissions and grant only the current user, then
-/// remove SYSTEM (`S-1-5-18`) and Administrators (`S-1-5-32-544`), which a new
-/// file can also get as explicit (not inherited) entries. Uses the built-in `icacls`.
+/// Windows: drop inherited permissions and grant only the current user, by
+/// SID (a name may not resolve on work laptops), then remove SYSTEM
+/// (`S-1-5-18`) and Administrators (`S-1-5-32-544`), which a new file can also
+/// get as explicit entries. Then read the permissions back to be sure.
 #[cfg(windows)]
 fn restrict_to_owner(path: &Path) -> Result<(), String> {
-    let user = std::env::var("USERNAME").map_err(|_| "USERNAME isn't set".to_string())?;
-    icacls(path, &["/inheritance:r".into(), "/grant:r".into(), format!("{user}:F")])?;
-    icacls(path, &["/remove:g".into(), "*S-1-5-18".into(), "*S-1-5-32-544".into()])
+    let sid = current_sid()?;
+    icacls(path, &["/inheritance:r".into(), "/grant:r".into(), format!("*{sid}:F")])?;
+    icacls(path, &["/remove:g".into(), "*S-1-5-18".into(), "*S-1-5-32-544".into()])?;
+    let allowed = allowed_sids(path)?;
+    if allowed == [sid.clone()] {
+        Ok(())
+    } else {
+        Err(format!("it should be open only to {sid}, but these can open it: {}", allowed.join(", ")))
+    }
+}
+
+/// A tool from `System32`, by full path, so nothing else on `PATH` runs instead.
+#[cfg(windows)]
+fn system_tool(name: &str) -> PathBuf {
+    let root = std::env::var_os("SystemRoot").map(PathBuf::from).filter(|p| p.is_absolute());
+    root.unwrap_or_else(|| PathBuf::from(r"C:\Windows")).join("System32").join(name)
+}
+
+#[cfg(windows)]
+fn run_tool(name: &str, args: &[&std::ffi::OsStr]) -> Result<Vec<u8>, String> {
+    let out = std::process::Command::new(system_tool(name))
+        .args(args)
+        .output()
+        .map_err(|e| format!("couldn't run {name}: {e}"))?;
+    if out.status.success() {
+        Ok(out.stdout)
+    } else {
+        // These tools report some failures on stdout and some on stderr.
+        let said = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        Err(format!("{name} failed: {}", said.trim()))
+    }
+}
+
+/// The current user's SID, from `whoami`.
+#[cfg(windows)]
+fn current_sid() -> Result<String, String> {
+    let out = run_tool("whoami.exe", &["/user".as_ref(), "/fo".as_ref(), "csv".as_ref(), "/nh".as_ref()])?;
+    parse_whoami(&String::from_utf8_lossy(&out)).ok_or_else(|| "whoami didn't say who you are".into())
 }
 
 #[cfg(windows)]
 fn icacls(path: &Path, args: &[String]) -> Result<(), String> {
-    let out = std::process::Command::new("icacls")
-        .arg(path)
-        .args(args)
-        .output()
-        .map_err(|e| format!("couldn't run icacls: {e}"))?;
-    if out.status.success() {
-        Ok(())
-    } else {
-        // icacls reports some failures on stdout and some on stderr.
-        let said = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
-        Err(said.trim().to_string())
-    }
+    let mut all: Vec<&std::ffi::OsStr> = vec![path.as_os_str()];
+    all.extend(args.iter().map(|a| a.as_ref()));
+    run_tool("icacls.exe", &all).map(drop)
+}
+
+/// The SIDs allowed into `path`, read from `icacls /save`, which writes them
+/// as SDDL (`icacls` itself prints names, which may not resolve).
+#[cfg(windows)]
+fn allowed_sids(path: &Path) -> Result<Vec<String>, String> {
+    let saved = std::env::temp_dir().join(format!("corvo-wan-p2p-acl-{:016x}.txt", rand::random::<u64>()));
+    let result = icacls(path, &["/save".into(), saved.display().to_string()]).and_then(|()| {
+        let bytes = std::fs::read(&saved).map_err(|e| format!("couldn't read the saved permissions: {e}"))?;
+        let units: Vec<u16> = bytes.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+        let text = String::from_utf16_lossy(&units);
+        parse_saved_acl(text.trim_start_matches('\u{feff}')).ok_or_else(|| "couldn't read the saved permissions".into())
+    });
+    let _ = std::fs::remove_file(&saved);
+    result
+}
+
+/// The SID in `whoami /user /fo csv /nh` output: `"domain\user","S-1-5-…"`.
+#[cfg(any(windows, test))]
+fn parse_whoami(csv: &str) -> Option<String> {
+    let sid = csv.trim().rsplit(',').next()?.trim().trim_matches('"');
+    let digits = sid.strip_prefix("S-1-")?;
+    (!digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit() || c == '-')).then(|| sid.to_string())
+}
+
+/// The SIDs of the allow entries in an `icacls /save` file: a line with the
+/// file name, then the SDDL, like `D:PAI(A;;FA;;;S-1-5-…)(A;;FA;;;SY)`.
+/// `None` if there's no DACL line.
+#[cfg(any(windows, test))]
+fn parse_saved_acl(saved: &str) -> Option<Vec<String>> {
+    let dacl = saved.lines().skip(1).map(str::trim).find(|l| l.starts_with("D:"))?;
+    let aces = dacl.split('(').skip(1).map(|ace| ace.trim_end_matches(')'));
+    let allowed = aces.filter(|ace| ace.split(';').next() == Some("A"));
+    Some(allowed.filter_map(|ace| ace.rsplit(';').next()).map(String::from).collect())
 }
 
 #[cfg(test)]
@@ -172,12 +252,66 @@ mod tests {
     fn the_file_is_readable_only_by_you() {
         let home = tempfile::tempdir().unwrap();
         let path = write(home.path(), &vector(), "2026-10-15", false).unwrap();
-        let out = std::process::Command::new("icacls").arg(&path).output().unwrap();
-        let acl = String::from_utf8_lossy(&out.stdout);
-        let user = std::env::var("USERNAME").unwrap();
-        assert!(acl.contains(&format!("{user}:(F)")), "{acl}");
-        for other in ["Everyone", "BUILTIN\\Users", "Administrators", "SYSTEM"] {
-            assert!(!acl.contains(other), "{other} can still read it: {acl}");
-        }
+        assert_eq!(allowed_sids(&path).unwrap(), vec![current_sid().unwrap()]);
+    }
+
+    #[test]
+    fn a_file_that_cannot_be_made_private_is_not_left_behind() {
+        let home = tempfile::tempdir().unwrap();
+        let refuse = |_: &Path| Err("no SID".to_string());
+        let err = write_with(home.path(), &vector(), "2026-10-15", false, refuse).unwrap_err();
+        assert!(
+            matches!(&err, RecoveryError::NotPrivate(p, why) if *p == path(home.path()) && why == "no SID"),
+            "{err}"
+        );
+        assert!(!exists(home.path()));
+        assert_eq!(std::fs::read_dir(home.path()).unwrap().count(), 0, "a temp file was left behind");
+    }
+
+    #[test]
+    fn a_failed_replacement_keeps_the_old_file() {
+        let home = tempfile::tempdir().unwrap();
+        write(home.path(), &vector(), "2026-10-15", false).unwrap();
+        let refuse = |_: &Path| Err("no SID".to_string());
+        assert!(write_with(home.path(), &Seed::generate(), "2026-10-16", true, refuse).is_err());
+        assert!(std::fs::read_to_string(path(home.path())).unwrap().contains("Made: 2026-10-15"));
+    }
+
+    #[test]
+    fn the_temp_file_is_made_private_before_the_words_go_in() {
+        let home = tempfile::tempdir().unwrap();
+        let check = |tmp: &Path| {
+            assert_eq!(std::fs::metadata(tmp).unwrap().len(), 0, "the words were written before restricting");
+            assert_ne!(tmp, path(home.path()));
+            #[cfg(windows)]
+            {
+                restrict_to_owner(tmp)?;
+                assert_eq!(allowed_sids(tmp).unwrap(), vec![current_sid().unwrap()]);
+            }
+            Ok(())
+        };
+        write_with(home.path(), &vector(), "2026-10-15", false, check).unwrap();
+        assert!(std::fs::read_to_string(path(home.path())).unwrap().contains(" 1. abandon\n"));
+    }
+
+    #[test]
+    fn the_sid_is_read_from_whoami() {
+        let sid = "S-1-5-21-3623811015-3361044348-30300820-1013";
+        assert_eq!(parse_whoami(&format!("\"desktop-x\\abin\",\"{sid}\"\r\n")), Some(sid.into()));
+        assert_eq!(parse_whoami(&format!("\"CORP\\a, b\",\"{sid}\"")), Some(sid.into()));
+        assert_eq!(parse_whoami(""), None);
+        assert_eq!(parse_whoami("\"x\",\"not a sid\""), None);
+        assert_eq!(parse_whoami("\"x\",\"S-1-5-21-12a\""), None);
+    }
+
+    #[test]
+    fn allowed_sids_are_read_from_saved_acls() {
+        let me = "S-1-5-21-1-2-3-1001";
+        let saved = format!("corvo-wan-p2p-recovery.txt\r\nD:PAI(A;;FA;;;{me})(D;;FA;;;WD)\r\n");
+        assert_eq!(parse_saved_acl(&saved), Some(vec![me.to_string()]));
+        let shared = format!("x.txt\r\nD:AI(A;;FA;;;{me})(A;ID;FA;;;SY)(A;ID;0x1200a9;;;BU)\r\n");
+        assert_eq!(parse_saved_acl(&shared), Some(vec![me.to_string(), "SY".into(), "BU".into()]));
+        assert_eq!(parse_saved_acl("D:\\folder\\x.txt\r\nD:P\r\n"), Some(vec![]));
+        assert_eq!(parse_saved_acl("x.txt\r\n"), None);
     }
 }

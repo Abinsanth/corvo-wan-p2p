@@ -28,6 +28,7 @@ sha2 = "0.11.1"
 tempfile = "3.27.0"
 thiserror = "2.0.21"
 tokio = { version = "1.53.3", features = ["full"] }
+unicode-normalization = "0.1.25"
 zeroize = "1.9.1"
 
 [workspace.lints.rust]

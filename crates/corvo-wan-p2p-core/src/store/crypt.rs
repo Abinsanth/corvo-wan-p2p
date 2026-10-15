@@ -6,6 +6,7 @@ use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use hkdf::Hkdf;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
+use unicode_normalization::UnicodeNormalization;
 use zeroize::Zeroizing;
 
 const NONCE_LEN: usize = 24;
@@ -31,11 +32,16 @@ impl KdfParams {
 
 /// Stretches a passphrase into a 32-byte key. `None` if `params` are outside
 /// what Argon2 accepts (a damaged `key.json`).
+///
+/// The passphrase is NFC-normalized first: the same text on screen can arrive
+/// as different bytes (é as one character, or e plus an accent) depending on
+/// the keyboard or password manager.
 pub(crate) fn passphrase_key(passphrase: &str, salt: &[u8], params: KdfParams) -> Option<Zeroizing<[u8; 32]>> {
     let params = Params::new(params.m_kib, params.t, params.p, Some(32)).ok()?;
+    let normalized = Zeroizing::new(passphrase.nfc().collect::<String>());
     let mut key = Zeroizing::new([0u8; 32]);
     Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
-        .hash_password_into(passphrase.as_bytes(), salt, key.as_mut())
+        .hash_password_into(normalized.as_bytes(), salt, key.as_mut())
         .ok()?;
     Some(key)
 }

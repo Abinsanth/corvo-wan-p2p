@@ -185,3 +185,13 @@ fn any_language_and_emoji_work_in_a_passphrase() {
     assert!(matches!(Store::open(dir.path(), "പാസ്‌വേഡ് 🔑 o"), Err(StoreError::WrongPassphrase)));
     assert_eq!(Store::open(dir.path(), "പാസ്‌വേഡ് 🔑 ok").unwrap().profile().unwrap().seed, seed);
 }
+
+#[test]
+fn the_same_passphrase_typed_differently_still_opens() {
+    // "café" with é as one character (NFC) and as e plus a combining accent (NFD):
+    // the same text on screen, different bytes, depending on the keyboard or password manager.
+    let dir = tempfile::tempdir().unwrap();
+    let seed = Seed::generate();
+    drop(Store::create(dir.path(), "caf\u{e9}", FAST, &seed, "abin").unwrap());
+    assert_eq!(Store::open(dir.path(), "cafe\u{301}").unwrap().profile().unwrap().seed, seed);
+}

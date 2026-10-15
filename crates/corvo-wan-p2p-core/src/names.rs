@@ -95,14 +95,53 @@ pub fn find(people: &[Person], typed: &str) -> Result<Code, FindError> {
 }
 
 /// What a name looks like, for comparing: compatibility forms folded (NFKC),
-/// lower case, joiners and variation selectors dropped, `·` read as `.`, and
-/// Latin lookalikes from Cyrillic and Greek read as Latin.
+/// lower case, joiners, variation selectors and tags dropped, `·` read as
+/// `.`, and Latin lookalikes from Cyrillic and Greek read as Latin. Capitals
+/// are matched before lowercasing, since many (Т, Н, Ν…) lowercase to
+/// letters that no longer look Latin.
 pub fn skeleton(name: &str) -> String {
-    name.nfkc()
-        .flat_map(char::to_lowercase)
-        .filter(|c| !matches!(c, '\u{200C}' | '\u{200D}' | '\u{FE00}'..='\u{FE0F}'))
-        .map(|c| if c == SEPARATOR { '.' } else { latin_lookalike(c).unwrap_or(c) })
-        .collect()
+    let mut out = String::new();
+    for c in name.nfkc() {
+        if let Some(latin) = latin_capital_lookalike(c) {
+            out.push(latin);
+            continue;
+        }
+        for c in c.to_lowercase().filter(|&c| !is_ignorable(c)) {
+            out.push(if c == SEPARATOR { '.' } else { latin_lookalike(c).unwrap_or(c) });
+        }
+    }
+    out
+}
+
+/// Marks that change nothing visible in a name.
+fn is_ignorable(c: char) -> bool {
+    matches!(c, '\u{200C}' | '\u{200D}' | '\u{FE00}'..='\u{FE0F}' | '\u{E0000}'..='\u{E0FFF}')
+}
+
+/// The lower-case Latin letter a Cyrillic or Greek capital is drawn like, if any.
+fn latin_capital_lookalike(c: char) -> Option<char> {
+    Some(match c {
+        'А' | 'Α' => 'a',
+        'В' | 'Β' => 'b',
+        'С' => 'c',
+        'Е' | 'Ε' => 'e',
+        'Н' | 'Η' => 'h',
+        'І' | 'Ι' => 'i',
+        'Ј' => 'j',
+        'К' | 'Κ' => 'k',
+        'М' | 'Μ' => 'm',
+        'Ν' => 'n',
+        'О' | 'Ο' => 'o',
+        'Р' | 'Ρ' => 'p',
+        'Ԛ' => 'q',
+        'Ѕ' => 's',
+        'Т' | 'Τ' => 't',
+        'Ԝ' => 'w',
+        'Х' | 'Χ' => 'x',
+        'Ү' | 'Υ' => 'y',
+        'Ζ' => 'z',
+        _ => return None,
+    })
 }
 
 /// The Latin letter a lower-case Cyrillic or Greek letter is drawn like, if any.
@@ -169,6 +208,26 @@ mod tests {
             let fake = person(fake);
             let labels = labels(&[rahul.clone(), fake.clone()]);
             assert!(labels[&rahul.code].starts_with("rahul·"), "{:?} wasn't caught", fake.name);
+            assert!(labels[&fake.code].contains('·'));
+        }
+    }
+
+    #[test]
+    fn capital_lookalikes_and_ignorable_marks_count_as_shared() {
+        let pairs = [
+            ("Tom", "Тom"),
+            ("Hari", "Нari"),
+            ("Mike", "Мike"),
+            ("Ben", "Вen"),
+            ("Nina", "ΝINA"),
+            ("Zoe", "Ζoe"),
+            ("rahul", "rahul\u{E0100}"),
+            ("rahul", "rahul\u{E0020}"),
+        ];
+        for (real, fake) in pairs {
+            let (real, fake) = (person(real), person(fake));
+            let labels = labels(&[real.clone(), fake.clone()]);
+            assert!(labels[&real.code].contains('·'), "{:?} passed for {:?}", fake.name, real.name);
             assert!(labels[&fake.code].contains('·'));
         }
     }

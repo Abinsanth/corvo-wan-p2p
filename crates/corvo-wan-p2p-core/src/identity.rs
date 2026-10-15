@@ -221,8 +221,9 @@ pub fn clean_name(raw: &str) -> Result<String, NameError> {
 
 /// Characters that never belong in a name: they show nothing, or they turn
 /// the text around them backwards, so a name can pass for someone else's.
-/// The zero-width joiners U+200C and U+200D are allowed, because emoji and
-/// Indic and Persian writing need them; `names` ignores them when comparing.
+/// The zero-width joiners U+200C and U+200D, variation selectors and the tag
+/// characters of subdivision flags are allowed, because emoji and Indic and Persian
+/// writing need them; `names` ignores them when comparing.
 pub fn is_invisible(c: char) -> bool {
     matches!(
         c,
@@ -238,6 +239,10 @@ pub fn is_invisible(c: char) -> bool {
             | '\u{2060}'..='\u{206F}' // word joiner, invisible operators, direction isolates
             | '\u{FEFF}' // byte-order mark
             | '\u{FFF9}'..='\u{FFFB}' // interlinear annotation
+            | '\u{2800}' // braille blank
+            | '\u{1BCA0}'..='\u{1BCA3}' // shorthand format controls
+            | '\u{1D173}'..='\u{1D17A}' // musical formatting
+            | '\u{E0001}' // language tag
     )
 }
 
@@ -369,6 +374,14 @@ mod tests {
         assert_eq!(clean_name("\u{202E}luhar"), Err(NameError::Invisible('\u{202E}')));
         assert_eq!(clean_name("\u{2067}abin\u{2069}"), Err(NameError::Invisible('\u{2067}')));
         assert_eq!(clean_name("\u{3164}"), Err(NameError::Invisible('\u{3164}')));
+        for blank in ['\u{2800}', '\u{1D173}', '\u{1BCA0}', '\u{E0001}'] {
+            assert_eq!(
+                clean_name(&format!("rahul{blank}")),
+                Err(NameError::Invisible(blank)),
+                "U+{:04X}",
+                u32::from(blank)
+            );
+        }
         assert_eq!(
             NameError::Invisible('\u{200B}').to_string(),
             "a name can't contain invisible or text-direction characters (U+200B)"

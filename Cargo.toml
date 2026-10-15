@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
-members = ["crates/*"]
+# `spike` is a throwaway M0 connectivity check, deleted at the end of M0.
+members = ["crates/*", "spike"]
 
 [workspace.package]
 version = "0.1.0"

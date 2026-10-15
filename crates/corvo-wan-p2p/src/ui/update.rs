@@ -2,11 +2,16 @@
 //! the engine and draws nothing: it returns [`Effect`]s for the loop to carry
 //! out, and their results come back as messages.
 
+use std::path::PathBuf;
+
 use corvo_wan_p2p_core::chat::Event;
+use corvo_wan_p2p_core::identity::{Code, Seed};
+use corvo_wan_p2p_core::store::StoreError;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind};
 
+use super::account::{self, PhraseDone, PhraseUse};
 use super::commands::{Cmd, HELP, Input, KEYS, parse};
-use super::state::{APP, State, Tone, WHEEL_STEP};
+use super::state::{APP, Screen, Secret, State, Tone, WHEEL_STEP};
 use super::view::chat_page;
 
 #[derive(Debug)]
@@ -18,12 +23,85 @@ pub enum Msg {
     /// Four times a second, so flashes go away on time.
     Tick,
     Core(Event),
+    /// What came of an [`Effect`].
+    Done(Outcome),
 }
 
+/// Work for the loop: anything that touches the store, the engine, files or
+/// the terminal. Its result comes back as [`Msg::Done`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Effect {
     Quit,
+    /// Leave, and print this once the terminal is back to normal.
+    Exit(String),
     SetTitle(String),
+    /// Put this on the clipboard (OSC 52).
+    Copy(String),
+    /// Unlock the account and start the engine.
+    Unlock(Secret),
+    /// Make the account. The engine starts later, with [`Effect::Start`].
+    Create {
+        seed: Seed,
+        name: String,
+        passphrase: Secret,
+    },
+    /// Start the engine on the account just made.
+    Start,
+    /// Delete the account on this computer (`--recover`).
+    Wipe,
+    /// Whether the recovery file is there.
+    CheckRecovery,
+    WriteRecovery {
+        seed: Seed,
+        overwrite: bool,
+    },
+    ChangePassphrase {
+        old: Secret,
+        new: Secret,
+    },
+    /// Check the passphrase, then do `then` with the words.
+    Phrase {
+        passphrase: Secret,
+        then: PhraseUse,
+    },
+}
+
+impl Effect {
+    /// What to show while it runs, for the ones that take a moment.
+    pub fn busy(&self) -> Option<&'static str> {
+        Some(match self {
+            Effect::Unlock(_) => "unlocking…",
+            Effect::Create { .. } => "making your account…",
+            Effect::Start => "starting…",
+            Effect::Wipe => "deleting…",
+            Effect::ChangePassphrase { .. } => "changing your passphrase…",
+            Effect::Phrase { .. } => "checking your passphrase…",
+            _ => return None,
+        })
+    }
+}
+
+/// What came of an [`Effect`].
+#[derive(Debug)]
+pub enum Outcome {
+    /// The account is unlocked and the engine is running. `recovery_file` is
+    /// where the recovery file is, if it's still there.
+    Started {
+        name: String,
+        code: Code,
+        recovery_file: Option<PathBuf>,
+    },
+    /// Unlocking didn't work.
+    Unlock(StoreError),
+    Created(Result<(), String>),
+    Wiped(Result<(), String>),
+    /// Where the recovery file is, if it's there.
+    RecoveryFile(Option<PathBuf>),
+    RecoveryWritten(Result<PathBuf, String>),
+    PassphraseChanged(Result<(), String>),
+    Phrase(Result<PhraseDone, String>),
+    /// Something that leaves the app unusable, like the engine not starting.
+    Fatal(String),
 }
 
 /// What a key press means.
@@ -69,6 +147,8 @@ fn action_for(key: KeyEvent) -> Option<Action> {
         KeyCode::Char('w') if ctrl => Action::KillWord,
         KeyCode::Char('j') if ctrl => Action::Newline,
         KeyCode::Char(c @ '1'..='9') if alt => Action::GoTab(c as usize - '1' as usize),
+        // Windows reports AltGr chords, like @ on a German keyboard, as Ctrl+Alt.
+        KeyCode::Char(c) if ctrl && alt => Action::Insert(c),
         KeyCode::Char(_) if ctrl || alt => return None,
         KeyCode::Char(c) => Action::Insert(c),
         KeyCode::Backspace => Action::Backspace,
@@ -92,10 +172,19 @@ fn action_for(key: KeyEvent) -> Option<Action> {
 pub fn update(state: &mut State, msg: Msg) -> Vec<Effect> {
     let mut effects = Vec::new();
     match msg {
+        // A key while the words are up only hides them.
+        Msg::Key(key) if state.reveal.is_some() && key.kind != KeyEventKind::Release => state.reveal = None,
         Msg::Key(key) => {
             if let Some(action) = action_for(key) {
                 on_action(state, action, &mut effects);
             }
+        }
+        Msg::Paste(_) if state.reveal.is_some() => state.reveal = None,
+        // An answer is one line: a passphrase copied with its line break still
+        // works, and words pasted one per line become one line.
+        Msg::Paste(text) if state.ask().is_some() => {
+            let text = text.trim_end_matches(['\r', '\n']).replace("\r\n", " ").replace(['\r', '\n'], " ");
+            state.editor.insert_str(&text);
         }
         Msg::Paste(text) => state.editor.insert_str(&text),
         Msg::Mouse(mouse) => match mouse.kind {
@@ -113,6 +202,13 @@ pub fn update(state: &mut State, msg: Msg) -> Vec<Effect> {
             }
         }
         Msg::Core(event) => on_core(state, event),
+        Msg::Done(outcome) => {
+            state.busy = None;
+            on_done(state, outcome, &mut effects);
+        }
+    }
+    if let Some(busy) = effects.iter().find_map(Effect::busy) {
+        state.busy = Some(busy);
     }
     let title = APP.to_string();
     if state.title != title {
@@ -128,13 +224,22 @@ fn scroll_by(state: &mut State, delta: isize) {
 }
 
 fn on_action(state: &mut State, action: Action, effects: &mut Vec<Effect>) {
+    let asking = state.ask().is_some();
     let editor = &mut state.editor;
     match action {
         Action::Send => {
             let line = editor.take();
-            state.history.push(&line);
-            on_line(state, &line, effects);
+            if let Screen::Onboarding(onboarding) = &mut state.screen {
+                effects.extend(onboarding.answer(Secret::new(line), editor));
+            } else if asking {
+                effects.extend(account::answer(state, Secret::new(line)));
+            } else {
+                state.history.push(&line);
+                on_line(state, &line, effects);
+            }
         }
+        // An answer is one line, and earlier lines aren't answers.
+        Action::Newline | Action::Up | Action::Down if asking => {}
         Action::Quit => effects.push(Effect::Quit),
         Action::Clear => state.clear_tab(),
         Action::Newline => editor.newline(),
@@ -172,6 +277,7 @@ fn on_action(state: &mut State, action: Action, effects: &mut Vec<Effect>) {
             let (total, height) = chat_page(state);
             state.scroll.page_down(total, height);
         }
+        Action::Esc if editor.is_empty() && state.pending.is_some() => account::cancel(state),
         Action::Esc if editor.is_empty() => state.scroll.follow_end(),
         Action::Esc => editor.clear(),
     }
@@ -200,6 +306,7 @@ fn on_command(state: &mut State, cmd: Cmd, effects: &mut Vec<Effect>) {
             state.select_tab(0);
         }
         Cmd::Clear => state.clear_tab(),
+        cmd @ (Cmd::Passphrase | Cmd::Phrase | Cmd::PhraseSave | Cmd::PhraseCopy) => account::begin(state, cmd),
         Cmd::Quit => effects.push(Effect::Quit),
         Cmd::Close => {
             if !state.close_tab() {
@@ -207,6 +314,29 @@ fn on_command(state: &mut State, cmd: Cmd, effects: &mut Vec<Effect>) {
             }
         }
         other => state.say(Tone::Warn, format!("{} isn't available yet", other.typed())),
+    }
+}
+
+fn on_done(state: &mut State, outcome: Outcome, effects: &mut Vec<Effect>) {
+    match outcome {
+        Outcome::Started { name, code, recovery_file } => {
+            state.screen = Screen::Main;
+            state.short_code = code.short();
+            state.code = Some(code);
+            state.say(Tone::Good, format!("welcome, {name}. Your code is {code}"));
+            state.name = name;
+            if let Some(path) = recovery_file {
+                state.say(
+                    Tone::Warn,
+                    format!("your recovery file is still at {}. Move it somewhere safe and delete it.", path.display()),
+                );
+            }
+        }
+        Outcome::Fatal(why) => effects.push(Effect::Exit(why)),
+        other => match &mut state.screen {
+            Screen::Onboarding(onboarding) => effects.extend(onboarding.done(other)),
+            Screen::Main => effects.extend(account::done(state, other)),
+        },
     }
 }
 
@@ -441,8 +571,8 @@ mod tests {
         assert_eq!(s.flash.as_ref().unwrap().line, *last_corvo(&s));
         send(&mut s, "/contacts");
         assert_eq!(last_corvo(&s).text, "/contacts isn't available yet");
-        send(&mut s, "/phrase save");
-        assert_eq!(last_corvo(&s).text, "/phrase save isn't available yet");
+        send(&mut s, "/blocked");
+        assert_eq!(last_corvo(&s).text, "/blocked isn't available yet");
         send(&mut s, "hello");
         assert!(last_corvo(&s).text.starts_with("this is the corvo tab"));
         let before = s.tabs[0].lines.len();

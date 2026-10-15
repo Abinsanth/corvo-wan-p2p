@@ -2,26 +2,32 @@
 //! cleanly on every exit, including panics. One loop merges terminal input, a
 //! tick and messages from elsewhere, feeds them to `update` and draws.
 
+pub mod account;
+pub mod clip;
 pub mod commands;
+pub mod onboarding;
+pub mod runner;
 pub mod state;
 pub mod update;
 pub mod view;
 
+use std::collections::VecDeque;
 use std::io::{Write, stdout};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
 use anyhow::Context;
-use corvo_wan_p2p_core::chat::Event;
+use corvo_wan_p2p_core::chat::Config;
 use corvo_wan_p2p_core::identity::Seed;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::event::{
     self, DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste, EnableFocusChange,
-    EnableMouseCapture, Event as TermEvent, KeyboardEnhancementFlags, MouseEventKind, PopKeyboardEnhancementFlags,
-    PushKeyboardEnhancementFlags,
+    EnableMouseCapture, Event as TermEvent, KeyCode, KeyModifiers, KeyboardEnhancementFlags, MouseEventKind,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use ratatui::crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, SetTitle, disable_raw_mode, enable_raw_mode,
@@ -30,6 +36,7 @@ use ratatui::crossterm::terminal::{
 use ratatui::crossterm::{Command, execute};
 use tokio::sync::mpsc;
 
+use self::runner::{Flow, Net, Runner};
 use self::state::{Line, Peer, State, Tab, Tone};
 use self::update::{Effect, Msg, update};
 
@@ -169,9 +176,35 @@ fn to_msg(ev: TermEvent) -> Option<Msg> {
     }
 }
 
-/// Runs the UI until it quits. `msgs` brings everything that isn't the
-/// terminal: engine events now, and effect results later.
-pub async fn run(mut state: State, mut msgs: mpsc::UnboundedReceiver<Msg>) -> anyhow::Result<()> {
+/// What to keep of the input that arrived during a slow step, like
+/// unlocking: only resizes and Ctrl-C. Anything typed ahead would land on
+/// the next screen, maybe unmasked, so a passphrase typed twice would show.
+fn typed_ahead(rx: &mut mpsc::UnboundedReceiver<TermEvent>) -> Vec<Msg> {
+    let mut kept = Vec::new();
+    while let Ok(ev) = rx.try_recv() {
+        match ev {
+            TermEvent::Resize(..) => kept.extend(to_msg(ev)),
+            TermEvent::Key(key) if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) => {
+                kept.push(Msg::Key(key))
+            }
+            _ => {}
+        }
+    }
+    kept
+}
+
+/// Runs the UI until it quits. `Some` with a message to print if it has to
+/// exit, like when the account is open in another window.
+pub async fn run<W: Write>(mut state: State, mut runner: Runner<W>) -> anyhow::Result<Option<String>> {
+    let result = interact(&mut state, &mut runner).await;
+    // After the terminal is back, so leaving looks instant.
+    runner.shutdown().await;
+    result
+}
+
+/// The loop: draw, then carry out one waiting effect or wait for the next
+/// message. Drawing before each effect shows what's slow, like "unlocking…".
+async fn interact<W: Write>(state: &mut State, runner: &mut Runner<W>) -> anyhow::Result<Option<String>> {
     // Declared in this order so they drop in reverse: the input thread stops
     // before the guard gives the terminal back.
     let _guard = Guard::enter().context("couldn't set up the terminal")?;
@@ -179,26 +212,39 @@ pub async fn run(mut state: State, mut msgs: mpsc::UnboundedReceiver<Msg>) -> an
     let (term_tx, mut term_rx) = mpsc::unbounded_channel();
     let _input = InputThread::start(term_tx);
     let size = terminal.size()?;
-    let mut next = Some(Msg::Resize(size.width, size.height));
+    let mut effects: VecDeque<Effect> = update(state, Msg::Resize(size.width, size.height)).into();
     let mut tick = tokio::time::interval(TICK);
     loop {
-        if let Some(msg) = next.take() {
-            for effect in update(&mut state, msg) {
-                match effect {
-                    Effect::Quit => return Ok(()),
-                    Effect::SetTitle(title) => execute!(stdout(), SetTitle(title))?,
+        terminal.draw(|frame| view::draw(frame, state))?;
+        let (msg, slow) = match effects.pop_front() {
+            Some(effect) => {
+                let slow = effect.busy().is_some();
+                match runner.apply(effect).await? {
+                    Flow::Next(msg) => (msg, slow),
+                    Flow::Quit => return Ok(None),
+                    Flow::Exit(why) => return Ok(Some(why)),
                 }
             }
-        }
-        terminal.draw(|frame| view::draw(frame, &state))?;
-        next = tokio::select! {
-            ev = term_rx.recv() => match ev {
-                Some(ev) => to_msg(ev),
-                None => anyhow::bail!("the terminal stopped sending input"),
-            },
-            Some(msg) = msgs.recv() => Some(msg),
-            _ = tick.tick() => Some(Msg::Tick),
+            None => (
+                tokio::select! {
+                ev = term_rx.recv() => match ev {
+                    Some(ev) => to_msg(ev),
+                    None => anyhow::bail!("the terminal stopped sending input"),
+                },
+                Some(event) = runner.next_event() => Some(Msg::Core(event)),
+                _ = tick.tick() => Some(Msg::Tick),
+                },
+                false,
+            ),
         };
+        if let Some(msg) = msg {
+            effects.extend(update(state, msg));
+        }
+        if slow {
+            for msg in typed_ahead(&mut term_rx) {
+                effects.extend(update(state, msg));
+            }
+        }
     }
 }
 
@@ -220,13 +266,9 @@ pub async fn demo() -> anyhow::Result<()> {
     let bob = chat(&state.people[2], &["bob: \x1b[2Jthis tried to clear your screen \u{202E}and flip text"]);
     state.tabs.extend([rahul, bob]);
     state.say(Tone::Good, "demo: nothing here is sent anywhere. /help lists commands, /quit or Ctrl-C leaves.");
-
-    let (tx, rx) = mpsc::unbounded_channel();
-    tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_secs(2)).await;
-        let _ = tx.send(Msg::Core(Event::Network { online: true }));
-    });
-    run(state, rx).await
+    state.online = Some(true);
+    let runner = Runner::new(PathBuf::new(), None, Config::DEFAULT, Net::Internet, stdout());
+    run(state, runner).await.map(drop)
 }
 
 #[cfg(test)]
@@ -271,6 +313,23 @@ mod tests {
         assert!(KEYBOARD_FLAGS.contains(F::DISAMBIGUATE_ESCAPE_CODES));
         assert!(KEYBOARD_FLAGS.contains(F::REPORT_ALTERNATE_KEYS));
         assert!(!KEYBOARD_FLAGS.contains(F::REPORT_ALL_KEYS_AS_ESCAPE_CODES));
+    }
+
+    #[test]
+    fn what_was_typed_during_a_slow_step_is_dropped_but_resizes_and_ctrl_c_are_kept() {
+        use ratatui::crossterm::event::KeyEvent;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let key = |code, modifiers| TermEvent::Key(KeyEvent::new(code, modifiers));
+        for c in "hunter2".chars() {
+            tx.send(key(KeyCode::Char(c), KeyModifiers::NONE)).unwrap();
+        }
+        tx.send(key(KeyCode::Enter, KeyModifiers::NONE)).unwrap();
+        tx.send(TermEvent::Paste("hunter2".into())).unwrap();
+        tx.send(TermEvent::Resize(90, 30)).unwrap();
+        tx.send(key(KeyCode::Char('c'), KeyModifiers::CONTROL)).unwrap();
+        let kept = typed_ahead(&mut rx);
+        assert!(matches!(kept[..], [Msg::Resize(90, 30), Msg::Key(k)] if k.code == KeyCode::Char('c')), "{kept:?}");
+        assert!(rx.try_recv().is_err(), "nothing is left to read");
     }
 
     #[test]

@@ -595,9 +595,13 @@ dependencies = [
  "anyhow",
  "clap",
  "corvo-wan-p2p-core",
+ "iroh",
+ "rand 0.10.3",
  "ratatui",
+ "tempfile",
  "tokio",
  "unicode-width",
+ "zeroize",
 ]
 
 [[package]]

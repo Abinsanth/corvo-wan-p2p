@@ -2,7 +2,13 @@
 //! scrolling, the sidebar, the flash and the status line. Only `update`
 //! changes it; `view` only reads it.
 
+use std::fmt;
+
 use corvo_wan_p2p_core::identity::Code;
+use zeroize::Zeroizing;
+
+use super::account::Pending;
+use super::onboarding::Onboarding;
 
 pub const APP: &str = "corvo-wan-p2p";
 /// The input box grows up to this many rows, then scrolls.
@@ -14,6 +20,43 @@ pub const CORVO_LEN: usize = 500;
 pub const FLASH_TICKS: u32 = 20;
 /// Rows the mouse wheel scrolls per notch.
 pub const WHEEL_STEP: usize = 3;
+
+/// Text that mustn't linger: a passphrase or the recovery words. Wiped from
+/// memory when dropped, and `{:?}` never shows it.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct Secret(Zeroizing<String>);
+
+impl Secret {
+    pub fn new(text: String) -> Secret {
+        Secret(Zeroizing::new(text))
+    }
+
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for Secret {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Secret(..)")
+    }
+}
+
+/// A question in the input box. The answer goes to whoever asked, not to a
+/// chat, and isn't kept in the input history.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Ask {
+    /// Shown before the answer, in place of `> `.
+    pub label: String,
+    /// Each character shows as `•`.
+    pub masked: bool,
+}
+
+/// Which screen is up: the ones before the chat, or the chat itself.
+pub enum Screen {
+    Onboarding(Onboarding),
+    Main,
+}
 
 /// The multi-line input box. `cursor` is a byte index on a char boundary.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -297,6 +340,7 @@ pub struct Flash {
 }
 
 pub struct State {
+    pub screen: Screen,
     /// `corvo` first, then one per open chat.
     pub tabs: Vec<Tab>,
     pub current: usize,
@@ -308,6 +352,8 @@ pub struct State {
     /// Your display name and the start of your code, for the status line.
     pub name: String,
     pub short_code: String,
+    /// Your code, once the account is unlocked.
+    pub code: Option<Code>,
     /// `None` until the engine first says.
     pub online: Option<bool>,
     pub flash: Option<Flash>,
@@ -315,11 +361,18 @@ pub struct State {
     pub size: (u16, u16),
     /// The window title last asked for.
     pub title: String,
+    /// What the app is doing while it can't take input, like "unlocking…".
+    pub busy: Option<&'static str>,
+    /// A command asking its questions in the input box.
+    pub pending: Option<Pending>,
+    /// Your 12 words, shown over the chat until a key is pressed.
+    pub reveal: Option<Secret>,
 }
 
 impl State {
     pub fn new(name: String, short_code: String) -> State {
         State {
+            screen: Screen::Main,
             tabs: vec![Tab::corvo()],
             current: 0,
             editor: Editor::default(),
@@ -328,10 +381,27 @@ impl State {
             people: Vec::new(),
             name,
             short_code,
+            code: None,
             online: None,
             flash: None,
             size: (80, 24),
             title: String::new(),
+            busy: None,
+            pending: None,
+            reveal: None,
+        }
+    }
+
+    /// Starts on the screens before the chat.
+    pub fn onboarding(onboarding: Onboarding) -> State {
+        State { screen: Screen::Onboarding(onboarding), ..State::new(String::new(), String::new()) }
+    }
+
+    /// The question the input box is answering, if it isn't a chat line.
+    pub fn ask(&self) -> Option<Ask> {
+        match &self.screen {
+            Screen::Onboarding(onboarding) => Some(onboarding.ask()),
+            Screen::Main => self.pending.as_ref().map(Pending::ask),
         }
     }
 

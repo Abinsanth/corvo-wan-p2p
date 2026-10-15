@@ -7,7 +7,10 @@ use std::path::PathBuf;
 use corvo_wan_p2p_core::chat::Event;
 use corvo_wan_p2p_core::identity::{Code, Seed};
 use corvo_wan_p2p_core::store::{Person, StoreError, StoredMessage};
-use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind};
+use ratatui::crossterm::event::{
+    KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
+use ratatui::layout::Position;
 
 use super::account::{self, PhraseDone, PhraseUse};
 use super::chat::{self, Loaded};
@@ -15,7 +18,7 @@ use super::commands::{Cmd, HELP, Input, KEYS, parse};
 use super::complete;
 use super::people::{self, Act, Show};
 use super::state::{Screen, Secret, State, Tone, WHEEL_STEP};
-use super::view::chat_page;
+use super::view::{areas, chat_page, input_rows, sidebar_rows, tab_at};
 
 #[derive(Debug)]
 pub enum Msg {
@@ -221,6 +224,10 @@ fn action_for(key: KeyEvent) -> Option<Action> {
 
 pub fn update(state: &mut State, msg: Msg) -> Vec<Effect> {
     let mut effects = Vec::new();
+    // Typing means the window has focus, even where the terminal doesn't say.
+    if matches!(msg, Msg::Key(_) | Msg::Paste(_)) {
+        state.focused = true;
+    }
     match msg {
         // A key while the words are up only hides them.
         Msg::Key(key) if state.reveal.is_some() && key.kind != KeyEventKind::Release => state.reveal = None,
@@ -243,6 +250,10 @@ pub fn update(state: &mut State, msg: Msg) -> Vec<Effect> {
         Msg::Mouse(mouse) => match mouse.kind {
             MouseEventKind::ScrollUp => scroll_by(state, -(WHEEL_STEP as isize)),
             MouseEventKind::ScrollDown => scroll_by(state, WHEEL_STEP as isize),
+            MouseEventKind::Down(MouseButton::Left) => {
+                state.focused = true;
+                click(state, mouse.column, mouse.row);
+            }
             _ => {}
         },
         Msg::Resize(w, h) => state.size = (w, h),
@@ -272,6 +283,23 @@ pub fn update(state: &mut State, msg: Msg) -> Vec<Effect> {
         effects.push(Effect::SetTitle(title));
     }
     effects
+}
+
+/// A left click: on a tab selects it, on a name in the sidebar opens the chat.
+fn click(state: &mut State, x: u16, y: u16) {
+    let Some(areas) = areas(state.size, input_rows(state)) else { return };
+    if !matches!(state.screen, Screen::Main) {
+        return;
+    }
+    if y == areas.tabs.y {
+        if let Some(tab) = tab_at(state, x) {
+            state.select_tab(tab);
+        }
+    } else if areas.sidebar.contains(Position::new(x, y))
+        && let Some(Some(code)) = sidebar_rows(state).get(usize::from(y - areas.sidebar.y))
+    {
+        state.open_chat(*code, true);
+    }
 }
 
 fn scroll_by(state: &mut State, delta: isize) {
@@ -595,7 +623,13 @@ mod tests {
         send(&mut s, "/clear");
         assert_eq!(s.tabs[0].cleared, 1);
         alt(&mut s, KeyCode::Char('2'));
-        s.tabs[1].lines.push(Line { text: "hi".into(), tone: Tone::Plain });
+        let peer = s.tabs[1].peer.unwrap();
+        s.chats.entry(peer).or_default().messages.push(corvo_wan_p2p_core::store::StoredMessage {
+            id: "01".into(),
+            sent_at: 0,
+            text: "hi".into(),
+            mark: corvo_wan_p2p_core::store::Mark::Received,
+        });
         ctrl(&mut s, 'l');
         assert_eq!(s.tabs[1].cleared, 1);
         assert_eq!(s.tabs[0].lines.len(), 1, "nothing is deleted");

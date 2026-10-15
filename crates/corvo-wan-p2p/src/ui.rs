@@ -29,8 +29,8 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::event::{
     self, DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste, EnableFocusChange,
-    EnableMouseCapture, Event as TermEvent, KeyCode, KeyModifiers, KeyboardEnhancementFlags, MouseEventKind,
-    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    EnableMouseCapture, Event as TermEvent, KeyCode, KeyModifiers, KeyboardEnhancementFlags, MouseButton,
+    MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use ratatui::crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, SetTitle, disable_raw_mode, enable_raw_mode,
@@ -40,7 +40,7 @@ use ratatui::crossterm::{Command, execute};
 use tokio::sync::mpsc;
 
 use self::runner::{Flow, Net, Runner};
-use self::state::{Line, Peer, State, Tab, Tone};
+use self::state::{State, Tone};
 use self::update::{Effect, Msg, update};
 
 /// How long the input thread waits for a key before checking whether to stop.
@@ -171,11 +171,18 @@ fn to_msg(ev: TermEvent) -> Option<Msg> {
     match ev {
         TermEvent::Key(key) => Some(Msg::Key(key)),
         TermEvent::Paste(text) => Some(Msg::Paste(text)),
-        TermEvent::Mouse(m) if matches!(m.kind, MouseEventKind::ScrollUp | MouseEventKind::ScrollDown) => {
+        TermEvent::Mouse(m)
+            if matches!(
+                m.kind,
+                MouseEventKind::ScrollUp | MouseEventKind::ScrollDown | MouseEventKind::Down(MouseButton::Left)
+            ) =>
+        {
             Some(Msg::Mouse(m))
         }
         TermEvent::Resize(w, h) => Some(Msg::Resize(w, h)),
-        _ => None,
+        TermEvent::FocusGained => Some(Msg::Focus(true)),
+        TermEvent::FocusLost => Some(Msg::Focus(false)),
+        TermEvent::Mouse(_) => None,
     }
 }
 
@@ -254,20 +261,33 @@ async fn interact<W: Write>(state: &mut State, runner: &mut Runner<W>) -> anyhow
 /// `--demo-ui`: the screen with made-up people and chats, to try it by hand
 /// before there's an account to unlock.
 pub async fn demo() -> anyhow::Result<()> {
+    use corvo_wan_p2p_core::store::{Mark, Person, Standing, StoredMessage};
     let me = Seed::generate().code();
     let mut state = State::new("you".into(), me.short());
-    let people = [("rahul", true, false), ("ana maria", false, false), ("bob·m4x8", false, true)];
-    for (label, online, request) in people {
-        state.people.push(Peer { code: Seed::generate().code(), label: label.into(), online, request, unread: 0 });
-    }
-    let chat = |peer: &Peer, lines: &[&str]| {
-        let mut tab = Tab::chat(peer.code, peer.label.clone());
-        tab.lines = lines.iter().map(|text| Line { text: text.to_string(), tone: Tone::Plain }).collect();
-        tab
+    let now = 1_760_000_000_000;
+    let person =
+        |name: &str, standing| Person { code: Seed::generate().code(), name: name.into(), last_seen: None, standing };
+    let (rahul, bob) = (person("rahul", Standing::Contact), person("bob", Standing::Request));
+    let (rahul_code, bob_code) = (rahul.code, bob.code);
+    state.set_people(vec![rahul, person("ana maria", Standing::Contact), bob, person("bob", Standing::Blocked)]);
+    state.connected.insert(rahul_code);
+    let message = |i: i64, text: &str, mark| StoredMessage {
+        id: format!("{i:02}"),
+        sent_at: now + i * 60_000,
+        text: text.into(),
+        mark,
     };
-    let rahul = chat(&state.people[0], &["rahul: hi!", "you: hey, this is the demo", "rahul: two\nlines"]);
-    let bob = chat(&state.people[2], &["bob: \x1b[2Jthis tried to clear your screen \u{202E}and flip text"]);
-    state.tabs.extend([rahul, bob]);
+    state.chats.entry(rahul_code).or_default().messages = vec![
+        message(1, "hi!", Mark::Received),
+        message(2, "hey, this is the demo", Mark::Read),
+        message(3, "two\nlines", Mark::Received),
+        message(4, "not delivered yet", Mark::Waiting),
+    ];
+    state.chats.entry(bob_code).or_default().messages =
+        vec![message(5, "\x1b[2Jthis tried to clear your screen \u{202E}and flip text", Mark::Received)];
+    state.open_chat(rahul_code, false);
+    state.open_chat(bob_code, false);
+    state.refresh_sidebar();
     state.say(Tone::Good, "demo: nothing here is sent anywhere. /help lists commands, /quit or Ctrl-C leaves.");
     state.online = Some(true);
     let runner = Runner::new(PathBuf::new(), None, Config::DEFAULT, Net::Internet, stdout());
@@ -342,6 +362,8 @@ mod tests {
         assert!(to_msg(mouse(MouseEventKind::Moved)).is_none());
         assert!(matches!(to_msg(mouse(MouseEventKind::ScrollUp)), Some(Msg::Mouse(_))));
         assert!(matches!(to_msg(TermEvent::Resize(10, 5)), Some(Msg::Resize(10, 5))));
-        assert!(to_msg(TermEvent::FocusLost).is_none());
+        assert!(matches!(to_msg(TermEvent::FocusLost), Some(Msg::Focus(false))));
+        let click = MouseEventKind::Down(ratatui::crossterm::event::MouseButton::Left);
+        assert!(matches!(to_msg(mouse(click)), Some(Msg::Mouse(_))));
     }
 }

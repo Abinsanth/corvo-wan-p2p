@@ -211,7 +211,8 @@ fn distance(a: &str, b: &str) -> usize {
 }
 
 impl Cmd {
-    /// How it's typed, for messages about it.
+    /// How it's typed.
+    #[cfg(test)]
     pub fn typed(&self) -> &'static str {
         match self {
             Cmd::Code => "/code",

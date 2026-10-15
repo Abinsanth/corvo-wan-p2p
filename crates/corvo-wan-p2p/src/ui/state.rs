@@ -310,6 +310,8 @@ impl Scroll {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tone {
     Plain,
+    /// Less important, like the line for a new day.
+    Dim,
     Good,
     Warn,
     Bad,
@@ -327,9 +329,10 @@ pub struct Tab {
     /// Who the chat is with; `None` for the `corvo` tab.
     pub peer: Option<Code>,
     pub title: String,
+    /// The `corvo` tab's lines. A chat tab draws its messages from `State::chats`.
     pub lines: Vec<Line>,
-    /// How many of `lines` came before the last `/clear`. They're kept, just
-    /// scrolled out of view.
+    /// How many lines (or a chat's messages) came before the last `/clear`.
+    /// They're kept, just scrolled out of view.
     pub cleared: usize,
 }
 
@@ -575,8 +578,13 @@ impl State {
     /// Like a terminal's `clear`: the open tab shows empty, and scrolling up
     /// shows what came before.
     pub fn clear_tab(&mut self) {
-        let tab = &mut self.tabs[self.current];
-        tab.cleared = tab.lines.len();
+        let tab = &self.tabs[self.current];
+        // A chat tab's mark counts its messages; the corvo tab's, its lines.
+        let len = match tab.peer {
+            Some(peer) => self.chats.get(&peer).map_or(0, |c| c.messages.len()),
+            None => tab.lines.len(),
+        };
+        self.tabs[self.current].cleared = len;
         self.scroll.follow_end();
     }
 

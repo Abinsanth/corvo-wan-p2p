@@ -17,7 +17,8 @@ use std::iter::Peekable;
 use std::str::Chars;
 
 use corvo_wan_p2p_core::VERSION;
-use corvo_wan_p2p_core::identity::is_invisible;
+use corvo_wan_p2p_core::identity::{Code, is_invisible};
+use corvo_wan_p2p_core::store::{Mark, Standing};
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -25,8 +26,9 @@ use ratatui::text::{Line as TextLine, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use super::chat::local;
 use super::onboarding::Onboarding;
-use super::state::{APP, MAX_INPUT_ROWS, Screen, Secret, State, Tab, Tone};
+use super::state::{APP, Line, MAX_INPUT_ROWS, Screen, Secret, State, Tab, Tone};
 
 /// Smaller than this, only [`TOO_SMALL`] is drawn.
 pub const MIN_WIDTH: u16 = 40;
@@ -38,6 +40,8 @@ pub const BIGGER_FOR_WORDS: &str = "make the window bigger for your words";
 const FIXED_ROWS: u16 = 4;
 /// Before the input's first row, and the space before its others.
 const PROMPT: &str = "> ";
+/// Most completion choices shown at once; the list scrolls with the selection.
+pub const POPUP_ROWS: usize = 6;
 /// How a masked answer's characters show.
 const MASK: char = '•';
 /// Columns for one of the 12 words: `12. ` and the longest word, 8 letters, then a gap.
@@ -81,13 +85,57 @@ pub fn input_rows(state: &State) -> usize {
     state.editor.rows().len().clamp(1, MAX_INPUT_ROWS)
 }
 
-/// The open tab's rows at the chat area's width, and the row its last `/clear`
-/// was at.
-pub fn chat_rows(tab: &Tab, width: u16) -> (Vec<(String, Tone)>, usize) {
+/// What a tab shows, and the line its last `/clear` was at. A chat tab's
+/// lines come from its messages: a line for each new day, the time, who
+/// sent it and, for yours, its mark.
+pub fn tab_lines(state: &State, tab: &Tab) -> (Vec<Line>, usize) {
+    let Some(peer) = tab.peer else {
+        return (tab.lines.clone(), tab.cleared);
+    };
+    let label = state.label(&peer);
+    let mut lines = Vec::new();
+    if state.standing(&peer) == Some(Standing::Request) {
+        let text = format!("{label} isn't a contact yet: /accept adds them, /block stops them");
+        lines.push(Line { text, tone: Tone::Warn });
+    }
+    let messages = state.chats.get(&peer).map_or(&[][..], |c| &c.messages[..]);
+    let mut clear_line = None;
+    let mut last_day = None;
+    for (i, m) in messages.iter().enumerate() {
+        if i == tab.cleared {
+            clear_line = Some(lines.len());
+        }
+        let at = local(m.sent_at);
+        let day = at.map(|t| t.date_naive());
+        if day != last_day {
+            let text = at.map_or_else(|| "── ? ──".into(), |t| format!("── {} ──", t.format("%a %-d %b")));
+            lines.push(Line { text, tone: Tone::Dim });
+            last_day = day;
+        }
+        let time = at.map_or_else(|| "--:--".into(), |t| t.format("%H:%M").to_string());
+        let who = if m.mark.is_outgoing() { "you" } else { label.as_str() };
+        // Later lines of a message start under its text's first column.
+        let text = m.text.replace('\n', &format!("\n{}", " ".repeat(time.len() + 1)));
+        let mark = match m.mark {
+            Mark::Waiting => " ·",
+            Mark::Delivered => " ✓",
+            Mark::Read => " ✓✓",
+            Mark::Received => "",
+        };
+        lines.push(Line { text: format!("{time} {who}: {text}{mark}"), tone: Tone::Plain });
+    }
+    // Never cleared: everything shows, the request line too.
+    let clear_line = if tab.cleared == 0 { 0 } else { clear_line.unwrap_or(lines.len()) };
+    (lines, clear_line)
+}
+
+/// A tab's rows at `width`, and the row its last `/clear` was at.
+pub fn chat_rows(state: &State, tab: &Tab, width: u16) -> (Vec<(String, Tone)>, usize) {
+    let (lines, cleared) = tab_lines(state, tab);
     let mut rows = Vec::new();
     let mut clear_row = None;
-    for (i, line) in tab.lines.iter().enumerate() {
-        if i == tab.cleared {
+    for (i, line) in lines.iter().enumerate() {
+        if i == cleared {
             clear_row = Some(rows.len());
         }
         for piece in line.text.split('\n') {
@@ -105,7 +153,7 @@ pub fn chat_page(state: &State) -> (usize, usize) {
     let Some(areas) = areas(state.size, input_rows(state)) else {
         return (0, 0);
     };
-    let (rows, clear_row) = chat_rows(state.tab(), areas.chat.width);
+    let (rows, clear_row) = chat_rows(state, state.tab(), areas.chat.width);
     let height = areas.chat.height as usize;
     (rows.len().max(clear_row + height), height)
 }
@@ -226,6 +274,7 @@ pub fn draw(frame: &mut Frame, state: &State) {
     draw_flash(frame, state, areas.flash);
     frame.render_widget(Block::new().borders(Borders::TOP).border_style(dim()), areas.border);
     draw_input(frame, state, areas.input);
+    draw_popup(frame, state, areas.input);
     draw_status(frame, state, areas.status);
 }
 
@@ -323,6 +372,7 @@ fn dim() -> Style {
 fn tone(tone: Tone) -> Style {
     match tone {
         Tone::Plain => Style::new(),
+        Tone::Dim => dim(),
         Tone::Good => Style::new().fg(Color::Green),
         Tone::Warn => Style::new().fg(Color::Yellow),
         Tone::Bad => Style::new().fg(Color::Red),
@@ -334,9 +384,27 @@ fn one_line(text: &str) -> String {
     clean(&text.replace('\n', " "))
 }
 
+/// Each tab's title as drawn, padded with a space each side.
+fn tab_titles(state: &State) -> Vec<String> {
+    state.tabs.iter().map(|tab| format!(" {} ", one_line(&tab.title))).collect()
+}
+
+/// The tab drawn at column `x`, for clicks.
+pub fn tab_at(state: &State, x: u16) -> Option<usize> {
+    let mut start = 0;
+    for (i, title) in tab_titles(state).iter().enumerate() {
+        let end = start + title.width();
+        if (start..end).contains(&usize::from(x)) {
+            return Some(i);
+        }
+        start = end + 1; // the │ between tabs
+    }
+    None
+}
+
 fn draw_tabs(frame: &mut Frame, state: &State, area: Rect) {
     let mut spans = Vec::new();
-    for (i, tab) in state.tabs.iter().enumerate() {
+    for (i, title) in tab_titles(state).into_iter().enumerate() {
         if i > 0 {
             spans.push(Span::styled("│", dim()));
         }
@@ -345,37 +413,85 @@ fn draw_tabs(frame: &mut Frame, state: &State, area: Rect) {
         } else {
             Style::new()
         };
-        spans.push(Span::styled(format!(" {} ", one_line(&tab.title)), style));
+        spans.push(Span::styled(title, style));
     }
     frame.render_widget(Paragraph::new(TextLine::from(spans)), area);
 }
 
-fn draw_sidebar(frame: &mut Frame, state: &State, area: Rect) {
+/// The sidebar's lines, each with the person a click on it opens.
+fn sidebar(state: &State) -> Vec<(TextLine<'static>, Option<Code>)> {
     let open = state.tab().peer;
+    let unread = |n: usize| if n > 0 { Span::styled(format!(" ({n})"), tone(Tone::Warn)) } else { Span::raw("") };
     let mut lines = Vec::new();
     for peer in state.people.iter().filter(|p| !p.request) {
         let (dot, dot_style) = if peer.online { ("● ", Style::new().fg(Color::Green)) } else { ("○ ", dim()) };
         let name = if open == Some(peer.code) { Style::new().add_modifier(Modifier::BOLD) } else { Style::new() };
-        lines.push(TextLine::from(vec![Span::styled(dot, dot_style), Span::styled(one_line(&peer.label), name)]));
+        let spans = vec![Span::styled(dot, dot_style), Span::styled(one_line(&peer.label), name), unread(peer.unread)];
+        lines.push((TextLine::from(spans), Some(peer.code)));
     }
     let requests: Vec<_> = state.people.iter().filter(|p| p.request).collect();
     if !requests.is_empty() {
         if !lines.is_empty() {
-            lines.push(TextLine::default());
+            lines.push((TextLine::default(), None));
         }
-        lines.push(TextLine::styled(format!("Requests ({})", requests.len()), tone(Tone::Warn)));
+        lines.push((TextLine::styled(format!("Requests ({})", requests.len()), tone(Tone::Warn)), None));
         for peer in requests {
-            lines.push(TextLine::from(format!("  {}", one_line(&peer.label))));
+            let spans = vec![Span::raw(format!("  {}", one_line(&peer.label))), unread(peer.unread)];
+            lines.push((TextLine::from(spans), Some(peer.code)));
         }
     }
     if lines.is_empty() {
-        lines = vec![TextLine::styled("no one yet", dim()), TextLine::styled("/add <code>", dim())];
+        lines = vec![(TextLine::styled("no one yet", dim()), None), (TextLine::styled("/add <code>", dim()), None)];
     }
+    lines
+}
+
+/// Who each sidebar row opens, top to bottom, for clicks.
+pub fn sidebar_rows(state: &State) -> Vec<Option<Code>> {
+    sidebar(state).into_iter().map(|(_, code)| code).collect()
+}
+
+fn draw_sidebar(frame: &mut Frame, state: &State, area: Rect) {
+    let lines: Vec<TextLine> = sidebar(state).into_iter().map(|(line, _)| line).collect();
     frame.render_widget(Paragraph::new(lines).block(Block::new().borders(Borders::RIGHT).border_style(dim())), area);
 }
 
+/// The completion list, just above the input and lined up with the word.
+/// Shrinks to the rows that fit below the tabs.
+fn draw_popup(frame: &mut Frame, state: &State, input: Rect) {
+    let Some(p) = &state.popup else {
+        return;
+    };
+    let room = usize::from(input.y).saturating_sub(3);
+    let rows = p.matches.len().min(POPUP_ROWS).min(room);
+    if rows == 0 || p.start > state.editor.before_cursor().len() {
+        return;
+    }
+    let height = rows as u16 + 2;
+    let longest = p.matches.iter().map(|m| one_line(m).width()).max().unwrap_or(0) as u16;
+    let width = (longest + 2).min(input.width);
+    let before = &state.editor.before_cursor()[..p.start];
+    let col = before[before.rfind('\n').map_or(0, |i| i + 1)..].width() as u16;
+    let x = (input.x + PROMPT.len() as u16 + col).min(input.x + input.width - width);
+    let area = Rect::new(x, input.y - height, width, height);
+    let first = p.selected.saturating_sub(rows - 1);
+    let lines: Vec<TextLine> = p
+        .matches
+        .iter()
+        .enumerate()
+        .skip(first)
+        .take(rows)
+        .map(|(i, m)| {
+            let style = if i == p.selected { Style::new().add_modifier(Modifier::REVERSED) } else { Style::new() };
+            TextLine::styled(one_line(m), style)
+        })
+        .collect();
+    frame.render_widget(Clear, area);
+    frame.render_widget(Paragraph::new(lines).block(Block::bordered().border_style(dim())), area);
+}
+
 fn draw_chat(frame: &mut Frame, state: &State, area: Rect) {
-    let (rows, _) = chat_rows(state.tab(), area.width);
+    let (rows, _) = chat_rows(state, state.tab(), area.width);
     let (total, height) = chat_page(state);
     let top = state.scroll.top(total, height);
     let shown: Vec<TextLine> =
@@ -459,9 +575,10 @@ fn draw_status(frame: &mut Frame, state: &State, area: Rect) {
 mod tests {
     use super::*;
     use crate::ui::onboarding::Onboarding;
-    use crate::ui::state::{Line, Peer, Screen, Secret};
+    use crate::ui::state::{Screen, Secret};
     use crate::ui::update::{Msg, update};
     use corvo_wan_p2p_core::identity::Seed;
+    use corvo_wan_p2p_core::store::{Person, StoredMessage};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::buffer::Buffer;
@@ -513,24 +630,45 @@ mod tests {
         terminal.backend().buffer().clone()
     }
 
+    fn person(code: Code, name: &str, standing: Standing) -> Person {
+        Person { code, name: name.into(), last_seen: None, standing }
+    }
+
+    fn received(id: usize, text: &str) -> StoredMessage {
+        StoredMessage {
+            id: format!("{id:04}"),
+            sent_at: 1_760_000_000_000 + id as i64,
+            text: text.into(),
+            mark: Mark::Received,
+        }
+    }
+
+    /// rahul (online, with a chat open), maria, and two bobs who look alike:
+    /// one a request, one blocked.
     fn busy_state() -> State {
         let mut state = State::new("ana".into(), "abcdefgh".into());
         let rahul = Seed::generate().code();
-        state.people = vec![
-            Peer { code: rahul, label: "rahul".into(), online: true, request: false, unread: 0 },
-            Peer { code: Seed::generate().code(), label: "maria".into(), online: false, request: false, unread: 0 },
-            Peer { code: Seed::generate().code(), label: "bob·m4x8".into(), online: false, request: true, unread: 0 },
-        ];
-        let mut chat = Tab::chat(rahul, "rahul".into());
+        state.set_people(vec![
+            person(rahul, "rahul", Standing::Contact),
+            person(Seed::generate().code(), "maria", Standing::Contact),
+            person(Seed::generate().code(), "bob", Standing::Request),
+            person(Seed::generate().code(), "bob", Standing::Blocked),
+        ]);
+        state.connected.insert(rahul);
+        let chat = state.chats.entry(rahul).or_default();
         for i in 0..40 {
-            chat.lines
-                .push(Line { text: format!("rahul: message {i} with some words to wrap around"), tone: Tone::Plain });
+            chat.messages.push(received(i, &format!("message {i} with some words to wrap around")));
         }
-        chat.lines.push(Line { text: "two\nlines and 日本語 and \x1b[2J\u{202E}".into(), tone: Tone::Good });
-        state.tabs.push(chat);
+        chat.messages.push(received(40, "two\nlines and 日本語 and \x1b[2J\u{202E}"));
+        state.refresh_sidebar();
+        state.open_chat(rahul, false);
         state.say(Tone::Plain, "welcome");
         state.say(Tone::Bad, "something went wrong");
         state
+    }
+
+    fn rahul(state: &State) -> Code {
+        state.tabs[1].peer.unwrap()
     }
 
     #[test]
@@ -540,10 +678,10 @@ mod tests {
         state.editor.set("hello".into());
         let buf = render(&state, 80, 24);
         assert!(row(&buf, 0).starts_with(" corvo │ rahul "), "{:?}", row(&buf, 0));
-        assert!(row(&buf, 1).starts_with("● rahul"), "{:?}", row(&buf, 1));
-        assert!(row(&buf, 2).starts_with("○ maria"));
+        assert!(row(&buf, 1).starts_with("○ maria"), "{:?}", row(&buf, 1));
+        assert!(row(&buf, 2).starts_with("● rahul"), "contacts by name");
         assert!(row(&buf, 4).starts_with("Requests (1)"));
-        assert!(row(&buf, 5).starts_with("  bob·m4x8"));
+        assert!(row(&buf, 5).starts_with("  bob·"));
         assert_eq!(row(&buf, 1).chars().nth(19), Some('│'), "the sidebar is 20 columns");
         assert!(row(&buf, 1).contains("welcome"));
         assert!(row(&buf, 20).starts_with("something went wrong"), "the flash");
@@ -758,5 +896,133 @@ mod tests {
                 render(&main, w, h);
             }
         }
+    }
+
+    fn hhmm(ms: i64) -> String {
+        crate::ui::chat::local(ms).unwrap().format("%H:%M").to_string()
+    }
+
+    fn chat_screen(state: &mut State) -> String {
+        state.select_tab(1);
+        screen(&render(state, 80, 24))
+    }
+
+    #[test]
+    fn messages_show_time_sender_and_marks() {
+        let mut state = busy_state();
+        let rahul = rahul(&state);
+        let t = 1_760_000_100_000;
+        let mine = |id: &str, text: &str, mark| StoredMessage { id: id.into(), sent_at: t, text: text.into(), mark };
+        let chat = state.chats.get_mut(&rahul).unwrap();
+        chat.messages = vec![
+            StoredMessage { id: "a".into(), sent_at: t, text: "hi".into(), mark: Mark::Received },
+            mine("b", "waiting", Mark::Waiting),
+            mine("c", "delivered", Mark::Delivered),
+            mine("d", "read", Mark::Read),
+        ];
+        let screen = chat_screen(&mut state);
+        let at = hhmm(t);
+        assert!(screen.contains(&format!("{at} rahul: hi")), "{screen}");
+        assert!(screen.contains(&format!("{at} you: waiting ·")));
+        assert!(screen.contains(&format!("{at} you: delivered ✓")));
+        assert!(screen.contains(&format!("{at} you: read ✓✓")));
+        let day = crate::ui::chat::local(t).unwrap().format("%a %-d %b").to_string();
+        assert!(screen.contains(&format!("── {day} ──")), "a line for the day");
+    }
+
+    #[test]
+    fn peer_text_is_drawn_cleaned() {
+        let mut state = busy_state();
+        let rahul = rahul(&state);
+        state.chats.get_mut(&rahul).unwrap().messages = vec![received(1, "\x1b[2Jboom \u{202E}evil\x1b]0;title\x07")];
+        let screen = chat_screen(&mut state);
+        assert!(screen.contains("rahul: boom evil"), "{screen}");
+        assert!(!screen.contains('\x1b') && !screen.contains('\u{202E}'));
+    }
+
+    #[test]
+    fn a_long_line_wraps_within_the_chat() {
+        let mut state = busy_state();
+        let rahul = rahul(&state);
+        state.chats.get_mut(&rahul).unwrap().messages = vec![received(1, &"x".repeat(300))];
+        state.select_tab(1);
+        let buf = render(&state, 80, 24);
+        let chat = areas((80, 24), 1).unwrap().chat;
+        let xs: usize = (chat.y..chat.bottom()).map(|y| row(&buf, y).chars().filter(|&c| c == 'x').count()).sum();
+        assert_eq!(xs, 300, "every character is drawn");
+        assert!((chat.y..chat.bottom()).filter(|&y| row(&buf, y).contains("xxxx")).count() >= 6);
+    }
+
+    #[test]
+    fn look_alike_labels_show_in_the_sidebar_and_on_messages() {
+        let mut state = busy_state();
+        let bob = state.people.iter().find(|p| p.request).unwrap().code;
+        state.chats.entry(bob).or_default().messages.push(received(1, "hello"));
+        state.open_chat(bob, true);
+        let label = state.label(&bob);
+        assert!(label.starts_with("bob·"));
+        let screen = screen(&render(&state, 80, 24));
+        assert!(screen.contains(&format!("{label}: hello")));
+        assert!(screen.contains("/accept"), "a request's chat says how to answer:\n{screen}");
+    }
+
+    #[test]
+    fn the_sidebar_counts_unread_messages() {
+        let mut state = busy_state();
+        let rahul = rahul(&state);
+        state.chats.get_mut(&rahul).unwrap().unread = 3;
+        state.refresh_sidebar();
+        let buf = render(&state, 80, 24);
+        assert!((0..24).any(|y| row(&buf, y).starts_with("● rahul (3)")));
+    }
+
+    #[test]
+    fn the_completion_list_sits_above_the_input_lined_up_with_the_word() {
+        let mut state = busy_state();
+        typed(&mut state, "/chat ");
+        update(&mut state, Msg::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)));
+        let buf = render(&state, 80, 24);
+        let names: Vec<String> = state.popup.as_ref().unwrap().matches.clone();
+        assert_eq!(names.len(), 3, "rahul, maria and the bob who's a request");
+        let input = areas((80, 24), 1).unwrap().input;
+        let first = input.y as usize - names.len() - 1;
+        for (i, name) in names.iter().enumerate() {
+            let line = row(&buf, (first + i) as u16);
+            let column = line.find(name.as_str()).map(|at| line[..at].chars().count());
+            assert_eq!(column, Some("> /chat ".len() + 1), "{line:?}");
+        }
+        let selected = buf[(("> /chat ".len() + 1) as u16, first as u16)].modifier;
+        assert!(selected.contains(Modifier::REVERSED));
+    }
+
+    #[test]
+    fn clicking_a_name_opens_the_chat_and_clicking_a_tab_selects_it() {
+        use ratatui::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let mut state = busy_state();
+        state.size = (80, 24);
+        let click = |column, row| {
+            Msg::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+        let maria = state.people.iter().find(|p| p.label == "maria").unwrap().code;
+        let y = (0..24).find(|&y| row(&render(&state, 80, 24), y).starts_with("○ maria")).unwrap();
+        update(&mut state, click(3, y));
+        assert_eq!(state.open_peer(), Some(maria));
+        let bob = state.people.iter().find(|p| p.request).unwrap().code;
+        let y = (0..24).find(|&y| row(&render(&state, 80, 24), y).starts_with("  bob")).unwrap();
+        update(&mut state, click(4, y));
+        assert_eq!(state.open_peer(), Some(bob));
+        update(&mut state, click(2, 0));
+        assert!(state.on_corvo(), "the first tab");
+        let x = row(&render(&state, 80, 24), 0).find("rahul").unwrap() as u16;
+        update(&mut state, click(x, 0));
+        assert_eq!(state.open_peer(), Some(rahul(&state)));
+        update(&mut state, click(3, 4));
+        update(&mut state, click(40, 10));
+        assert_eq!(state.open_peer(), Some(rahul(&state)), "clicking elsewhere changes nothing");
     }
 }

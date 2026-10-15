@@ -10,6 +10,7 @@ use self::ui::onboarding::Onboarding;
 use self::ui::runner::{Net, Runner};
 use self::ui::state::State;
 
+mod selfupdate;
 mod ui;
 
 /// Peer-to-peer chat in your terminal, over the internet.

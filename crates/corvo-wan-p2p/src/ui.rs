@@ -3,6 +3,7 @@
 //! tick and messages from elsewhere, feeds them to `update` and draws.
 
 pub mod commands;
+pub mod onboarding;
 pub mod state;
 pub mod update;
 pub mod view;
@@ -187,6 +188,7 @@ pub async fn run(mut state: State, mut msgs: mpsc::UnboundedReceiver<Msg>) -> an
                 match effect {
                     Effect::Quit => return Ok(()),
                     Effect::SetTitle(title) => execute!(stdout(), SetTitle(title))?,
+                    _ => {}
                 }
             }
         }

@@ -2,11 +2,15 @@
 //! the engine and draws nothing: it returns [`Effect`]s for the loop to carry
 //! out, and their results come back as messages.
 
+use std::path::PathBuf;
+
 use corvo_wan_p2p_core::chat::Event;
+use corvo_wan_p2p_core::identity::{Code, Seed};
+use corvo_wan_p2p_core::store::StoreError;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind};
 
 use super::commands::{Cmd, HELP, Input, KEYS, parse};
-use super::state::{APP, State, Tone, WHEEL_STEP};
+use super::state::{APP, Screen, Secret, State, Tone, WHEEL_STEP};
 use super::view::chat_page;
 
 #[derive(Debug)]
@@ -18,12 +22,72 @@ pub enum Msg {
     /// Four times a second, so flashes go away on time.
     Tick,
     Core(Event),
+    /// What came of an [`Effect`].
+    Done(Outcome),
 }
 
+/// Work for the loop: anything that touches the store, the engine, files or
+/// the terminal. Its result comes back as [`Msg::Done`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Effect {
     Quit,
+    /// Leave, and print this once the terminal is back to normal.
+    Exit(String),
     SetTitle(String),
+    /// Put this on the clipboard (OSC 52).
+    Copy(String),
+    /// Unlock the account and start the engine.
+    Unlock(Secret),
+    /// Make the account. The engine starts later, with [`Effect::Start`].
+    Create {
+        seed: Seed,
+        name: String,
+        passphrase: Secret,
+    },
+    /// Start the engine on the account just made.
+    Start,
+    /// Delete the account on this computer (`--recover`).
+    Wipe,
+    /// Whether the recovery file is there.
+    CheckRecovery,
+    WriteRecovery {
+        seed: Seed,
+        overwrite: bool,
+    },
+}
+
+impl Effect {
+    /// What to show while it runs, for the ones that take a moment.
+    fn busy(&self) -> Option<&'static str> {
+        Some(match self {
+            Effect::Unlock(_) => "unlocking…",
+            Effect::Create { .. } => "making your account…",
+            Effect::Start => "starting…",
+            Effect::Wipe => "deleting…",
+            _ => return None,
+        })
+    }
+}
+
+/// What came of an [`Effect`].
+#[derive(Debug)]
+pub enum Outcome {
+    /// The account is unlocked and the engine is running. `recovery_file` is
+    /// where the recovery file is, if it's still there.
+    Started {
+        name: String,
+        code: Code,
+        recovery_file: Option<PathBuf>,
+    },
+    /// Unlocking didn't work.
+    Unlock(StoreError),
+    Created(Result<(), String>),
+    Wiped(Result<(), String>),
+    /// Where the recovery file is, if it's there.
+    RecoveryFile(Option<PathBuf>),
+    RecoveryWritten(Result<PathBuf, String>),
+    /// Something that leaves the app unusable, like the engine not starting.
+    Fatal(String),
 }
 
 /// What a key press means.
@@ -113,6 +177,13 @@ pub fn update(state: &mut State, msg: Msg) -> Vec<Effect> {
             }
         }
         Msg::Core(event) => on_core(state, event),
+        Msg::Done(outcome) => {
+            state.busy = None;
+            on_done(state, outcome, &mut effects);
+        }
+    }
+    if let Some(busy) = effects.iter().find_map(Effect::busy) {
+        state.busy = Some(busy);
     }
     let title = APP.to_string();
     if state.title != title {
@@ -128,13 +199,20 @@ fn scroll_by(state: &mut State, delta: isize) {
 }
 
 fn on_action(state: &mut State, action: Action, effects: &mut Vec<Effect>) {
+    let asking = state.ask().is_some();
     let editor = &mut state.editor;
     match action {
         Action::Send => {
             let line = editor.take();
-            state.history.push(&line);
-            on_line(state, &line, effects);
+            if let Screen::Onboarding(onboarding) = &mut state.screen {
+                effects.extend(onboarding.answer(Secret::new(line), editor));
+            } else {
+                state.history.push(&line);
+                on_line(state, &line, effects);
+            }
         }
+        // An answer is one line, and earlier lines aren't answers.
+        Action::Newline | Action::Up | Action::Down if asking => {}
         Action::Quit => effects.push(Effect::Quit),
         Action::Clear => state.clear_tab(),
         Action::Newline => editor.newline(),
@@ -207,6 +285,29 @@ fn on_command(state: &mut State, cmd: Cmd, effects: &mut Vec<Effect>) {
             }
         }
         other => state.say(Tone::Warn, format!("{} isn't available yet", other.typed())),
+    }
+}
+
+fn on_done(state: &mut State, outcome: Outcome, effects: &mut Vec<Effect>) {
+    match outcome {
+        Outcome::Started { name, code, recovery_file } => {
+            state.screen = Screen::Main;
+            state.short_code = code.short();
+            state.code = Some(code);
+            state.say(Tone::Good, format!("welcome, {name}. Your code is {code}"));
+            state.name = name;
+            if let Some(path) = recovery_file {
+                state.say(
+                    Tone::Warn,
+                    format!("your recovery file is still at {}. Move it somewhere safe and delete it.", path.display()),
+                );
+            }
+        }
+        Outcome::Fatal(why) => effects.push(Effect::Exit(why)),
+        other => match &mut state.screen {
+            Screen::Onboarding(onboarding) => effects.extend(onboarding.done(other)),
+            Screen::Main => {}
+        },
     }
 }
 

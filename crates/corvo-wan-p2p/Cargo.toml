@@ -12,9 +12,11 @@ publish = false
 corvo-wan-p2p-core.workspace = true
 anyhow.workspace = true
 clap.workspace = true
+rand.workspace = true
 ratatui.workspace = true
 tokio.workspace = true
 unicode-width.workspace = true
+zeroize.workspace = true
 
 [lints]
 workspace = true

@@ -5,6 +5,7 @@
 pub mod chat;
 pub mod files;
 pub mod identity;
+pub mod names;
 pub mod net;
 pub mod proto;
 pub mod recovery;

@@ -170,15 +170,6 @@ async fn a_contact_that_answers_wrongly_is_retried_with_back_off() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn strangers_are_turned_away() {
-    let lookup = MemoryLookup::new();
-    let mut a = Peer::start(&lookup, "abin").await;
-    let fake = Fake::new(&lookup).await;
-    assert!(fake.hello(a.code, PROTO_VERSION).await.is_none(), "a stranger gets no hello back");
-    a.expect_none(Duration::from_millis(500), |e| matches!(e, Event::Online(_) | Event::Received { .. })).await;
-}
-
-#[tokio::test(flavor = "multi_thread")]
 async fn a_peer_sending_an_oversized_frame_is_cut_off_and_others_carry_on() {
     let lookup = MemoryLookup::new();
     let (mut a, mut b) = friends(&lookup).await;

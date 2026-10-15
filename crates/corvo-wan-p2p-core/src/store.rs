@@ -16,6 +16,7 @@ mod schema;
 use std::fs::{self, File, TryLockError};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use rusqlite::{Connection, OptionalExtension, params};
 use zeroize::Zeroizing;
@@ -31,6 +32,9 @@ use crate::identity::{NameError, Seed, clean_name};
 pub const KEY_FILE: &str = "key.json";
 pub const DB_FILE: &str = "store.db";
 const LOCK_FILE: &str = "lock";
+/// How long a held lock is tried again before saying another copy has it.
+const LOCK_PATIENCE: Duration = Duration::from_millis(300);
+const LOCK_RETRY: Duration = Duration::from_millis(10);
 /// SQLite's side files, which belong to `store.db`.
 const DB_SIDE_FILES: [&str; 3] = ["store.db-journal", "store.db-wal", "store.db-shm"];
 
@@ -227,13 +231,20 @@ fn row_aad(column: &[u8], row: &[&[u8]]) -> Vec<u8> {
     aad
 }
 
-/// Takes the lock file in `dir`, or reports that another copy holds it.
+/// Takes the lock file in `dir`, or reports that another copy holds it. A
+/// lock still held is tried again for a moment first: a process started just
+/// before (curl or tar, say) shares the lock's file until it runs its own
+/// program, so a lock can outlive the store that let it go.
 fn take_lock(dir: &Path) -> Result<File, StoreError> {
     let file = private_file().create(true).truncate(false).open(dir.join(LOCK_FILE))?;
-    match file.try_lock() {
-        Ok(()) => Ok(file),
-        Err(TryLockError::WouldBlock) => Err(StoreError::AlreadyRunning),
-        Err(TryLockError::Error(e)) => Err(e.into()),
+    let give_up = Instant::now() + LOCK_PATIENCE;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(file),
+            Err(TryLockError::WouldBlock) if Instant::now() < give_up => std::thread::sleep(LOCK_RETRY),
+            Err(TryLockError::WouldBlock) => return Err(StoreError::AlreadyRunning),
+            Err(TryLockError::Error(e)) => return Err(e.into()),
+        }
     }
 }
 

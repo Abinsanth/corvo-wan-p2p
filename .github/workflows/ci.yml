@@ -27,6 +27,15 @@ jobs:
       - run: cargo fmt --check
       # --locked fails if Cargo.lock wasn't updated with Cargo.toml.
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      # The core never draws the screen, so it must never depend on a terminal crate.
+      - name: The core doesn't depend on terminal crates
+        # The tree goes in a variable first, so the step fails if cargo tree does.
+        run: |
+          tree=$(cargo tree --locked -p corvo-wan-p2p-core -e normal)
+          if grep -E 'ratatui|crossterm' <<< "$tree"; then
+            echo "corvo-wan-p2p-core depends on ratatui or crossterm; only the binary may"
+            exit 1
+          fi
 
   # Linux clippy never sees cfg(windows) code.
   clippy-windows:

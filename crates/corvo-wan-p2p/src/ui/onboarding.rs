@@ -165,6 +165,7 @@ impl Onboarding {
     }
 
     /// Which word (counting from 1) the person is asked to type back.
+    #[cfg(test)]
     pub fn asked_word(&self) -> Option<usize> {
         match &self.step {
             Step::TypeBack { asked, done, .. } => Some(asked[*done] + 1),

@@ -1,4 +1,14 @@
+use std::io::stdout;
+
+use anyhow::Context;
 use clap::Parser;
+use corvo_wan_p2p_core::chat::Config;
+use corvo_wan_p2p_core::files::{data_dir, home_dir};
+use corvo_wan_p2p_core::store::Store;
+
+use self::ui::onboarding::Onboarding;
+use self::ui::runner::{Net, Runner};
+use self::ui::state::State;
 
 mod ui;
 
@@ -6,6 +16,10 @@ mod ui;
 #[derive(Parser)]
 #[command(version)]
 struct Args {
+    /// Forgot your passphrase? Deletes the account on this computer (after you
+    /// type yes) and brings it back from your 12 words: the same code, with no history.
+    #[arg(long)]
+    recover: bool,
     /// Opens the screen with made-up people, to try it by hand.
     #[arg(long, hide = true)]
     demo_ui: bool,
@@ -13,10 +27,17 @@ struct Args {
 
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
+    let runtime = tokio::runtime::Runtime::new()?;
+    ui::install_panic_hook();
     if args.demo_ui {
-        ui::install_panic_hook();
-        return tokio::runtime::Runtime::new()?.block_on(ui::demo());
+        return runtime.block_on(ui::demo());
     }
-    println!("corvo-wan-p2p {} isn't usable yet: chat arrives in a later milestone.", corvo_wan_p2p_core::VERSION);
+    let dir = data_dir().context("couldn't tell where your home folder is; set HOME (APPDATA on Windows)")?;
+    let state = State::onboarding(Onboarding::start(Store::exists(&dir), args.recover));
+    let runner = Runner::new(dir, home_dir(), Config::DEFAULT, Net::Internet, stdout());
+    if let Some(why) = runtime.block_on(ui::run(state, runner))? {
+        eprintln!("{why}");
+        std::process::exit(1);
+    }
     Ok(())
 }

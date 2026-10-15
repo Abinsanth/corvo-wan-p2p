@@ -12,8 +12,11 @@ fn version_flag_prints_name_and_version() {
 }
 
 #[test]
-fn bare_run_says_it_is_not_usable_yet() {
-    let out = run(&[]);
+fn help_offers_recover_for_a_forgotten_passphrase() {
+    let out = run(&["--help"]);
     assert!(out.status.success());
-    assert!(String::from_utf8_lossy(&out.stdout).contains("isn't usable yet"));
+    let help = String::from_utf8_lossy(&out.stdout);
+    assert!(help.contains("--recover"));
+    assert!(help.contains("12 words"));
+    assert!(!help.contains("demo"), "the demo stays hidden");
 }

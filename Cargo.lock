@@ -155,6 +155,7 @@ dependencies = [
  "blake2",
  "cpufeatures 0.3.1",
  "password-hash",
+ "zeroize",
 ]
 
 [[package]]
@@ -409,6 +410,7 @@ dependencies = [
  "cipher 0.5.2",
  "cpufeatures 0.3.1",
  "rand_core 0.10.1",
+ "zeroize",
 ]
 
 [[package]]
@@ -421,6 +423,7 @@ dependencies = [
  "chacha20",
  "cipher 0.5.2",
  "poly1305",
+ "zeroize",
 ]
 
 [[package]]
@@ -590,7 +593,7 @@ checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
 name = "corvo-wan-p2p"
-version = "0.1.0-rc.1"
+version = "0.1.0-rc.3"
 dependencies = [
  "anyhow",
  "chrono",
@@ -605,17 +608,20 @@ dependencies = [
  "sha2 0.11.1",
  "tempfile",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
  "unicode-width",
  "zeroize",
 ]
 
 [[package]]
 name = "corvo-wan-p2p-core"
-version = "0.1.0-rc.1"
+version = "0.1.0-rc.3"
 dependencies = [
  "argon2",
  "bip39",
  "chacha20poly1305",
+ "corvo-wan-p2p-core",
  "data-encoding",
  "hkdf",
  "hmac",
@@ -629,6 +635,8 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
  "ulid",
  "unicode-normalization",
  "zeroize",

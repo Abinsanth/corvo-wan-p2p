@@ -9,27 +9,34 @@ use std::fmt;
 use std::str::FromStr;
 
 use bip39::Mnemonic;
-use data_encoding::BASE32_NOPAD;
 use hkdf::Hkdf;
 use iroh_base::{PublicKey, SecretKey};
-use sha2::{Digest, Sha256};
+use sha2::Sha256;
 use zeroize::Zeroize;
 
 /// How many recovery words there are.
 pub const PHRASE_WORDS: usize = 12;
 
-/// Every code starts with this, so it's recognisable when pasted.
-pub const CODE_PREFIX: &str = "corvo:";
-
-/// The 32-byte key as lowercase base32 without padding.
-const KEY_CHARS: usize = 52;
-/// Characters of checksum after the key.
-const CHECK_CHARS: usize = 4;
+/// Every code starts with this, so it's recognisable when pasted: the
+/// bech32m human-readable part `corvo` and its separator `1`.
+pub const CODE_PREFIX: &str = "corvo1";
+/// The bech32m human-readable part. It's covered by the checksum.
+const HRP: &str = "corvo";
+/// The 32-byte key in code characters, 5 bits each (the last one padded).
+/// Two different keys always differ within these.
+pub const KEY_CHARS: usize = 52;
+/// Characters of bech32m checksum after the key.
+const CHECK_CHARS: usize = 6;
+/// The 32 characters codes are written in (BIP-173): no b, i, o or 1, which
+/// are easy to misread.
+const ALPHABET: &str = "qpzry9x8gf2tvdw0s3jn54khce6mua7l";
+/// What a valid bech32m string's checksum works out to (BIP-350).
+const BECH32M: u32 = 0x2bc8_30a3;
+/// How codes started in the test versions 0.1.0-rc.1 and rc.2.
+const OLD_PREFIX: &str = "corvo:";
 
 /// HKDF label for turning the seed into the secret key. Changing it changes every code.
 const KEY_LABEL: &[u8] = b"corvo-wan-p2p key v1";
-/// Domain-separation label for the code's checksum.
-const CHECK_LABEL: &[u8] = b"corvo-wan-p2p code v1";
 
 /// The 128 bits behind the 12 recovery words. Wiped from memory when dropped.
 #[derive(Clone, PartialEq, Eq)]
@@ -113,7 +120,9 @@ pub enum PhraseError {
     Checksum,
 }
 
-/// Someone's address: their public key, written as `corvo:` + base32 + checksum.
+/// Someone's address: their public key, written as a bech32m string (BIP-350):
+/// `corvo1` + 52 key characters + 6 checksum characters. The checksum catches
+/// any one wrong character, and any four.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Code(PublicKey);
 
@@ -126,26 +135,88 @@ impl Code {
         self.0
     }
 
-    /// The first 8 characters after `corvo:`, for the status line.
+    /// The first 8 characters after `corvo1`, for the status line.
     pub fn short(&self) -> String {
-        body(&self.0)[..8].to_string()
+        spelled(&groups(self.0.as_bytes()))[..8].to_string()
     }
 }
 
-/// Lowercase base32 of the key, 52 characters.
-fn body(key: &PublicKey) -> String {
-    BASE32_NOPAD.encode(key.as_bytes()).to_lowercase()
+/// The key's bits in 5-bit groups, the last one padded with zeros.
+fn groups(bytes: &[u8; 32]) -> Vec<u8> {
+    let (mut acc, mut bits, mut out) = (0u32, 0u32, Vec::with_capacity(KEY_CHARS));
+    for &byte in bytes {
+        acc = (acc << 8) | u32::from(byte);
+        bits += 8;
+        while bits >= 5 {
+            bits -= 5;
+            out.push(((acc >> bits) & 31) as u8);
+        }
+        acc &= (1 << bits) - 1;
+    }
+    if bits > 0 {
+        out.push(((acc << (5 - bits)) & 31) as u8);
+    }
+    out
 }
 
-/// 4 lowercase base32 characters from SHA-256 of the key.
-fn checksum(key_bytes: &[u8; 32]) -> String {
-    let hash = Sha256::new().chain_update(CHECK_LABEL).chain_update(key_bytes).finalize();
-    BASE32_NOPAD.encode(&hash[..3])[..CHECK_CHARS].to_lowercase()
+/// The key back from its 5-bit groups; `None` if the padding isn't zeros.
+fn key_bytes(groups: &[u8]) -> Option<[u8; 32]> {
+    let (mut acc, mut bits, mut out) = (0u32, 0u32, Vec::with_capacity(32));
+    for &group in groups {
+        acc = (acc << 5) | u32::from(group);
+        bits += 5;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+            acc &= (1 << bits) - 1;
+        }
+    }
+    if acc != 0 {
+        return None;
+    }
+    out.try_into().ok()
+}
+
+fn spelled(groups: &[u8]) -> String {
+    groups.iter().map(|&g| char::from(ALPHABET.as_bytes()[usize::from(g)])).collect()
+}
+
+fn char_value(c: char) -> Option<u8> {
+    ALPHABET.find(c).and_then(|i| u8::try_from(i).ok())
+}
+
+/// The bech32 checksum function (BIP-173).
+fn polymod(values: &[u8]) -> u32 {
+    const GENERATOR: [u32; 5] = [0x3b6a_57b2, 0x2650_8e6d, 0x1ea1_19fa, 0x3d42_33dd, 0x2a14_62b3];
+    let mut check = 1u32;
+    for &value in values {
+        let top = check >> 25;
+        check = ((check & 0x1ff_ffff) << 5) ^ u32::from(value);
+        for (i, g) in GENERATOR.iter().enumerate() {
+            if (top >> i) & 1 == 1 {
+                check ^= g;
+            }
+        }
+    }
+    check
+}
+
+/// The human-readable part as the checksum sees it.
+fn hrp_expand(hrp: &str) -> Vec<u8> {
+    let bytes = hrp.as_bytes();
+    bytes.iter().map(|b| b >> 5).chain([0]).chain(bytes.iter().map(|b| b & 31)).collect()
+}
+
+/// The 6 checksum groups for `data`.
+fn checksum(data: &[u8]) -> Vec<u8> {
+    let sum = polymod(&[hrp_expand(HRP), data.to_vec(), vec![0; CHECK_CHARS]].concat()) ^ BECH32M;
+    (0..CHECK_CHARS).map(|i| ((sum >> (5 * (CHECK_CHARS - 1 - i))) & 31) as u8).collect()
 }
 
 impl fmt::Display for Code {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{CODE_PREFIX}{}{}", body(&self.0), checksum(self.0.as_bytes()))
+        let data = groups(self.0.as_bytes());
+        write!(f, "{CODE_PREFIX}{}{}", spelled(&data), spelled(&checksum(&data)))
     }
 }
 
@@ -155,47 +226,74 @@ impl fmt::Debug for Code {
     }
 }
 
+/// Dropped from pasted codes: spaces, line breaks and characters that show nothing.
+fn pasted_noise(c: char) -> bool {
+    c.is_whitespace() || is_invisible(c) || matches!(c, '\u{200C}' | '\u{200D}')
+}
+
 impl FromStr for Code {
     type Err = CodeError;
 
-    /// Accepts what people paste: any case, spaces or line breaks inside, and
-    /// with or without the `corvo:` prefix.
+    /// Accepts what people paste: any case, spaces, line breaks or invisible
+    /// characters inside, and with or without the `corvo1` prefix.
     fn from_str(s: &str) -> Result<Code, CodeError> {
-        let joined: String = s.split_whitespace().collect::<String>().to_lowercase();
+        let joined: String = s.chars().filter(|&c| !pasted_noise(c)).collect::<String>().to_lowercase();
+        if joined.starts_with(OLD_PREFIX) {
+            return Err(CodeError::OldFormat);
+        }
         let text = joined.strip_prefix(CODE_PREFIX).unwrap_or(&joined);
         if text.is_empty() {
             return Err(CodeError::Empty);
         }
-        if let Some(bad) = text.chars().find(|c| !matches!(c, 'a'..='z' | '2'..='7')) {
-            return Err(CodeError::BadCharacter(bad));
+        // An old code without its prefix: base32 with a letter codes never have.
+        let base32 = |c: char| matches!(c, 'a'..='z' | '2'..='7');
+        if text.len() == 56 && text.chars().all(base32) && text.contains(['b', 'i', 'o']) {
+            return Err(CodeError::OldFormat);
+        }
+        if let Some(bad) = text.chars().find(|&c| char_value(c).is_none()) {
+            return Err(if matches!(bad, 'b' | 'i' | 'o' | '1') {
+                CodeError::NeverInCodes(bad)
+            } else {
+                CodeError::BadCharacter(bad)
+            });
         }
         if text.len() != KEY_CHARS + CHECK_CHARS {
             return Err(CodeError::WrongLength(text.len()));
         }
-        let (key_text, check_text) = text.split_at(KEY_CHARS);
-        let bytes: [u8; 32] = BASE32_NOPAD
-            .decode(key_text.to_uppercase().as_bytes())
-            .ok()
-            .and_then(|b| b.try_into().ok())
-            .ok_or(CodeError::Typo)?;
-        if checksum(&bytes) != check_text {
+        let values: Vec<u8> = text.chars().filter_map(char_value).collect();
+        if polymod(&[hrp_expand(HRP), values.clone()].concat()) != BECH32M {
             return Err(CodeError::Typo);
         }
+        let bytes = key_bytes(&values[..KEY_CHARS]).ok_or(CodeError::Typo)?;
         PublicKey::from_bytes(&bytes).map(Code).map_err(|_| CodeError::Typo)
+    }
+}
+
+/// How a refused character is named: as itself when it can be seen, and
+/// always by its code point.
+fn shown(c: char) -> String {
+    if c.is_alphanumeric() || c.is_ascii_graphic() {
+        format!("'{c}' (U+{:04X})", u32::from(c))
+    } else {
+        format!("U+{:04X}", u32::from(c))
     }
 }
 
 /// Why a pasted code was refused.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum CodeError {
-    #[error("that's empty; paste the whole code, starting with corvo:")]
+    #[error("that's empty; paste the whole code, starting with corvo1")]
     Empty,
-    #[error("a code can't contain '{0}'; paste it again")]
+    #[error("a code can't contain {}; paste it again", shown(*.0))]
     BadCharacter(char),
-    #[error("that code is {0} characters long; it should be 56 after corvo:. Part of it is probably missing")]
+    #[error("codes never contain b, i, o or 1, but this has '{0}'; check that character, or copy the code once more")]
+    NeverInCodes(char),
+    #[error("that code is {0} characters long; it should be 58 after corvo1. Part of it is probably missing")]
     WrongLength(usize),
     #[error("this code has a typo; ask for it again or copy it once more")]
     Typo,
+    #[error("that's an old-style code from a test version; ask them for their new one, which starts with corvo1")]
+    OldFormat,
 }
 
 /// The longest display name, in characters.
@@ -268,7 +366,7 @@ mod tests {
         "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
     /// What `VECTOR_PHRASE` must always produce. If these change, every user's code changes.
     const VECTOR_KEY: &str = "407ac8e2d82b601d521b40b834a5c2b63f0c4f8746fd99a2f6430fe21f5355ba";
-    const VECTOR_CODE: &str = "corvo:ib5mrywyfnqb2uq3ic4djjocwy7qyt4hi36ztixwimh6eh2tkw5ageu6";
+    const VECTOR_CODE: &str = "corvo1gpav3ckc9dsp65smgzurffwzkclscnu8gm7enghkgv87y86n2kaq5jnjm8";
 
     fn vector() -> Seed {
         Seed::from_phrase(VECTOR_PHRASE).unwrap()
@@ -311,12 +409,16 @@ mod tests {
         assert_eq!(format!("{:?}", vector()), "Seed(..)");
     }
 
+    /// The same key in the code format of `0.1.0-rc.1` and `rc.2`.
+    const OLD_VECTOR_CODE: &str = "corvo:ib5mrywyfnqb2uq3ic4djjocwy7qyt4hi36ztixwimh6eh2tkw5ageu6";
+
     #[test]
     fn code_round_trips_and_shows_a_short_form() {
         let code = vector().code();
         assert_eq!(VECTOR_CODE.parse::<Code>().unwrap(), code);
-        assert_eq!(code.short(), "ib5mrywy");
-        assert_eq!(code.to_string().len(), CODE_PREFIX.len() + 56);
+        assert_eq!(code.short(), "gpav3ckc");
+        assert_eq!(code.to_string().len(), 64);
+        assert_eq!(code.to_string().len(), CODE_PREFIX.len() + KEY_CHARS + CHECK_CHARS);
     }
 
     #[test]
@@ -325,20 +427,93 @@ mod tests {
         let body = &VECTOR_CODE[CODE_PREFIX.len()..];
         assert_eq!(body.parse::<Code>().unwrap(), code);
         assert_eq!(format!("  {}  ", VECTOR_CODE.to_uppercase()).parse::<Code>().unwrap(), code);
+        assert_eq!(format!(" {} ", body.to_uppercase()).parse::<Code>().unwrap(), code);
         let wrapped = format!("{}\n{}", &VECTOR_CODE[..30], &VECTOR_CODE[30..]);
         assert_eq!(wrapped.parse::<Code>().unwrap(), code);
     }
 
     #[test]
-    fn every_single_character_typo_is_caught() {
-        let alphabet = "abcdefghijklmnopqrstuvwxyz234567";
-        let body: Vec<char> = VECTOR_CODE[CODE_PREFIX.len()..].chars().collect();
+    fn pasted_codes_ignore_zero_width_characters() {
+        let code = vector().code();
+        for mark in ['\u{200B}', '\u{200C}', '\u{200D}', '\u{2060}', '\u{FEFF}'] {
+            for at in [0, 10, VECTOR_CODE.len()] {
+                let mut pasted = VECTOR_CODE.to_string();
+                pasted.insert(at, mark);
+                assert_eq!(pasted.parse::<Code>(), Ok(code), "U+{:04X} at {at}", u32::from(mark));
+            }
+        }
+    }
+
+    /// Checks a whole bech32m string the way BIP-350 does, for the reference vectors.
+    fn bech32m_valid(s: &str) -> bool {
+        let s = s.to_lowercase();
+        let Some(at) = s.rfind('1').filter(|&at| at >= 1 && at + 7 <= s.len()) else { return false };
+        let Some(data) = s[at + 1..].chars().map(char_value).collect::<Option<Vec<u8>>>() else { return false };
+        polymod(&[hrp_expand(&s[..at]), data].concat()) == BECH32M
+    }
+
+    #[test]
+    fn bech32m_reference_vectors_pass() {
+        let valid = [
+            "A1LQFN3A",
+            "a1lqfn3a",
+            "an83characterlonghumanreadablepartthatcontainsthetheexcludedcharactersbioandnumber11sg7hg6",
+            "abcdef1l7aum6echk45nj3s0wdvt2fg8x9yrzpqzd3ryx",
+            "11llllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllludsr8",
+            "split1checkupstagehandshakeupstreamerranterredcaperredlc445v",
+            "?1v759aa",
+        ];
+        for v in valid {
+            assert!(bech32m_valid(v), "{v} should pass");
+        }
+        let invalid = [
+            "M1VUXWEZ",
+            "in1muywd",
+            "y1b0jsk6g",
+            "lt1igcx5c0",
+            "mm1crxm3i",
+            "au1s5cgom",
+            "qyrz8wqd2c9m",
+            "1qyrz8wqd2c9m",
+        ];
+        for v in invalid {
+            assert!(!bech32m_valid(v), "{v} should fail");
+        }
+    }
+
+    /// Every way to change one character of `code`, swap two neighbours, or
+    /// drop or add one character.
+    fn mistakes(code: &str) -> Vec<String> {
+        let body: Vec<char> = code[CODE_PREFIX.len()..].chars().collect();
+        let text = |chars: &[char]| format!("{CODE_PREFIX}{}", chars.iter().collect::<String>());
+        let mut out = Vec::new();
         for i in 0..body.len() {
-            for c in alphabet.chars().filter(|&c| c != body[i]) {
+            for c in ALPHABET.chars().filter(|&c| c != body[i]) {
                 let mut typo = body.clone();
                 typo[i] = c;
-                let typo: String = typo.into_iter().collect();
-                assert!(typo.parse::<Code>().is_err(), "typo at {i} ({c}) was accepted: {typo}");
+                out.push(text(&typo));
+            }
+            if i + 1 < body.len() && body[i] != body[i + 1] {
+                let mut swapped = body.clone();
+                swapped.swap(i, i + 1);
+                out.push(text(&swapped));
+            }
+            let mut dropped = body.clone();
+            dropped.remove(i);
+            out.push(text(&dropped));
+            let mut added = body.clone();
+            added.insert(i, 'q');
+            out.push(text(&added));
+        }
+        out
+    }
+
+    #[test]
+    fn every_single_typo_swap_and_missing_or_extra_character_is_caught() {
+        for _ in 0..200 {
+            let code = Seed::generate().code().to_string();
+            for wrong in mistakes(&code) {
+                assert!(wrong.parse::<Code>().is_err(), "{wrong} was accepted for {code}");
             }
         }
     }
@@ -346,14 +521,35 @@ mod tests {
     #[test]
     fn broken_codes_are_explained() {
         assert_eq!("".parse::<Code>(), Err(CodeError::Empty));
-        assert_eq!("corvo:".parse::<Code>(), Err(CodeError::Empty));
-        assert_eq!("corvo:abc!".parse::<Code>(), Err(CodeError::BadCharacter('!')));
+        assert_eq!("corvo1".parse::<Code>(), Err(CodeError::Empty));
+        assert_eq!("corvo1acd!".parse::<Code>(), Err(CodeError::BadCharacter('!')));
         assert_eq!(VECTOR_CODE[..40].parse::<Code>(), Err(CodeError::WrongLength(34)));
         let mut extra = VECTOR_CODE.to_string();
-        extra.push('a');
-        assert_eq!(extra.parse::<Code>(), Err(CodeError::WrongLength(57)));
-        // 0, 1, 8 and 9 aren't base32: a classic misread of o, l, b and g.
-        assert_eq!(VECTOR_CODE.replacen('i', "1", 1).parse::<Code>(), Err(CodeError::BadCharacter('1')));
+        extra.push('q');
+        assert_eq!(extra.parse::<Code>(), Err(CodeError::WrongLength(59)));
+        for letter in ['b', 'i', 'o', '1'] {
+            let typo = format!("{}{letter}{}", &VECTOR_CODE[..10], &VECTOR_CODE[11..]);
+            assert_eq!(typo.parse::<Code>(), Err(CodeError::NeverInCodes(letter)), "{typo}");
+        }
+        assert!(CodeError::NeverInCodes('b').to_string().contains("never contain b, i, o or 1"));
+        assert!(CodeError::WrongLength(34).to_string().contains("58 after corvo1"));
+    }
+
+    #[test]
+    fn a_refused_character_is_named_by_its_code_point() {
+        assert_eq!(CodeError::BadCharacter('!').to_string(), "a code can't contain '!' (U+0021); paste it again");
+        assert_eq!(CodeError::BadCharacter('é').to_string(), "a code can't contain 'é' (U+00E9); paste it again");
+        let accent = "corvo1gpav\u{0301}3ckc".parse::<Code>().unwrap_err();
+        assert_eq!(accent, CodeError::BadCharacter('\u{0301}'));
+        assert_eq!(accent.to_string(), "a code can't contain U+0301; paste it again");
+    }
+
+    #[test]
+    fn an_old_style_code_is_named_as_such() {
+        assert_eq!(OLD_VECTOR_CODE.parse::<Code>(), Err(CodeError::OldFormat));
+        assert_eq!(OLD_VECTOR_CODE[OLD_PREFIX.len()..].parse::<Code>(), Err(CodeError::OldFormat), "no prefix");
+        assert_eq!(OLD_VECTOR_CODE.to_uppercase().parse::<Code>(), Err(CodeError::OldFormat));
+        assert!(CodeError::OldFormat.to_string().contains("ask them for their new one"));
     }
 
     #[test]

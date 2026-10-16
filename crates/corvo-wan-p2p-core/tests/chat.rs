@@ -4,8 +4,8 @@ mod common;
 
 use std::time::Duration;
 
-use common::{Fake, Peer, eventually, friends, is_cut_off, next_frame};
-use corvo_wan_p2p_core::chat::{ChatError, Event};
+use common::{Fake, Peer, eventually, friends, is_cut_off, next_frame, say};
+use corvo_wan_p2p_core::chat::{ChatError, Config, Event};
 use corvo_wan_p2p_core::identity::Seed;
 use corvo_wan_p2p_core::proto::{Frame, MAX_FRAME, MAX_TEXT, PROTO_VERSION, write_frame};
 use corvo_wan_p2p_core::store::Mark;
@@ -157,6 +157,91 @@ async fn a_different_protocol_version_is_reported_and_messages_wait() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_contact_answering_another_version_is_reported_once() {
+    let lookup = MemoryLookup::new();
+    let mut a = Peer::start(&lookup, "abin").await;
+    let fake = Fake::new(&lookup).await;
+    let dials = fake.answer_with(fake.hello_frame(PROTO_VERSION + 1));
+    a.client.add_contact(fake.code).await.unwrap();
+    a.client.send(fake.code, "waits").await.unwrap();
+    let fc = fake.code;
+    a.expect(|e| *e == Event::VersionMismatch { peer: fc, theirs: PROTO_VERSION + 1 }).await;
+    // Dialed again after retry_max (1 s here), but said only once.
+    a.expect_none(Duration::from_millis(2500), |e| matches!(e, Event::VersionMismatch { .. })).await;
+    assert!(dials.load(std::sync::atomic::Ordering::SeqCst) >= 2, "dialed again");
+    assert_eq!(a.client.history(fc).await.unwrap()[0].mark, Mark::Waiting);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_contact_dialing_on_another_version_is_reported_once() {
+    let lookup = MemoryLookup::new();
+    let mut a = Peer::start(&lookup, "abin").await;
+    let fake = Fake::new(&lookup).await;
+    fake.answer_with(fake.hello_frame(PROTO_VERSION + 1));
+    a.client.add_contact(fake.code).await.unwrap();
+    let fc = fake.code;
+    a.expect(|e| *e == Event::VersionMismatch { peer: fc, theirs: PROTO_VERSION + 1 }).await;
+    for _ in 0..2 {
+        let _ = fake.hello(a.code, PROTO_VERSION + 1).await;
+    }
+    a.expect_none(Duration::from_millis(500), |e| matches!(e, Event::VersionMismatch { .. })).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_peer_on_another_version_is_told_ours() {
+    let lookup = MemoryLookup::new();
+    let mut a = Peer::start(&lookup, "abin").await;
+    let (contact, stranger) = (Fake::new(&lookup).await, Fake::new(&lookup).await);
+    a.client.add_contact(contact.code).await.unwrap();
+    for fake in [&contact, &stranger] {
+        let (_, mut recv, theirs) = fake.hello(a.code, PROTO_VERSION + 1).await.expect("an answer");
+        assert!(matches!(theirs, Frame::Hello { proto: PROTO_VERSION, .. }), "{theirs:?}");
+        assert!(is_cut_off(&mut recv).await);
+    }
+    let sc = stranger.code;
+    a.expect_none(Duration::from_millis(500), |e| matches!(e, Event::VersionMismatch { peer, .. } if *peer == sc))
+        .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refusal_naming_another_version_is_reported() {
+    let lookup = MemoryLookup::new();
+    let mut a = Peer::start(&lookup, "abin").await;
+    let fake = Fake::new(&lookup).await;
+    fake.refuse_with(5, b"7");
+    a.client.add_contact(fake.code).await.unwrap();
+    let fc = fake.code;
+    a.expect(|e| *e == Event::VersionMismatch { peer: fc, theirs: 7 }).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_restarted_peer_replaces_its_stale_link_at_once() {
+    let lookup = MemoryLookup::new();
+    let mut a = Peer::start(&lookup, "abin").await;
+    // The key order decides which of two links both sides keep; this is the
+    // case where it used to keep the dead one.
+    let seed = loop {
+        let seed = Seed::generate();
+        if seed.code().key().as_bytes() > a.code.key().as_bytes() {
+            break seed;
+        }
+    };
+    let before = Fake::with_seed(&lookup, Seed::from_bytes(*seed.as_bytes())).await;
+    before.answer_with(before.hello_frame(PROTO_VERSION));
+    a.client.add_contact(before.code).await.unwrap();
+    let fc = before.code;
+    a.expect(|e| *e == Event::Online(fc)).await;
+    // Their app dies without a word and starts again.
+    let after = Fake::with_seed(&lookup, seed).await;
+    let started = tokio::time::Instant::now();
+    let (mut send, mut recv, _) = after.hello(a.code, PROTO_VERSION).await.expect("the new link is taken");
+    say(&mut send, "m1", "back again").await;
+    assert_eq!(next_frame(&mut recv, |f| matches!(f, Frame::Ack { .. })).await, Frame::Ack { id: "m1".into() });
+    assert!(started.elapsed() < Duration::from_secs(3));
+    drop(before);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_contact_that_answers_wrongly_is_retried_with_back_off() {
     let lookup = MemoryLookup::new();
     let fake = Fake::new(&lookup).await;
@@ -200,4 +285,132 @@ async fn bad_requests_are_refused() {
     assert!(matches!(a.client.send(stranger, &"\u{1}".repeat(MAX_TEXT)).await, Err(ChatError::TooLong)));
     a.client.send(stranger, &"a".repeat(MAX_TEXT)).await.unwrap();
     assert!(a.client.set_name("").await.is_err());
+}
+
+/// The gaps between the first `n` + 1 dials noted in `times`.
+async fn dial_gaps(times: &std::sync::Mutex<Vec<tokio::time::Instant>>, n: usize) -> Vec<Duration> {
+    eventually(async || times.lock().unwrap().len() > n).await;
+    let times = times.lock().unwrap();
+    times.windows(2).take(n).map(|w| w[1] - w[0]).collect()
+}
+
+// The timing tests below use waits of half a second and more, and compare
+// gaps with wide margins: CI machines can be slow and busy.
+
+#[tokio::test(flavor = "multi_thread")]
+async fn retries_start_at_the_first_wait_and_double() {
+    let lookup = MemoryLookup::new();
+    let fake = Fake::new(&lookup).await;
+    let times = fake.answer_with_times(Frame::Ack { id: "not a hello".into() });
+    let config = Config { retry_first: Duration::from_secs(1), retry_max: Duration::from_secs(5), ..common::FAST };
+    let a = Peer::start_with_config(&lookup, "abin", config).await;
+    a.client.add_contact(fake.code).await.unwrap();
+    // 1 s, then 2 s (waiting 2 s first would make it 2 s, then 4 s).
+    let gaps = dial_gaps(&times, 2).await;
+    assert!(gaps[0] < Duration::from_millis(1600), "first retry after {:?}", gaps[0]);
+    assert!(gaps[1] > gaps[0] + Duration::from_millis(600), "gaps {gaps:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_contact_that_hangs_up_at_once_is_retried_less_and_less() {
+    let lookup = MemoryLookup::new();
+    let fake = Fake::new(&lookup).await;
+    let times = fake.answer_and_hang_up(fake.hello_frame(PROTO_VERSION));
+    let config = Config { retry_first: Duration::from_millis(500), retry_max: Duration::from_secs(5), ..common::FAST };
+    let a = Peer::start_with_config(&lookup, "abin", config).await;
+    a.client.add_contact(fake.code).await.unwrap();
+    // Waits of 0.5, 1 and 2 s on top of each round's own time, so the gaps
+    // grow; going offline every time would keep them the same.
+    let gaps = dial_gaps(&times, 3).await;
+    assert!(gaps[2] > gaps[0] + Duration::from_millis(800), "gaps {gaps:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_endpoint_with_another_key_is_refused() {
+    let lookup = MemoryLookup::new();
+    let dir = tempfile::tempdir().unwrap();
+    let store = corvo_wan_p2p_core::store::Store::create(
+        dir.path(),
+        "pass",
+        corvo_wan_p2p_core::store::KdfParams::FAST_INSECURE,
+        &Seed::generate(),
+        "abin",
+    )
+    .unwrap();
+    let endpoint = corvo_wan_p2p_core::net::local_endpoint(Seed::generate().secret_key(), lookup).await.unwrap();
+    let started = corvo_wan_p2p_core::chat::Client::start(store, endpoint, common::FAST);
+    assert!(matches!(started, Err(ChatError::WrongKey)));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_network_is_said_offline_only_after_a_moment_to_connect() {
+    let lookup = MemoryLookup::new();
+    // No relays here, so it never connects.
+    let config = Config { connecting: Duration::from_secs(1), ..common::FAST };
+    let mut a = Peer::start_with_config(&lookup, "abin", config).await;
+    a.expect_none(Duration::from_millis(500), |e| matches!(e, Event::Network { .. })).await;
+    a.expect(|e| *e == Event::Network { online: false }).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_bad_frame_closes_the_link_with_its_own_code() {
+    let lookup = MemoryLookup::new();
+    let a = Peer::start(&lookup, "abin").await;
+    let fake = Fake::new(&lookup).await;
+    a.client.add_contact(fake.code).await.unwrap();
+    let conn = fake.connect(a.code).await.unwrap();
+    let (mut send, _recv, _) = fake.hello_on(&conn, PROTO_VERSION).await.unwrap();
+    let junk = b"{\"t\":\"selfdestruct\"}";
+    send.write_all(&(junk.len() as u32).to_be_bytes()).await.unwrap();
+    send.write_all(junk).await.unwrap();
+    let closed = tokio::time::timeout(Duration::from_secs(5), conn.closed()).await.expect("closed");
+    let iroh::endpoint::ConnectionError::ApplicationClosed(reason) = closed else { panic!("{closed:?}") };
+    assert_eq!(reason.error_code, iroh::endpoint::VarInt::from_u32(9), "BAD_FRAME, not a plain goodbye");
+}
+
+/// A log that tests can read back.
+#[derive(Clone, Default)]
+struct Logged(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for Logged {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Everything logged by this test binary, from its first call on.
+fn logged() -> &'static Logged {
+    static LOGGED: std::sync::OnceLock<Logged> = std::sync::OnceLock::new();
+    LOGGED.get_or_init(|| {
+        let logged = Logged::default();
+        let writer = logged.clone();
+        tracing_subscriber::fmt().with_writer(move || writer.clone()).with_max_level(tracing::Level::TRACE).init();
+        logged
+    })
+}
+
+/// A peer controls what's in its frames, so a bad one is logged by kind only:
+/// its text could fake log lines or carry something private.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_bad_frame_is_logged_without_its_contents() {
+    let logged = logged();
+    let lookup = MemoryLookup::new();
+    let a = Peer::start(&lookup, "abin").await;
+    let fake = Fake::new(&lookup).await;
+    a.client.add_contact(fake.code).await.unwrap();
+    let conn = fake.connect(a.code).await.unwrap();
+    let (mut send, _recv, _) = fake.hello_on(&conn, PROTO_VERSION).await.unwrap();
+    let junk = br#"{"t":"x\nWARN forged line SECRET-7f3a"}"#;
+    send.write_all(&(junk.len() as u32).to_be_bytes()).await.unwrap();
+    send.write_all(junk).await.unwrap();
+    let _ = tokio::time::timeout(Duration::from_secs(5), conn.closed()).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let text = String::from_utf8(logged.0.lock().unwrap().clone()).unwrap();
+    assert!(text.contains("bad frame"), "{text}");
+    assert!(!text.contains("SECRET-7f3a"), "{text}");
 }

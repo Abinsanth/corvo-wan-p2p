@@ -19,7 +19,7 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -36,17 +36,34 @@ jobs:
             echo "corvo-wan-p2p-core depends on ratatui or crossterm; only the binary may"
             exit 1
           fi
+      # The weak passphrase settings are for tests; the app itself must never have them.
+      - name: The app doesn't have the test-only passphrase settings
+        run: |
+          tree=$(cargo tree --locked -p corvo-wan-p2p -e normal,features)
+          if grep insecure-test-kdf <<< "$tree"; then
+            echo "corvo-wan-p2p builds with insecure-test-kdf; only tests may"
+            exit 1
+          fi
 
   # Linux clippy never sees cfg(windows) code.
   clippy-windows:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+
+  # The oldest Rust that Cargo.toml's rust-version promises.
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@1.91
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --locked --workspace --all-targets
 
   test:
     strategy:
@@ -54,7 +71,7 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --locked --workspace

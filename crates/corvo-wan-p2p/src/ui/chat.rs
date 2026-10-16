@@ -7,28 +7,31 @@ use corvo_wan_p2p_core::identity::Code;
 use corvo_wan_p2p_core::proto::PROTO_VERSION;
 use corvo_wan_p2p_core::store::{Mark, Person, Standing, StoredMessage};
 
-use super::state::{APP, Chat, Screen, State, Tone};
+use super::state::{APP, CHAT_LEN, Chat, Screen, State, Tone};
 use super::update::Effect;
-use super::view::{areas, input_rows};
+use super::view::{areas, chat_page, input_rows};
 
-/// Wait this long (10 seconds of ticks) for the first connection before
-/// saying "offline": the engine reports offline at start, before its relay
-/// has had a chance to answer.
-pub const CONNECTING_TICKS: u32 = 40;
+/// How many older messages to load at a time.
+pub const OLDER_PAGE: usize = 100;
 
 /// Everything the chat screens need at start.
 #[derive(Debug)]
 pub struct Loaded {
     pub people: Vec<Person>,
     pub chats: Vec<History>,
+    /// People whose saved details couldn't be read (a damaged store).
+    pub unreadable_people: usize,
 }
 
-/// One conversation as stored, and the newest of their messages you've read.
+/// One conversation's newest messages (up to [`CHAT_LEN`]), and the newest
+/// of their messages you've read.
 #[derive(Debug)]
 pub struct History {
     pub code: Code,
     pub messages: Vec<StoredMessage>,
     pub read_upto: Option<String>,
+    /// Messages that couldn't be read (a damaged store); the rest are here.
+    pub unreadable: usize,
 }
 
 pub fn on_event(state: &mut State, event: Event) {
@@ -50,7 +53,11 @@ pub fn on_event(state: &mut State, event: Event) {
             );
         }
         Event::Received { from, id, sent_at, text } => {
-            know(state, from, "");
+            // Only `Request` brings someone new. Someone unknown here was just
+            // removed or blocked, and this was sent before that took effect.
+            if state.standing(&from).is_none() {
+                return;
+            }
             let chat = state.chats.entry(from).or_default();
             // Already read from the store at start (it arrived while loading).
             if chat.messages.iter().any(|m| m.id == id) {
@@ -79,34 +86,32 @@ pub fn on_event(state: &mut State, event: Event) {
                 }
             }
         }
+        // `set_people` says so, unless a refresh already did.
         Event::Name { of, name } => {
-            let before = state.label(&of);
-            if let Some(person) = state.known.iter_mut().find(|p| p.code == of) {
+            let mut people = state.known.clone();
+            if let Some(person) = people.iter_mut().find(|p| p.code == of) {
                 person.name = name;
-                state.relabel();
-                let after = state.label(&of);
-                if after != before {
-                    state.say(Tone::Plain, format!("{before} is now called {after}"));
-                }
+                state.set_people(people);
             }
         }
+        // Once per person and version: the engine doesn't repeat it.
         Event::VersionMismatch { peer, theirs } => {
             let label = state.label(&peer);
+            let (app, todo) = if theirs > PROTO_VERSION {
+                ("newer", "/update to talk to them")
+            } else {
+                ("older", "they need to update")
+            };
             state.say(
                 Tone::Warn,
                 format!(
-                    "{label}'s app speaks version {theirs} of the protocol and yours speaks {PROTO_VERSION}: \
-                     whoever has the older app should /update. Messages wait until then."
+                    "{label}'s app is {app} (protocol {theirs}, yours {PROTO_VERSION}): {todo}. \
+                     Your messages to them wait until then."
                 ),
             );
         }
-        Event::Network { online: true } => state.online = Some(true),
-        // Before the first connection, `tick` decides when it's really offline.
-        Event::Network { online: false } => {
-            if state.online.is_some() {
-                state.online = Some(false);
-            }
-        }
+        // The engine waits for its relay before a first "offline".
+        Event::Network { online } => state.online = Some(online),
         Event::Problem(text) => state.say(Tone::Bad, text),
     }
 }
@@ -145,14 +150,103 @@ pub fn sent(state: &mut State, to: Code, text: String, result: Result<StoredMess
 
 pub fn loaded(state: &mut State, result: Result<Loaded, String>) {
     match result {
-        Ok(Loaded { people, chats }) => {
-            for History { code, messages, read_upto } in chats {
+        Ok(Loaded { people, chats, unreadable_people }) => {
+            let mut damaged = Vec::new();
+            for History { code, messages, read_upto, unreadable } in chats {
                 let unread = unread_after(&messages, read_upto.as_deref());
-                state.chats.insert(code, Chat { messages, unread });
+                let older = messages.len() + unreadable >= CHAT_LEN;
+                state.chats.insert(code, Chat { messages, unread, older, loading: false });
+                if unreadable > 0 {
+                    damaged.push((unreadable, code));
+                }
             }
             state.set_people(people);
+            const DAMAGED: &str = "couldn't be read: that part of your saved chats is damaged. The rest is fine.";
+            for (n, code) in damaged {
+                let messages = if n == 1 { "message" } else { "messages" };
+                let label = state.label(&code);
+                state.say(Tone::Warn, format!("{n} {messages} with {label} {DAMAGED}"));
+            }
+            if unreadable_people > 0 {
+                let n = unreadable_people;
+                let who = if n == 1 { "person you know" } else { "people you know" };
+                state.say(Tone::Warn, format!("{n} {who} {DAMAGED}"));
+            }
         }
         Err(why) => state.say(Tone::Bad, format!("couldn't read your chats: {why}")),
+    }
+}
+
+/// What came of [`Effect::LoadOlder`]: `page` goes before what's there,
+/// without moving what's on screen.
+pub fn loaded_older(state: &mut State, peer: Code, result: Result<(Vec<StoredMessage>, usize), String>) {
+    let Some(chat) = state.chats.get_mut(&peer) else { return };
+    chat.loading = false;
+    // Not asked for again when it fails or nothing in it can be read: the
+    // view would still be at the top, and it would ask again at once, forever.
+    let (page, unreadable) = match result {
+        Ok(page) => page,
+        Err(why) => {
+            chat.older = false;
+            return state.say(Tone::Bad, format!("couldn't read older messages: {why}"));
+        }
+    };
+    chat.older = !page.is_empty() && page.len() + unreadable >= OLDER_PAGE;
+    let added = page.len();
+    let open = state.open_peer() == Some(peer);
+    let before = if open { chat_page(state).0 } else { 0 };
+    let chat = state.chats.get_mut(&peer).expect("checked above");
+    chat.messages.splice(0..0, page);
+    if let Some(tab) = state.tabs.iter_mut().find(|t| t.peer == Some(peer))
+        && tab.cleared > 0
+    {
+        tab.cleared += added;
+    }
+    state.changes += 1;
+    if open {
+        let after = chat_page(state).0;
+        state.scroll.shift(after.saturating_sub(before));
+    }
+    if unreadable > 0 {
+        let label = state.label(&peer);
+        let messages = if unreadable == 1 { "message" } else { "messages" };
+        state.say(Tone::Warn, format!("{unreadable} older {messages} with {label} couldn't be read"));
+    }
+}
+
+/// Asks for older messages when the open chat is scrolled to its top and
+/// there may be some.
+pub fn load_older(state: &mut State, effects: &mut Vec<Effect>) {
+    let Some(peer) = state.open_peer() else { return };
+    if !state.scroll.is_scrolled() || state.chats.get(&peer).is_none_or(|c| !c.older || c.loading) {
+        return;
+    }
+    let (total, height) = chat_page(state);
+    if state.scroll.top(total, height) > 0 {
+        return;
+    }
+    let chat = state.chats.get_mut(&peer).expect("checked above");
+    let Some(first) = chat.messages.first() else { return };
+    chat.loading = true;
+    effects.push(Effect::LoadOlder { peer, before: first.id.clone(), n: OLDER_PAGE });
+}
+
+/// Drops all but the newest [`CHAT_LEN`] messages of each chat, except the
+/// open one while it's scrolled up.
+pub fn trim(state: &mut State) {
+    let keep = if state.scroll.is_scrolled() { state.open_peer() } else { None };
+    for (code, chat) in &mut state.chats {
+        if chat.messages.len() <= CHAT_LEN || keep == Some(*code) {
+            continue;
+        }
+        let gone = chat.messages.len() - CHAT_LEN;
+        chat.messages.drain(..gone);
+        chat.older = true;
+        if let Some(tab) = state.tabs.iter_mut().find(|t| t.peer == Some(*code)) {
+            // 0 once everything before the mark is gone: all of it shows.
+            tab.cleared = tab.cleared.saturating_sub(gone);
+        }
+        state.changes += 1;
     }
 }
 
@@ -170,14 +264,6 @@ pub fn local(ms: i64) -> Option<DateTime<Local>> {
 /// A day and time, like `Thu 15 Oct 14:02`.
 pub fn day_and_time(ms: i64) -> String {
     local(ms).map_or_else(|| "--".into(), |t| t.format("%a %-d %b %H:%M").to_string())
-}
-
-/// Four times a second.
-pub fn tick(state: &mut State) {
-    state.since_start = state.since_start.saturating_add(1);
-    if state.online.is_none() && state.since_start >= CONNECTING_TICKS {
-        state.online = Some(false);
-    }
 }
 
 /// Marks the open chat read when its newest messages are on screen: the
@@ -213,6 +299,7 @@ pub fn title(state: &State) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ui::state::CHAT_LEN;
     use crate::ui::update::{Msg, Outcome, update};
     use corvo_wan_p2p_core::identity::Seed;
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -346,19 +433,18 @@ mod tests {
     }
 
     #[test]
-    fn offline_is_only_said_after_waiting_for_a_first_connection() {
+    fn the_status_is_connecting_until_the_engine_says() {
         let (mut s, _, _) = state();
-        update(&mut s, Msg::Core(Event::Network { online: false }));
-        for _ in 1..CONNECTING_TICKS {
+        for _ in 0..200 {
             update(&mut s, Msg::Tick);
         }
-        assert_eq!(s.online, None, "still connecting");
-        update(&mut s, Msg::Tick);
+        assert_eq!(s.online, None, "the engine decides when it's offline, after its own wait");
+        update(&mut s, Msg::Core(Event::Network { online: false }));
         assert_eq!(s.online, Some(false));
         update(&mut s, Msg::Core(Event::Network { online: true }));
         assert_eq!(s.online, Some(true));
         update(&mut s, Msg::Core(Event::Network { online: false }));
-        assert_eq!(s.online, Some(false), "once online, offline shows at once");
+        assert_eq!(s.online, Some(false));
     }
 
     #[test]
@@ -389,6 +475,50 @@ mod tests {
     }
 
     #[test]
+    fn the_version_mismatch_line_says_who_should_update() {
+        let (mut s, rahul, _) = state();
+        update(&mut s, Msg::Core(Event::VersionMismatch { peer: rahul, theirs: PROTO_VERSION + 1 }));
+        let newer = last_corvo(&s);
+        assert!(newer.contains("newer") && newer.contains("/update"), "{newer}");
+        update(&mut s, Msg::Core(Event::VersionMismatch { peer: rahul, theirs: PROTO_VERSION - 1 }));
+        let older = last_corvo(&s);
+        assert!(older.contains("older") && older.contains("they need to update"), "{older}");
+        assert!(!older.contains("/update"), "nothing for you to do: {older}");
+        for line in [newer, older] {
+            assert!(line.contains("wait"), "messages wait: {line}");
+        }
+    }
+
+    #[test]
+    fn a_message_queued_behind_a_removal_does_not_bring_them_back() {
+        let (mut s, rahul, _) = state();
+        send_line(&mut s, "/remove rahul");
+        send_line(&mut s, "n");
+        let people: Vec<Person> = s.known.iter().filter(|p| p.code != rahul).cloned().collect();
+        let act = crate::ui::people::Act::Remove { history: false };
+        update(&mut s, Msg::Done(Outcome::Acted { code: rahul, act, result: Ok(()), people: Some(people) }));
+        // Sent by the engine before it removed them, handled after.
+        update(&mut s, received(rahul, "late"));
+        assert_eq!(s.standing(&rahul), None, "not back as a request");
+        assert!(!s.people.iter().any(|p| p.code == rahul));
+        assert!(!s.tabs.iter().any(|t| t.peer == Some(rahul)));
+        assert!(s.chats.get(&rahul).is_none_or(|c| c.unread == 0 && c.messages.iter().all(|m| m.id != "late")));
+    }
+
+    #[test]
+    fn a_rename_first_seen_in_a_refresh_is_still_said() {
+        let (mut s, rahul, _) = state();
+        let mut people = s.known.clone();
+        people.iter_mut().find(|p| p.code == rahul).unwrap().name = "rahul k".into();
+        let show = crate::ui::people::Show::Contacts;
+        update(&mut s, Msg::Done(Outcome::Refreshed { show, result: Ok(people) }));
+        update(&mut s, Msg::Core(Event::Name { of: rahul, name: "rahul k".into() }));
+        let said: Vec<String> = s.tabs[0].lines.iter().map(|l| l.text.clone()).collect();
+        let renames = said.iter().filter(|l| *l == "rahul is now called rahul k").count();
+        assert_eq!(renames, 1, "said once, whichever came first: {said:#?}");
+    }
+
+    #[test]
     fn loading_counts_what_came_after_the_last_read() {
         let (mut s, rahul, bob) = state();
         let people = s.known.clone();
@@ -399,10 +529,10 @@ mod tests {
             message("04", "c", Mark::Received),
         ];
         let chats = vec![
-            History { code: rahul, messages: history.clone(), read_upto: Some("02".into()) },
-            History { code: bob, messages: history, read_upto: None },
+            History { code: rahul, messages: history.clone(), read_upto: Some("02".into()), unreadable: 0 },
+            History { code: bob, messages: history, read_upto: None, unreadable: 0 },
         ];
-        update(&mut s, Msg::Done(Outcome::Loaded(Ok(Loaded { people, chats }))));
+        update(&mut s, Msg::Done(Outcome::Loaded(Ok(Loaded { people, chats, unreadable_people: 0 }))));
         assert_eq!(s.chats[&rahul].unread, 1);
         assert_eq!(s.chats[&bob].unread, 3);
         assert_eq!(s.title, format!("(4) {APP}"));
@@ -420,9 +550,7 @@ mod tests {
     #[test]
     fn a_slow_unlock_still_starts_as_connecting() {
         let mut s = State::onboarding(crate::ui::onboarding::Onboarding::start(true, false));
-        for _ in 0..CONNECTING_TICKS + 5 {
-            update(&mut s, Msg::Tick);
-        }
+        s.online = Some(false);
         let code = Seed::generate().code();
         update(&mut s, Msg::Done(Outcome::Started { name: "ana".into(), code, recovery_file: None }));
         assert_eq!(s.online, None, "the wait starts once the engine does");
@@ -453,10 +581,106 @@ mod tests {
     fn a_message_already_loaded_is_not_counted_twice() {
         let (mut s, rahul, _) = state();
         let people = s.known.clone();
-        let chats = vec![History { code: rahul, messages: vec![message("01", "a", Mark::Received)], read_upto: None }];
-        update(&mut s, Msg::Done(Outcome::Loaded(Ok(Loaded { people, chats }))));
+        let chats = vec![History {
+            code: rahul,
+            messages: vec![message("01", "a", Mark::Received)],
+            read_upto: None,
+            unreadable: 0,
+        }];
+        update(&mut s, Msg::Done(Outcome::Loaded(Ok(Loaded { people, chats, unreadable_people: 0 }))));
         update(&mut s, received(rahul, "01"));
         assert_eq!(s.chats[&rahul].messages.len(), 1);
         assert_eq!(s.chats[&rahul].unread, 1);
+    }
+
+    /// The rows on screen.
+    fn on_screen(state: &State) -> Vec<String> {
+        let width = crate::ui::view::areas(state.size, 1).unwrap().chat.width;
+        let (rows, _) = crate::ui::view::chat_rows(state, width);
+        let (total, height) = crate::ui::view::chat_page(state);
+        rows.iter().skip(state.scroll.top(total, height)).take(height).map(|r| r.0.clone()).collect()
+    }
+
+    #[test]
+    fn a_chat_keeps_its_last_500_and_loads_older_at_the_top() {
+        let (mut s, rahul, _) = state();
+        s.size = (80, 24);
+        let people = s.known.clone();
+        let messages: Vec<_> =
+            (0..CHAT_LEN).map(|i| message(&format!("m{i:04}"), &format!("m{i:04}"), Mark::Read)).collect();
+        let chats = vec![History { code: rahul, messages, read_upto: None, unreadable: 0 }];
+        update(&mut s, Msg::Done(Outcome::Loaded(Ok(Loaded { people, chats, unreadable_people: 0 }))));
+        for i in 0..10 {
+            update(&mut s, received(rahul, &format!("n{i}")));
+        }
+        let ids = |s: &State| s.chats[&rahul].messages.iter().map(|m| m.id.clone()).collect::<Vec<_>>();
+        assert_eq!(ids(&s).len(), CHAT_LEN, "only the newest are kept");
+        assert_eq!(ids(&s)[0], "m0010");
+        assert_eq!(ids(&s).last().unwrap(), "n9");
+
+        s.open_chat(rahul, true);
+        let older = |effects: &[Effect]| effects.iter().find(|e| matches!(e, Effect::LoadOlder { .. })).cloned();
+        let mut asked = None;
+        for _ in 0..CHAT_LEN {
+            asked = older(&key(&mut s, KeyCode::PageUp, KeyModifiers::NONE));
+            if asked.is_some() {
+                break;
+            }
+        }
+        assert_eq!(asked, Some(Effect::LoadOlder { peer: rahul, before: "m0010".into(), n: OLDER_PAGE }));
+        assert_eq!(older(&key(&mut s, KeyCode::PageUp, KeyModifiers::NONE)), None, "asked once");
+        let shown: Vec<String> = on_screen(&s).into_iter().filter(|r| !r.starts_with("──")).collect();
+
+        let page: Vec<_> = (0..10).map(|i| message(&format!("m{i:04}"), &format!("m{i:04}"), Mark::Read)).collect();
+        update(&mut s, Msg::Done(Outcome::LoadedOlder { peer: rahul, result: Ok((page, 0)) }));
+        assert_eq!(ids(&s).len(), CHAT_LEN + 10);
+        assert_eq!(ids(&s)[0], "m0000");
+        let now = on_screen(&s);
+        assert!(shown.iter().all(|r| now.contains(r)), "what was on screen stays:\n{shown:#?}\n{now:#?}");
+        for _ in 0..10 {
+            assert_eq!(older(&key(&mut s, KeyCode::PageUp, KeyModifiers::NONE)), None, "that was all of them");
+        }
+        assert!(on_screen(&s).iter().any(|r| r.contains("m0000")));
+
+        key(&mut s, KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(ids(&s).len(), CHAT_LEN, "back at the end, the oldest go again");
+        assert_eq!(ids(&s).last().unwrap(), "n9");
+    }
+
+    #[test]
+    fn a_failed_or_unreadable_older_page_is_not_asked_for_again() {
+        let failed: Result<(Vec<StoredMessage>, usize), String> = Err("the store is busy".into());
+        for result in [failed, Ok((Vec::new(), OLDER_PAGE))] {
+            let (mut s, rahul, _) = state();
+            s.size = (80, 24);
+            let people = s.known.clone();
+            let messages: Vec<_> = (0..CHAT_LEN).map(|i| message(&format!("m{i:04}"), "x", Mark::Read)).collect();
+            let chats = vec![History { code: rahul, messages, read_upto: None, unreadable: 0 }];
+            update(&mut s, Msg::Done(Outcome::Loaded(Ok(Loaded { people, chats, unreadable_people: 0 }))));
+            s.open_chat(rahul, true);
+            let asks = |effects: &[Effect]| effects.iter().any(|e| matches!(e, Effect::LoadOlder { .. }));
+            let mut asked = false;
+            for _ in 0..CHAT_LEN {
+                asked |= asks(&key(&mut s, KeyCode::PageUp, KeyModifiers::NONE));
+            }
+            assert!(asked);
+            let effects = update(&mut s, Msg::Done(Outcome::LoadedOlder { peer: rahul, result }));
+            assert!(!asks(&effects), "not asked again at once: the loop would never read a key");
+            assert!(!asks(&key(&mut s, KeyCode::PageUp, KeyModifiers::NONE)));
+        }
+    }
+
+    #[test]
+    fn unreadable_rows_are_mentioned_and_the_rest_is_shown() {
+        let (mut s, rahul, _) = state();
+        let people = s.known.clone();
+        let messages = vec![message("01", "a", Mark::Received)];
+        let chats = vec![History { code: rahul, messages, read_upto: None, unreadable: 2 }];
+        update(&mut s, Msg::Done(Outcome::Loaded(Ok(Loaded { people, chats, unreadable_people: 1 }))));
+        assert_eq!(s.chats[&rahul].messages.len(), 1);
+        assert_eq!(s.known.len(), 2);
+        let said: Vec<&str> = s.tabs[0].lines.iter().map(|l| l.text.as_str()).collect();
+        assert!(said.iter().any(|l| l.starts_with("2 messages with rahul couldn't be read")), "{said:?}");
+        assert!(said.iter().any(|l| l.starts_with("1 person you know couldn't be read")), "{said:?}");
     }
 }

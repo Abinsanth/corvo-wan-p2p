@@ -16,15 +16,12 @@ pub mod view;
 
 use std::collections::VecDeque;
 use std::io::{Write, stdout};
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
 use anyhow::Context;
-use corvo_wan_p2p_core::chat::Config;
-use corvo_wan_p2p_core::identity::Seed;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::event::{
@@ -39,8 +36,8 @@ use ratatui::crossterm::terminal::{
 use ratatui::crossterm::{Command, execute};
 use tokio::sync::mpsc;
 
-use self::runner::{Flow, Net, Runner};
-use self::state::{State, Tone};
+use self::runner::{Flow, Runner};
+use self::state::State;
 use self::update::{Effect, Msg, update};
 
 /// How long the input thread waits for a key before checking whether to stop.
@@ -256,42 +253,6 @@ async fn interact<W: Write>(state: &mut State, runner: &mut Runner<W>) -> anyhow
             }
         }
     }
-}
-
-/// `--demo-ui`: the screen with made-up people and chats, to try it by hand
-/// before there's an account to unlock.
-pub async fn demo() -> anyhow::Result<()> {
-    use corvo_wan_p2p_core::store::{Mark, Person, Standing, StoredMessage};
-    let me = Seed::generate().code();
-    let mut state = State::new("you".into(), me.short());
-    let now = 1_760_000_000_000;
-    let person =
-        |name: &str, standing| Person { code: Seed::generate().code(), name: name.into(), last_seen: None, standing };
-    let (rahul, bob) = (person("rahul", Standing::Contact), person("bob", Standing::Request));
-    let (rahul_code, bob_code) = (rahul.code, bob.code);
-    state.set_people(vec![rahul, person("ana maria", Standing::Contact), bob, person("bob", Standing::Blocked)]);
-    state.connected.insert(rahul_code);
-    let message = |i: i64, text: &str, mark| StoredMessage {
-        id: format!("{i:02}"),
-        sent_at: now + i * 60_000,
-        text: text.into(),
-        mark,
-    };
-    state.chats.entry(rahul_code).or_default().messages = vec![
-        message(1, "hi!", Mark::Received),
-        message(2, "hey, this is the demo", Mark::Read),
-        message(3, "two\nlines", Mark::Received),
-        message(4, "not delivered yet", Mark::Waiting),
-    ];
-    state.chats.entry(bob_code).or_default().messages =
-        vec![message(5, "\x1b[2Jthis tried to clear your screen \u{202E}and flip text", Mark::Received)];
-    state.open_chat(rahul_code, false);
-    state.open_chat(bob_code, false);
-    state.refresh_sidebar();
-    state.say(Tone::Good, "demo: nothing here is sent anywhere. /help lists commands, /quit or Ctrl-C leaves.");
-    state.online = Some(true);
-    let runner = Runner::new(PathBuf::new(), None, Config::DEFAULT, Net::Internet, stdout());
-    run(state, runner).await.map(drop)
 }
 
 #[cfg(test)]

@@ -230,3 +230,79 @@ fn another_accounts_key_json_does_not_pass_the_check() {
     fs::copy(theirs.path().join(KEY_FILE), mine.path().join(KEY_FILE)).unwrap();
     assert!(!store.check_passphrase("first pass").unwrap());
 }
+
+#[test]
+fn weak_or_huge_settings_are_refused_when_locking() {
+    for params in [
+        KdfParams { m_kib: 8, t: 2, p: 1 },
+        KdfParams { m_kib: KdfParams::MIN.m_kib, t: 1, p: 1 },
+        KdfParams { m_kib: KdfParams::MAX.m_kib + 1, ..KdfParams::DEFAULT },
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let made = Store::create(dir.path(), "pass", params, &Seed::generate(), "abin");
+        assert!(matches!(made, Err(StoreError::BadKdfParams)), "{params:?}");
+        assert!(!Store::exists(dir.path()));
+    }
+}
+
+#[test]
+fn absurd_settings_in_key_json_are_refused_quickly() {
+    for params in ["{\"m_kib\":4294967295,\"t\":4294967295,\"p\":1}", "{\"m_kib\":1048577,\"t\":3,\"p\":1}"] {
+        let dir = tempfile::tempdir().unwrap();
+        drop(new_account(dir.path()));
+        let path = dir.path().join(KEY_FILE);
+        let mut json: serde_json::Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        json["params"] = serde_json::from_str(params).unwrap();
+        fs::write(&path, json.to_string()).unwrap();
+        let started = std::time::Instant::now();
+        let opened = Store::open(dir.path(), "first pass");
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        let Err(StoreError::Damaged { why, .. }) = opened else { panic!("expected damaged for {params}") };
+        assert!(why.contains("out of range"), "{why}");
+    }
+}
+
+#[test]
+fn a_garbage_store_db_is_reported_as_damaged() {
+    let dir = tempfile::tempdir().unwrap();
+    drop(new_account(dir.path()));
+    fs::write(
+        dir.path().join(DB_FILE),
+        "not a database at all, just some text that is long enough to look like one".repeat(4),
+    )
+    .unwrap();
+    let Err(StoreError::Damaged { file, why }) = Store::open(dir.path(), "first pass") else {
+        panic!("expected damaged")
+    };
+    assert!(file.ends_with(DB_FILE));
+    assert!(why.contains("isn't a corvo-wan-p2p database"), "{why}");
+}
+
+#[test]
+fn the_store_uses_wal() {
+    let dir = tempfile::tempdir().unwrap();
+    drop(new_account(dir.path()));
+    let db = rusqlite::Connection::open(dir.path().join(DB_FILE)).unwrap();
+    let mode: String = db.pragma_query_value(None, "journal_mode", |r| r.get(0)).unwrap();
+    assert_eq!(mode, "wal");
+}
+
+#[test]
+fn wal_files_stay_private_and_go_with_recover() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, _) = new_account(dir.path());
+    store.set_name("abin p").unwrap();
+    let wal = dir.path().join(format!("{DB_FILE}-wal"));
+    assert!(wal.exists(), "written through the WAL");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(fs::metadata(&wal).unwrap().permissions().mode() & 0o777, 0o600);
+    }
+    assert!(matches!(Store::open(dir.path(), "first pass"), Err(StoreError::AlreadyRunning)));
+    drop(store);
+    Store::wipe(dir.path()).unwrap();
+    for leftover in [DB_FILE.to_string(), format!("{DB_FILE}-wal"), format!("{DB_FILE}-shm")] {
+        assert!(!dir.path().join(&leftover).exists(), "{leftover} is gone");
+    }
+}

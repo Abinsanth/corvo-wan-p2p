@@ -5,7 +5,7 @@
 use iroh_base::PublicKey;
 use rusqlite::{OptionalExtension, params};
 
-use super::{Store, StoreError, crypt};
+use super::{Store, StoreError, crypt, readable};
 use crate::identity::Code;
 
 /// Where someone stands with you.
@@ -123,8 +123,19 @@ impl Store {
         sealed.map(|sealed| self.open_standing(peer, sealed.as_deref())).transpose()
     }
 
+    /// Schema step 4: rows from before requests have no standing; they're contacts.
+    pub(super) fn seal_missing_standings(&self) -> Result<(), StoreError> {
+        let mut query = self.db.prepare("SELECT peer FROM contacts WHERE standing IS NULL")?;
+        let peers: Vec<Vec<u8>> = query.query_map([], |r| r.get(0))?.collect::<Result<_, _>>()?;
+        for peer in peers {
+            self.set_stored(&peer, Stored::Contact)?;
+        }
+        Ok(())
+    }
+
     fn open_standing(&self, peer: &[u8], sealed: Option<&[u8]>) -> Result<Stored, StoreError> {
-        let Some(sealed) = sealed else { return Ok(Stored::Contact) }; // a row from before requests
+        // Schema step 4 sealed every standing, so a missing one was removed since.
+        let sealed = sealed.ok_or_else(|| self.damaged("a standing is missing"))?;
         let bytes = self.open_at(b"contacts.standing", &[peer], sealed)?;
         Stored::from_bytes(&bytes).ok_or_else(|| self.damaged("unknown standing"))
     }
@@ -202,15 +213,38 @@ impl Store {
         Ok(n as usize)
     }
 
-    /// Everyone you know of, in the order you first knew of them.
+    /// How many requests are waiting for an answer. Only standings are opened,
+    /// since this runs for every stranger who connects.
+    pub fn request_count(&self) -> Result<usize, StoreError> {
+        let mut query = self.db.prepare("SELECT peer, standing FROM contacts")?;
+        let mut rows = query.query([])?;
+        let mut requests = 0;
+        while let Some(row) = rows.next()? {
+            let (peer, standing): (Vec<u8>, Option<Vec<u8>>) = (row.get(0)?, row.get(1)?);
+            if matches!(readable(self.open_standing(&peer, standing.as_deref()))?, Some(Stored::Request { .. })) {
+                requests += 1;
+            }
+        }
+        Ok(requests)
+    }
+
+    /// Everyone you know of who can be read, in the order you first knew of them.
     pub fn people(&self) -> Result<Vec<Person>, StoreError> {
+        Ok(self.people_checked()?.0)
+    }
+
+    /// [`Store::people`], and how many people couldn't be read (damaged).
+    pub fn people_checked(&self) -> Result<(Vec<Person>, usize), StoreError> {
         let mut query = self.db.prepare(&format!("SELECT {COLUMNS} FROM contacts ORDER BY rowid"))?;
         let rows = query.query_map([], row)?;
-        let mut people = Vec::new();
+        let (mut people, mut damaged) = (Vec::new(), 0);
         for r in rows {
-            people.push(self.person_from_row(r?)?);
+            match readable(self.person_from_row(r?))? {
+                Some(person) => people.push(person),
+                None => damaged += 1,
+            }
         }
-        Ok(people)
+        Ok((people, damaged))
     }
 
     /// Your contacts, in the order you added them.
@@ -276,13 +310,14 @@ impl Store {
         let peer = self.peer_tag(code);
         let sealed: Option<Option<Vec<u8>>> =
             self.db.query_row("SELECT read_upto FROM contacts WHERE peer = ?1", [peer], |r| r.get(0)).optional()?;
-        match sealed.flatten() {
-            Some(sealed) => {
-                let id = self.open_at(b"contacts.read_upto", &[&peer], &sealed)?;
-                Ok(Some(String::from_utf8(id.to_vec()).map_err(|_| self.damaged("a read receipt isn't text"))?))
-            }
-            None => Ok(None),
-        }
+        let Some(sealed) = sealed.flatten() else { return Ok(None) };
+        // A damaged one counts as nothing read: their messages show as unread,
+        // rather than the chat failing to load.
+        let id = readable(
+            self.open_at(b"contacts.read_upto", &[&peer], &sealed)
+                .and_then(|id| String::from_utf8(id.to_vec()).map_err(|_| self.damaged("a read receipt isn't text"))),
+        )?;
+        Ok(id)
     }
 
     pub(super) fn open_i64(&self, column: &[u8], row: &[&[u8]], sealed: &[u8]) -> Result<i64, StoreError> {

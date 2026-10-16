@@ -10,6 +10,7 @@ use self::ui::onboarding::Onboarding;
 use self::ui::runner::{Net, Runner};
 use self::ui::state::State;
 
+mod logging;
 mod selfupdate;
 mod ui;
 
@@ -21,20 +22,16 @@ struct Args {
     /// type yes) and brings it back from your 12 words: the same code, with no history.
     #[arg(long)]
     recover: bool,
-    /// Opens the screen with made-up people, to try it by hand.
-    #[arg(long, hide = true)]
-    demo_ui: bool,
 }
 
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     let runtime = tokio::runtime::Runtime::new()?;
     ui::install_panic_hook();
-    if args.demo_ui {
-        return runtime.block_on(ui::demo());
-    }
     let dir = data_dir().context("couldn't tell where your home folder is; set HOME (APPDATA on Windows)")?;
-    let state = State::onboarding(Onboarding::start(Store::exists(&dir), args.recover));
+    logging::start(&dir);
+    let mut state = State::onboarding(Onboarding::start(Store::exists(&dir), args.recover));
+    state.can_copy = ui::clip::can_copy(std::env::var("TERM_PROGRAM").ok().as_deref());
     let runner = Runner::new(dir, home_dir(), Config::DEFAULT, Net::Internet, stdout());
     if let Some(why) = runtime.block_on(ui::run(state, runner))? {
         eprintln!("{why}");

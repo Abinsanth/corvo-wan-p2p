@@ -8,6 +8,7 @@ use corvo_wan_p2p_core::store::{Person, Standing};
 
 use super::account::Pending;
 use super::chat::day_and_time;
+use super::clip::{MAYBE, NO_COPY};
 use super::commands::Cmd;
 use super::state::{State, Tone};
 use super::update::Effect;
@@ -36,10 +37,14 @@ pub fn command(state: &mut State, cmd: Cmd, effects: &mut Vec<Effect>) {
             let Some(code) = state.code else { return };
             state.select_tab(0);
             state.say(Tone::Plain, format!("your code: {code}"));
+            let copy = if state.can_copy {
+                format!("sent to your clipboard, {MAYBE}.")
+            } else {
+                format!("{NO_COPY}: select it above to copy it.")
+            };
             state.say(
                 Tone::Plain,
-                "sent to your clipboard, if your terminal allows it. Send it to friends any way you like; \
-                 they add you with /add and your code.",
+                format!("{copy} Send it to friends any way you like; they add you with /add and your code."),
             );
             effects.push(Effect::Copy(code.to_string()));
         }
@@ -367,7 +372,7 @@ mod tests {
         let (mut s, _) = state();
         let mut typo = Seed::generate().code().to_string();
         let end = typo.pop().unwrap();
-        typo.push(if end == 'a' { 'b' } else { 'a' });
+        typo.push(if end == 'q' { 'p' } else { 'q' });
         let effects = send(&mut s, &format!("/add {typo}"));
         assert!(!effects.iter().any(|e| matches!(e, Effect::Act { .. })));
         assert_eq!(last_line_tone(&s), Tone::Bad);

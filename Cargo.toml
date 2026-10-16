@@ -49,6 +49,14 @@ dbg_macro = "warn"
 [profile.release]
 strip = true
 
+# Debug builds and tests keep only line numbers (enough for panics and
+# backtraces), and none for dependencies: a fraction of the disk space.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
 # Argon2id is deliberately slow; unoptimised it makes debug builds and tests crawl.
 [profile.dev.package.argon2]
 opt-level = 3

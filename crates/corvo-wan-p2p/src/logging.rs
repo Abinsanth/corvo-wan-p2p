@@ -4,8 +4,9 @@
 //!
 //! `corvo-wan-p2p.log` sits in the data folder, readable only by you. Past
 //! 1 MB it becomes `corvo-wan-p2p.log.old` (replacing the last one) and a new
-//! file starts. Warnings only, unless `CORVO_WAN_P2P_LOG` asks for more, like
-//! `debug`, or `corvo_wan_p2p_core=debug` for the chat engine alone.
+//! file starts. Warnings only, unless `CORVO_WAN_P2P_LOG` names another level
+//! (`info`, `debug`, `trace`). Only this app's own code is ever logged: the
+//! libraries under it log whole codes and addresses.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
@@ -29,13 +30,15 @@ const LEVEL_VAR: &str = "CORVO_WAN_P2P_LOG";
 /// Sends the app's and the chat engine's log lines to the log file in `dir`.
 /// Does nothing if logging was already set up.
 pub fn start(dir: &Path) {
-    let wanted = std::env::var(LEVEL_VAR).ok().and_then(|v| v.parse().ok());
-    let _ = subscriber(LogFile::new(dir), wanted.unwrap_or_else(warnings)).try_init();
+    let setting = std::env::var(LEVEL_VAR).ok();
+    let _ = subscriber(LogFile::new(dir), filter(setting.as_deref())).try_init();
 }
 
-/// Warnings from this app's own code, nothing from the libraries under it.
-fn warnings() -> Targets {
-    Targets::new().with_target("corvo_wan_p2p_core", LevelFilter::WARN).with_target("corvo_wan_p2p", LevelFilter::WARN)
+/// This app's own code at the level `setting` names (warnings if it names
+/// none), and nothing from the libraries under it.
+fn filter(setting: Option<&str>) -> Targets {
+    let level = setting.and_then(|s| s.trim().parse::<LevelFilter>().ok()).unwrap_or(LevelFilter::WARN);
+    Targets::new().with_target("corvo_wan_p2p_core", level).with_target("corvo_wan_p2p", level)
 }
 
 fn subscriber(file: LogFile, filter: Targets) -> impl tracing::Subscriber + Send + Sync {
@@ -115,10 +118,7 @@ pub fn start_for_tests() -> &'static Path {
     static FILE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
     FILE.get_or_init(|| {
         let dir = tempfile::tempdir().unwrap().keep();
-        let all = Targets::new()
-            .with_target("corvo_wan_p2p_core", LevelFilter::TRACE)
-            .with_target("corvo_wan_p2p", LevelFilter::TRACE);
-        subscriber(LogFile::new(&dir), all).try_init().expect("no other logging is set up in tests");
+        subscriber(LogFile::new(&dir), filter(Some("trace"))).try_init().expect("no other logging is set up in tests");
         dir.join(LOG_FILE)
     })
 }
@@ -142,6 +142,22 @@ mod tests {
         for file in [dir.path().join(LOG_FILE), old] {
             use std::os::unix::fs::PermissionsExt;
             assert_eq!(fs::metadata(file).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+    }
+
+    #[test]
+    fn the_level_setting_never_lets_in_other_libraries_logs() {
+        use tracing::Level;
+        let debug = filter(Some("debug"));
+        assert!(debug.would_enable("corvo_wan_p2p_core::chat", &Level::DEBUG));
+        assert!(debug.would_enable("corvo_wan_p2p::ui", &Level::DEBUG));
+        // iroh's debug lines hold whole codes and addresses.
+        assert!(!debug.would_enable("iroh::address_lookup::dns", &Level::DEBUG));
+        assert!(!debug.would_enable("iroh", &Level::ERROR));
+        for usual in [filter(None), filter(Some("not a level")), filter(Some("iroh=trace"))] {
+            assert!(usual.would_enable("corvo_wan_p2p_core", &Level::WARN));
+            assert!(!usual.would_enable("corvo_wan_p2p_core", &Level::INFO));
+            assert!(!usual.would_enable("iroh", &Level::TRACE));
         }
     }
 

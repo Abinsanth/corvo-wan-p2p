@@ -96,13 +96,21 @@ pub(super) async fn run(start: Start) {
                     break;
                 }
             }
-            Err(e @ (FrameError::TooBig(_) | FrameError::Invalid(_))) => {
-                warn!(peer = %peer.short(), error = %e, "a bad frame; closing the link");
+            // Logged by kind only: what's in a peer's frame, or its reason for
+            // closing, is theirs to choose, and could fake log lines or hold
+            // something private.
+            Err(FrameError::TooBig(bytes)) => {
+                warn!(peer = %peer.short(), bytes, "a bad frame (too big); closing the link");
                 conn.close(close::BAD_FRAME.into(), b"bad frame");
                 break;
             }
-            Err(FrameError::Connection(e)) => {
-                debug!(peer = %peer.short(), error = %e, "the link ended");
+            Err(FrameError::Invalid(_)) => {
+                warn!(peer = %peer.short(), "a bad frame (not one we know); closing the link");
+                conn.close(close::BAD_FRAME.into(), b"bad frame");
+                break;
+            }
+            Err(FrameError::Connection(_)) => {
+                debug!(peer = %peer.short(), "the link ended");
                 break;
             }
         }

@@ -287,25 +287,28 @@ async fn bad_requests_are_refused() {
     assert!(a.client.set_name("").await.is_err());
 }
 
-/// The gaps between the first few dials of a contact whose app answers wrongly.
-async fn dial_gaps(fake: &Fake, times: &std::sync::Mutex<Vec<tokio::time::Instant>>, n: usize) -> Vec<Duration> {
+/// The gaps between the first `n` + 1 dials noted in `times`.
+async fn dial_gaps(times: &std::sync::Mutex<Vec<tokio::time::Instant>>, n: usize) -> Vec<Duration> {
     eventually(async || times.lock().unwrap().len() > n).await;
     let times = times.lock().unwrap();
-    let _ = fake;
     times.windows(2).take(n).map(|w| w[1] - w[0]).collect()
 }
+
+// The timing tests below use waits of half a second and more, and compare
+// gaps with wide margins: CI machines can be slow and busy.
 
 #[tokio::test(flavor = "multi_thread")]
 async fn retries_start_at_the_first_wait_and_double() {
     let lookup = MemoryLookup::new();
     let fake = Fake::new(&lookup).await;
     let times = fake.answer_with_times(Frame::Ack { id: "not a hello".into() });
-    let a = Peer::start(&lookup, "abin").await;
+    let config = Config { retry_first: Duration::from_secs(1), retry_max: Duration::from_secs(5), ..common::FAST };
+    let a = Peer::start_with_config(&lookup, "abin", config).await;
     a.client.add_contact(fake.code).await.unwrap();
-    // retry_first is 200 ms here, retry_max 1 s.
-    let gaps = dial_gaps(&fake, &times, 2).await;
-    assert!(gaps[0] < Duration::from_millis(350), "first retry after {:?}", gaps[0]);
-    assert!((Duration::from_millis(350)..Duration::from_millis(700)).contains(&gaps[1]), "second after {:?}", gaps[1]);
+    // 1 s, then 2 s (waiting 2 s first would make it 2 s, then 4 s).
+    let gaps = dial_gaps(&times, 2).await;
+    assert!(gaps[0] < Duration::from_millis(1600), "first retry after {:?}", gaps[0]);
+    assert!(gaps[1] > gaps[0] + Duration::from_millis(600), "gaps {gaps:?}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -313,14 +316,13 @@ async fn a_contact_that_hangs_up_at_once_is_retried_less_and_less() {
     let lookup = MemoryLookup::new();
     let fake = Fake::new(&lookup).await;
     let times = fake.answer_and_hang_up(fake.hello_frame(PROTO_VERSION));
-    let config = Config { retry_max: Duration::from_secs(5), ..common::FAST };
+    let config = Config { retry_first: Duration::from_millis(500), retry_max: Duration::from_secs(5), ..common::FAST };
     let a = Peer::start_with_config(&lookup, "abin", config).await;
     a.client.add_contact(fake.code).await.unwrap();
-    // Waits of 200, 400 and 800 ms on top of each round's own time, so the
-    // gaps grow; going offline every time would keep them the same.
-    let gaps = dial_gaps(&fake, &times, 3).await;
-    eprintln!("hang-up gaps: {gaps:?}");
-    assert!(gaps[2] > gaps[0] + Duration::from_millis(300), "gaps {gaps:?}");
+    // Waits of 0.5, 1 and 2 s on top of each round's own time, so the gaps
+    // grow; going offline every time would keep them the same.
+    let gaps = dial_gaps(&times, 3).await;
+    assert!(gaps[2] > gaps[0] + Duration::from_millis(800), "gaps {gaps:?}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -343,9 +345,10 @@ async fn an_endpoint_with_another_key_is_refused() {
 #[tokio::test(flavor = "multi_thread")]
 async fn the_network_is_said_offline_only_after_a_moment_to_connect() {
     let lookup = MemoryLookup::new();
-    // No relays here, so it never connects; `connecting` is 300 ms.
-    let mut a = Peer::start(&lookup, "abin").await;
-    a.expect_none(Duration::from_millis(150), |e| matches!(e, Event::Network { .. })).await;
+    // No relays here, so it never connects.
+    let config = Config { connecting: Duration::from_secs(1), ..common::FAST };
+    let mut a = Peer::start_with_config(&lookup, "abin", config).await;
+    a.expect_none(Duration::from_millis(500), |e| matches!(e, Event::Network { .. })).await;
     a.expect(|e| *e == Event::Network { online: false }).await;
 }
 
@@ -363,4 +366,51 @@ async fn a_bad_frame_closes_the_link_with_its_own_code() {
     let closed = tokio::time::timeout(Duration::from_secs(5), conn.closed()).await.expect("closed");
     let iroh::endpoint::ConnectionError::ApplicationClosed(reason) = closed else { panic!("{closed:?}") };
     assert_eq!(reason.error_code, iroh::endpoint::VarInt::from_u32(9), "BAD_FRAME, not a plain goodbye");
+}
+
+/// A log that tests can read back.
+#[derive(Clone, Default)]
+struct Logged(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for Logged {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Everything logged by this test binary, from its first call on.
+fn logged() -> &'static Logged {
+    static LOGGED: std::sync::OnceLock<Logged> = std::sync::OnceLock::new();
+    LOGGED.get_or_init(|| {
+        let logged = Logged::default();
+        let writer = logged.clone();
+        tracing_subscriber::fmt().with_writer(move || writer.clone()).with_max_level(tracing::Level::TRACE).init();
+        logged
+    })
+}
+
+/// A peer controls what's in its frames, so a bad one is logged by kind only:
+/// its text could fake log lines or carry something private.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_bad_frame_is_logged_without_its_contents() {
+    let logged = logged();
+    let lookup = MemoryLookup::new();
+    let a = Peer::start(&lookup, "abin").await;
+    let fake = Fake::new(&lookup).await;
+    a.client.add_contact(fake.code).await.unwrap();
+    let conn = fake.connect(a.code).await.unwrap();
+    let (mut send, _recv, _) = fake.hello_on(&conn, PROTO_VERSION).await.unwrap();
+    let junk = br#"{"t":"x\nWARN forged line SECRET-7f3a"}"#;
+    send.write_all(&(junk.len() as u32).to_be_bytes()).await.unwrap();
+    send.write_all(junk).await.unwrap();
+    let _ = tokio::time::timeout(Duration::from_secs(5), conn.closed()).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let text = String::from_utf8(logged.0.lock().unwrap().clone()).unwrap();
+    assert!(text.contains("bad frame"), "{text}");
+    assert!(!text.contains("SECRET-7f3a"), "{text}");
 }

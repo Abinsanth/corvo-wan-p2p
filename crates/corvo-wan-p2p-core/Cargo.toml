@@ -37,6 +37,8 @@ insecure-test-kdf = []
 [dev-dependencies]
 corvo-wan-p2p-core = { path = ".", features = ["insecure-test-kdf"] }
 tempfile.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
 
 [lints]
 workspace = true

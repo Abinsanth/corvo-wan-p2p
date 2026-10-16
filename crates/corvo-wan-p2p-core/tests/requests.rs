@@ -390,9 +390,9 @@ async fn a_turned_down_link_delivers_nothing() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn idle_guests_are_dropped_to_make_room() {
+async fn a_quiet_guest_makes_room_for_a_new_one() {
     let lookup = MemoryLookup::new();
-    let config = Config { guest_idle: Duration::from_secs(1), ..common::FAST };
+    let config = Config { guest_idle: Duration::from_secs(5), ..common::FAST };
     let a = Peer::start_with_config(&lookup, "abin", config).await;
     let mut guests = Vec::new();
     for _ in 0..MAX_GUESTS {
@@ -401,19 +401,31 @@ async fn idle_guests_are_dropped_to_make_room() {
         guests.push((fake, streams));
     }
     let extra = Fake::new(&lookup).await;
-    assert!(extra.hello(a.code, PROTO_VERSION).await.is_none(), "full at first");
-    // None of them says a thing, so after a second they're let go.
-    let (_, (_, recv, _)) = guests.last_mut().unwrap();
-    assert!(is_cut_off(recv).await, "an idle guest was dropped");
-    let mut got_in = false;
-    for _ in 0..30 {
-        if extra.hello(a.code, PROTO_VERSION).await.is_some() {
-            got_in = true;
-            break;
+    assert!(extra.hello(a.code, PROTO_VERSION).await.is_none(), "full, and nobody quiet for long yet");
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    // None of them has said a thing for 5 s: the quietest gives way.
+    assert!(extra.hello(a.code, PROTO_VERSION).await.is_some(), "room was made");
+    let mut dropped = 0;
+    for (_, (_, recv, _)) in &mut guests {
+        if tokio::time::timeout(Duration::from_millis(200), is_cut_off(recv)).await.unwrap_or(false) {
+            dropped += 1;
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    assert!(got_in);
+    assert_eq!(dropped, 1, "just one gave way");
+}
+
+/// A quiet guest is only let go to make room: dropping it otherwise would
+/// make us look offline to them, again and again.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_quiet_guest_stays_while_there_is_room() {
+    let lookup = MemoryLookup::new();
+    let config = Config { guest_idle: Duration::from_millis(500), ..common::FAST };
+    let a = Peer::start_with_config(&lookup, "abin", config).await;
+    let fake = Fake::new(&lookup).await;
+    let (mut send, mut recv, _) = fake.hello(a.code, PROTO_VERSION).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    say(&mut send, "m1", "still here").await;
+    assert_eq!(next_frame(&mut recv, |f| matches!(f, Frame::Ack { .. })).await, Frame::Ack { id: "m1".into() });
 }
 
 #[tokio::test(flavor = "multi_thread")]

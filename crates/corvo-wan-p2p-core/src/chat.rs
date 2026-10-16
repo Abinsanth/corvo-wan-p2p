@@ -65,7 +65,7 @@ mod close {
     pub const DUPLICATE: u32 = 6;
     /// They weren't reading what we sent.
     pub const FLOOD: u32 = 7;
-    /// A guest that said nothing for too long.
+    /// A guest that had been quiet for a while, let go to make room.
     pub const IDLE: u32 = 8;
     /// A frame too big or not one we know.
     pub const BAD_FRAME: u32 = 9;
@@ -86,8 +86,8 @@ pub struct Config {
     /// How long a link must have lasted for its end to count as going offline
     /// rather than as a failed attempt (which backs off further).
     pub stable_link: Duration,
-    /// How long a guest (someone who isn't a contact) may stay connected
-    /// without sending anything.
+    /// How long a guest (someone who isn't a contact) may stay quiet before
+    /// its connection can be let go to make room for a new guest.
     pub guest_idle: Duration,
     /// How long, at start, the relay gets to answer before the network is
     /// said to be offline.
@@ -468,8 +468,6 @@ impl Core {
             }
             Err(e) => self.problem(e),
         }
-        let mut sweep = tokio::time::interval((self.config.guest_idle / 4).max(Duration::from_millis(50)));
-        sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             let due = self.next_dial();
             tokio::select! {
@@ -479,7 +477,6 @@ impl Core {
                 },
                 Some(message) = internal.recv() => self.internal(message),
                 _ = sleep_until(due) => self.dial_due(),
-                _ = sweep.tick() => self.sweep_guests(),
             }
         }
         accept.abort();
@@ -776,10 +773,33 @@ impl Core {
         }
     }
 
-    /// Whether another guest may connect. A `stranger` (not even a request)
-    /// also needs room for one more request.
-    fn room_for_guest(&self, stranger: bool) -> Result<bool, StoreError> {
-        Ok(self.guests.len() < MAX_GUESTS && !(stranger && self.requests()? >= MAX_REQUESTS))
+    /// Whether another guest may connect, letting a quiet one go to make room
+    /// if need be. A `stranger` (not even a request) also needs room for one
+    /// more request.
+    fn room_for_guest(&mut self, stranger: bool) -> Result<bool, StoreError> {
+        if stranger && self.requests()? >= MAX_REQUESTS {
+            return Ok(false);
+        }
+        Ok(self.guests.len() < MAX_GUESTS || self.let_quiet_guest_go())
+    }
+
+    /// Closes the guest that has been quiet longest, if it's been quiet for
+    /// [`Config::guest_idle`], so strangers who say nothing can't hold every
+    /// guest slot. Only done to make room: a guest dropped otherwise would see
+    /// us go offline and come back, over and over.
+    fn let_quiet_guest_go(&mut self) -> bool {
+        let idle = self.config.guest_idle;
+        let quietest = self
+            .links
+            .iter()
+            .filter(|(_, l)| self.guests.contains(&l.id) && l.heard.elapsed() >= idle)
+            .min_by_key(|(_, l)| l.heard);
+        let Some((peer, link)) = quietest else { return false };
+        debug!(peer = %peer.short(), "a quiet guest makes room for a new one");
+        link.conn.close(close::IDLE.into(), b"idle");
+        let id = link.id;
+        self.guests.remove(&id);
+        true
     }
 
     fn requests(&self) -> Result<usize, StoreError> {
@@ -1036,17 +1056,6 @@ impl Core {
         } else {
             // Up and straight down again: as good as a failed attempt.
             self.after_failure(peer, None);
-        }
-    }
-
-    /// Closes guest links that have said nothing for [`Config::guest_idle`],
-    /// so strangers who stay silent can't hold every guest slot.
-    fn sweep_guests(&mut self) {
-        let idle = self.config.guest_idle;
-        for (peer, link) in self.links.iter().filter(|(_, l)| self.guests.contains(&l.id) && l.heard.elapsed() >= idle)
-        {
-            debug!(peer = %peer.short(), "a guest said nothing for too long");
-            link.conn.close(close::IDLE.into(), b"idle");
         }
     }
 

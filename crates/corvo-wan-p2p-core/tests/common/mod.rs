@@ -172,8 +172,6 @@ impl Fake {
         self.hello_with(to, proto, &[]).await
     }
 
-    /// Like [`Fake::hello`], but sends `then` straight after the hello,
-    /// without waiting for the app's answer.
     /// Only connects, saying nothing yet (see [`Fake::hello_on`]).
     pub async fn connect(&self, to: Code) -> Option<iroh::endpoint::Connection> {
         tokio::time::timeout(PATIENCE, self.endpoint.connect(to.key(), ALPN)).await.ok()?.ok()
@@ -194,6 +192,8 @@ impl Fake {
         tokio::time::timeout(PATIENCE, exchange).await.expect("the exchange took too long")
     }
 
+    /// Like [`Fake::hello`], but sends `then` straight after the hello,
+    /// without waiting for the app's answer.
     pub async fn hello_with(&self, to: Code, proto: u32, then: &[Frame]) -> Option<(SendStream, RecvStream, Frame)> {
         let exchange = async {
             let conn = self.endpoint.connect(to.key(), ALPN).await.ok()?;

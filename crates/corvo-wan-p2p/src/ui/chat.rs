@@ -194,12 +194,14 @@ pub fn loaded_older(state: &mut State, peer: Code, result: Result<(Vec<StoredMes
             return state.say(Tone::Bad, format!("couldn't read older messages: {why}"));
         }
     };
-    chat.older = !page.is_empty() && page.len() + unreadable >= OLDER_PAGE;
+    let full = page.len() + unreadable >= OLDER_PAGE;
     // Trimming goes by position and paging by id, so a page can overlap
     // what's kept: each message goes in once.
     let have: HashSet<&str> = chat.messages.iter().map(|m| m.id.as_str()).collect();
     let page: Vec<StoredMessage> = page.into_iter().filter(|m| !have.contains(m.id.as_str())).collect();
     let added = page.len();
+    // A page with nothing new would be asked for again at once, forever.
+    chat.older = added > 0 && full;
     let open = state.open_peer() == Some(peer);
     let before = if open { chat_page(state).0 } else { 0 };
     let chat = state.chats.get_mut(&peer).expect("checked above");
@@ -678,6 +680,28 @@ mod tests {
         let ids: Vec<String> = s.chats[&rahul].messages.iter().map(|m| m.id.clone()).collect();
         let expected: Vec<String> = (5..=20).map(|i| format!("m{i:04}")).collect();
         assert_eq!(ids, expected);
+    }
+
+    #[test]
+    fn an_older_page_with_nothing_new_is_not_asked_for_again() {
+        let (mut s, rahul, _) = state();
+        s.size = (80, 24);
+        let people = s.known.clone();
+        let messages: Vec<_> = (0..CHAT_LEN).map(|i| message(&format!("m{i:04}"), "x", Mark::Read)).collect();
+        let chats = vec![History { code: rahul, messages: messages.clone(), read_upto: None, unreadable: 0 }];
+        update(&mut s, Msg::Done(Outcome::Loaded(Ok(Loaded { people, chats, unreadable_people: 0 }))));
+        s.open_chat(rahul, true);
+        let asks = |effects: &[Effect]| effects.iter().any(|e| matches!(e, Effect::LoadOlder { .. }));
+        let mut asked = false;
+        for _ in 0..CHAT_LEN {
+            asked |= asks(&key(&mut s, KeyCode::PageUp, KeyModifiers::NONE));
+        }
+        assert!(asked);
+        // A full page, every message of it already shown.
+        let page: Vec<_> = messages.iter().cycle().take(OLDER_PAGE).cloned().collect();
+        let effects = update(&mut s, Msg::Done(Outcome::LoadedOlder { peer: rahul, result: Ok((page, 0)) }));
+        assert!(!asks(&effects), "the same page again, forever");
+        assert!(!asks(&key(&mut s, KeyCode::PageUp, KeyModifiers::NONE)));
     }
 
     #[test]

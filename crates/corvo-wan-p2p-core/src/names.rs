@@ -276,10 +276,10 @@ mod tests {
             assert_eq!(find(&[them.clone(), abin], &labels[&them.code]), Ok(them.code));
         }
         let fake = person("you.m4x8");
-        assert!(labels(&[fake.clone()])[&fake.code].starts_with("you.m4x8·"), "can't pass for a you label");
+        assert!(labels(std::slice::from_ref(&fake))[&fake.code].starts_with("you.m4x8·"), "can't pass for a you label");
         for name in ["yours", "youssef"] {
             let p = person(name);
-            assert_eq!(labels(&[p.clone()])[&p.code], name);
+            assert_eq!(labels(std::slice::from_ref(&p))[&p.code], name);
         }
     }
 

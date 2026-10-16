@@ -219,7 +219,7 @@ impl Onboarding {
                     Step::Choose
                 }
             },
-            Step::Words => match Seed::from_phrase(&typed) {
+            Step::Words => match Seed::from_phrase(typed) {
                 Ok(seed) => Step::Name { seed, recovered: true },
                 Err(e) => {
                     self.note(Tone::Bad, e.to_string());

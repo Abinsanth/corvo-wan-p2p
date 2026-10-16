@@ -96,6 +96,7 @@ impl Editor {
     }
 
     /// Bytes the buffer holds before it has to move.
+    #[cfg(test)]
     pub fn capacity(&self) -> usize {
         self.text.capacity()
     }

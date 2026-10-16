@@ -1,7 +1,9 @@
-//! Windows over the main screen: the welcome after a new or recovered account.
+//! Windows over the main screen: the welcome after a new or recovered
+//! account, and the help.
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
 
+use super::commands::{HELP, KEYS, MARKS};
 use super::state::State;
 use super::view::wrap;
 
@@ -9,10 +11,12 @@ use super::view::wrap;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Overlay {
     Welcome { scroll: u16 },
+    Help { scroll: u16 },
 }
 
-/// The widest a window gets: its text, the margins and the border.
-pub const WIDTH: u16 = 56;
+/// Where a help line's description starts: after a two-space indent and
+/// the command (or key), padded.
+const DESCRIBED_AT: usize = 23;
 /// Columns a window's text leaves for its border and margins: two at the
 /// left, at least two at the right.
 const FRAME: u16 = 6;
@@ -38,33 +42,72 @@ impl Overlay {
     pub fn title(&self) -> &'static str {
         match self {
             Overlay::Welcome { .. } => "─ Welcome to corvo ",
+            Overlay::Help { .. } => "─ Help ",
+        }
+    }
+
+    /// What the top border says at its right end, if anything.
+    pub fn hint(&self) -> Option<&'static str> {
+        match self {
+            Overlay::Welcome { .. } => None,
+            Overlay::Help { .. } => Some(" Esc closes ─"),
+        }
+    }
+
+    /// The widest it gets: its text, the margins and the border.
+    pub fn width(&self) -> u16 {
+        match self {
+            Overlay::Welcome { .. } => 56,
+            Overlay::Help { .. } => 80,
         }
     }
 
     pub fn scroll(&self) -> u16 {
         match self {
-            Overlay::Welcome { scroll } => *scroll,
+            Overlay::Welcome { scroll } | Overlay::Help { scroll } => *scroll,
         }
     }
 
     fn scrolled_to(self, scroll: u16) -> Overlay {
         match self {
             Overlay::Welcome { .. } => Overlay::Welcome { scroll },
-        }
-    }
-
-    fn text(&self) -> &'static [&'static str] {
-        match self {
-            Overlay::Welcome { .. } => WELCOME,
+            Overlay::Help { .. } => Overlay::Help { scroll },
         }
     }
 }
 
 /// The window's text as drawn on a terminal of `size`: wrapped to fit
-/// when the terminal is narrower than [`WIDTH`].
+/// when the terminal is narrower than the window.
 pub fn rows(overlay: &Overlay, size: (u16, u16)) -> Vec<String> {
-    let inner = usize::from(size.0.min(WIDTH).saturating_sub(FRAME));
-    overlay.text().iter().flat_map(|line| wrap(line, inner)).collect()
+    let inner = usize::from(size.0.min(overlay.width()).saturating_sub(FRAME));
+    match overlay {
+        Overlay::Welcome { .. } => WELCOME.iter().flat_map(|line| wrap(line, inner)).collect(),
+        Overlay::Help { .. } => help_rows(inner),
+    }
+}
+
+/// The help in `inner` columns: each group's heading, then its commands with
+/// their descriptions, which wrap under themselves; then the keys and marks.
+fn help_rows(inner: usize) -> Vec<String> {
+    let mut rows = Vec::new();
+    let mut section = |title: &str, items: &[(&str, &str)]| {
+        rows.push(title.to_string());
+        for (name, what) in items {
+            let width = inner.saturating_sub(DESCRIBED_AT).max(12);
+            for (i, part) in wrap(what, width).into_iter().enumerate() {
+                let head =
+                    if i == 0 { format!("  {name:<w$}", w = DESCRIBED_AT - 2) } else { " ".repeat(DESCRIBED_AT) };
+                rows.push(format!("{head}{part}"));
+            }
+        }
+    };
+    for (group, commands) in HELP {
+        section(group, commands);
+    }
+    section("", &[]);
+    section("Keys", KEYS);
+    section("Marks", MARKS);
+    rows
 }
 
 /// How many of `total` rows the window shows at once: all of them if there's
@@ -84,22 +127,32 @@ fn last(size: (u16, u16), total: usize) -> u16 {
     u16::try_from(total).unwrap_or(u16::MAX).saturating_sub(height(size, total))
 }
 
+/// Whether the window has rows below what it shows at `size`.
+pub fn more_below(overlay: &Overlay, size: (u16, u16)) -> bool {
+    scroll(overlay, size) < last(size, rows(overlay, size).len())
+}
+
 /// A key while a window is open: Enter or Esc closes it, the arrows and
 /// PgUp/PgDn scroll it, and anything else does nothing.
 pub fn key(state: &mut State, key: KeyEvent) {
     let Some(overlay) = state.overlay else { return };
-    let total = rows(&overlay, state.size).len();
-    let page = height(state.size, total);
-    let last = last(state.size, total);
-    let scroll = scroll(&overlay, state.size);
-    state.overlay = match key.code {
-        KeyCode::Enter | KeyCode::Esc => None,
-        KeyCode::Up => Some(overlay.scrolled_to(scroll.saturating_sub(1))),
-        KeyCode::Down => Some(overlay.scrolled_to(scroll.saturating_add(1).min(last))),
-        KeyCode::PageUp => Some(overlay.scrolled_to(scroll.saturating_sub(page))),
-        KeyCode::PageDown => Some(overlay.scrolled_to(scroll.saturating_add(page).min(last))),
-        _ => Some(overlay),
-    };
+    let page = height(state.size, rows(&overlay, state.size).len()) as isize;
+    match key.code {
+        KeyCode::Enter | KeyCode::Esc => state.overlay = None,
+        KeyCode::Up => scroll_by(state, -1),
+        KeyCode::Down => scroll_by(state, 1),
+        KeyCode::PageUp => scroll_by(state, -page),
+        KeyCode::PageDown => scroll_by(state, page),
+        _ => {}
+    }
+}
+
+/// Scrolls the open window by `delta` rows, within its text.
+pub fn scroll_by(state: &mut State, delta: isize) {
+    let Some(overlay) = state.overlay else { return };
+    let last = last(state.size, rows(&overlay, state.size).len());
+    let to = (scroll(&overlay, state.size) as isize).saturating_add(delta).clamp(0, last as isize);
+    state.overlay = Some(overlay.scrolled_to(u16::try_from(to).unwrap_or(last)));
 }
 
 #[cfg(test)]
@@ -188,6 +241,58 @@ mod tests {
         assert_eq!(usize::from(scroll), total - usize::from(height(s.size, total)), "at the end, no further");
         key(&mut s, KeyCode::Up);
         assert_eq!(s.overlay, Some(Overlay::Welcome { scroll: scroll - 1 }));
+    }
+
+    #[test]
+    fn help_opens_a_window_and_prints_nothing() {
+        for line in ["/help", "/h"] {
+            let mut s = main_screen();
+            let said = s.tabs[0].lines.len();
+            send_line(&mut s, line);
+            assert_eq!(s.overlay, Some(Overlay::Help { scroll: 0 }));
+            assert_eq!(s.tabs[0].lines.len(), said, "nothing printed into the corvo tab");
+            key(&mut s, KeyCode::Esc);
+            assert_eq!(s.overlay, None);
+        }
+    }
+
+    #[test]
+    fn the_help_scrolls_on_a_short_terminal() {
+        let mut s = main_screen();
+        s.size = (80, 12);
+        s.overlay = Some(Overlay::Help { scroll: 0 });
+        for _ in 0..20 {
+            key(&mut s, KeyCode::PageDown);
+        }
+        let Some(overlay @ Overlay::Help { scroll }) = s.overlay else { panic!("closed") };
+        let total = rows(&overlay, s.size).len();
+        assert!(scroll > 0);
+        assert_eq!(usize::from(scroll), total - usize::from(height(s.size, total)));
+    }
+
+    #[test]
+    fn a_long_help_line_wraps_under_its_description() {
+        let help = rows(&Overlay::Help { scroll: 0 }, (80, 24));
+        let at = help.iter().position(|r| r.contains("/code")).expect("listed");
+        let indent = help[at].find("show").expect("described");
+        assert!(help[at + 1].starts_with(&" ".repeat(indent)), "{:?}", &help[at..at + 2]);
+    }
+
+    #[test]
+    fn the_wheel_scrolls_a_window_and_clicks_do_nothing() {
+        use crate::ui::state::WHEEL_STEP;
+        use ratatui::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let mouse = |kind| Msg::Mouse(MouseEvent { kind, column: 30, row: 10, modifiers: KeyModifiers::NONE });
+        let mut s = main_screen();
+        s.overlay = Some(Overlay::Help { scroll: 0 });
+        update(&mut s, mouse(MouseEventKind::ScrollDown));
+        assert_eq!(s.overlay, Some(Overlay::Help { scroll: WHEEL_STEP as u16 }));
+        update(&mut s, mouse(MouseEventKind::ScrollUp));
+        assert_eq!(s.overlay, Some(Overlay::Help { scroll: 0 }));
+        let tab = s.current;
+        update(&mut s, mouse(MouseEventKind::Down(MouseButton::Left)));
+        assert_eq!(s.overlay, Some(Overlay::Help { scroll: 0 }));
+        assert_eq!(s.current, tab);
     }
 
     #[test]

@@ -271,7 +271,10 @@ pub fn update(state: &mut State, msg: Msg) -> Vec<Effect> {
             }
             _ => {}
         },
-        Msg::Resize(w, h) => state.size = (w, h),
+        Msg::Resize(w, h) => {
+            state.size = (w, h);
+            drop_hidden_popup(state);
+        }
         Msg::Focus(focused) => state.focused = focused,
         Msg::Tick => {
             chat::tick(state);
@@ -334,7 +337,16 @@ fn scroll_by(state: &mut State, delta: isize) {
     state.scroll.by(delta, total, height);
 }
 
+/// A completion list that isn't drawn closes, so keys don't go to it unseen.
+fn drop_hidden_popup(state: &mut State) {
+    let drawn = areas(state.size, input_rows(state)).is_some_and(|a| popup_area(state, a.input).is_some());
+    if !drawn {
+        state.popup = None;
+    }
+}
+
 fn on_action(state: &mut State, action: Action, effects: &mut Vec<Effect>) {
+    drop_hidden_popup(state);
     if state.popup.is_some() {
         match action {
             Action::Complete | Action::Down => return complete::step(state, 1),
@@ -755,6 +767,40 @@ mod tests {
         update(&mut s, Msg::Core(Event::Problem("the store is full".into())));
         assert_eq!(last_corvo(&s).text, "the store is full");
         assert_eq!(last_corvo(&s).tone, Tone::Bad);
+    }
+
+    #[test]
+    fn a_list_that_is_not_drawn_takes_no_keys() {
+        let mut s = state();
+        s.set_people(vec![
+            corvo_wan_p2p_core::store::Person {
+                code: Seed::generate().code(),
+                name: "rahul".into(),
+                last_seen: None,
+                standing: corvo_wan_p2p_core::store::Standing::Contact,
+            },
+            corvo_wan_p2p_core::store::Person {
+                code: Seed::generate().code(),
+                name: "rani".into(),
+                last_seen: None,
+                standing: corvo_wan_p2p_core::store::Standing::Contact,
+            },
+        ]);
+        send(&mut s, "/help");
+        type_text(&mut s, "/chat r");
+        press(&mut s, KeyCode::Tab);
+        assert!(s.popup.is_some());
+        update(&mut s, Msg::Resize(80, 8));
+        assert_eq!(s.popup, None, "a resize to too small clears it");
+
+        update(&mut s, Msg::Resize(80, 24));
+        press(&mut s, KeyCode::Tab);
+        assert!(s.popup.is_some());
+        // Drawn nowhere, as if the window shrank without saying.
+        s.size = (80, 8);
+        press(&mut s, KeyCode::Up);
+        assert_eq!(s.popup, None);
+        assert_eq!(s.editor.text(), "/help", "↑ browses the history as if there were no list");
     }
 
     #[test]

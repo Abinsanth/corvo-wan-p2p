@@ -183,6 +183,7 @@ enum Command {
     History(Code, Reply<(Vec<StoredMessage>, usize)>),
     HistoryBefore { peer: Code, before: Option<String>, n: usize, reply: Reply<(Vec<StoredMessage>, usize)> },
     ReadUpto(Code, Reply<Option<String>>),
+    Path(Code, Reply<Option<PathInfo>>),
     ChangePassphrase { old: Zeroizing<String>, new: Zeroizing<String>, reply: Reply<()> },
     Phrase(Zeroizing<String>, Reply<Seed>),
     Shutdown,
@@ -375,6 +376,11 @@ impl Client {
         self.ask(|r| Command::ReadUpto(peer, r)).await
     }
 
+    /// How the connection to `peer` goes now, if there is one.
+    pub async fn path(&self, peer: Code) -> Result<Option<PathInfo>, ChatError> {
+        self.ask(|r| Command::Path(peer, r)).await
+    }
+
     /// Locks your history with `new` instead, if `old` is your passphrase now.
     pub async fn change_passphrase(&self, old: &str, new: &str) -> Result<(), ChatError> {
         let (old, new) = (Zeroizing::new(old.to_string()), Zeroizing::new(new.to_string()));
@@ -398,6 +404,21 @@ impl Client {
         self.commands.send(command(reply)).map_err(|_| ChatError::Stopped)?;
         answer.await.map_err(|_| ChatError::Stopped)?
     }
+}
+
+/// How a connection goes: straight between the two computers, or through a
+/// relay, and how long a round trip takes on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PathInfo {
+    pub direct: bool,
+    pub rtt: Duration,
+}
+
+/// The path `conn` sends on now, if it has one yet.
+fn path_info(conn: &Connection) -> Option<PathInfo> {
+    let paths = conn.paths();
+    let path = paths.iter().find(|p| p.is_selected())?;
+    Some(PathInfo { direct: path.is_ip(), rtt: path.rtt() })
 }
 
 /// One run of an app: random `session`, and when it `started` (Unix
@@ -561,6 +582,9 @@ impl Core {
             }
             Command::ReadUpto(peer, reply) => {
                 let _ = reply.send(self.store.read_upto(&peer).map_err(ChatError::from));
+            }
+            Command::Path(peer, reply) => {
+                let _ = reply.send(Ok(self.links.get(&peer).and_then(|link| path_info(&link.conn))));
             }
             // Argon2 takes a fifth of a second to a second: done on a blocking
             // thread, so messages keep flowing meanwhile.

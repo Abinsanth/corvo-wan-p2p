@@ -239,6 +239,10 @@ pub fn done(state: &mut State, outcome: Outcome) -> Vec<Effect> {
             state.say(Tone::Good, format!("updated to v{version}: /quit and start corvo-wan-p2p again to use it"))
         }
         Outcome::Updated(Err(why)) => state.say(Tone::Bad, why),
+        Outcome::UpdatedAlready(version) => state.say(
+            Tone::Plain,
+            format!("v{version} is installed already: /quit and start corvo-wan-p2p again to use it"),
+        ),
         _ => {}
     }
     effects

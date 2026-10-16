@@ -320,7 +320,7 @@ pub fn update(state: &mut State, msg: Msg) -> Vec<Effect> {
         Msg::Focus(focused) => state.focused = focused,
         Msg::Tick => {
             state.ticks = state.ticks.wrapping_add(1);
-            if state.ticks % PATH_TICKS == 0
+            if state.ticks.is_multiple_of(PATH_TICKS)
                 && matches!(state.screen, Screen::Main)
                 && let Some(peer) = state.open_peer()
             {

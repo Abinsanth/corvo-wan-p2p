@@ -164,7 +164,7 @@ impl Fake {
 
     /// The hello this fake's app would send.
     pub fn hello_frame(&self, proto: u32) -> Frame {
-        Frame::Hello { proto, app_version: "test".into(), session: self.session }
+        Frame::Hello { proto, app_version: "test".into(), session: self.session, started: 0 }
     }
 
     /// Dials `to`, says hello with protocol `proto`, and returns the streams

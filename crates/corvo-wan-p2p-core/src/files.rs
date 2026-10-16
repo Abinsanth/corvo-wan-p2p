@@ -6,6 +6,8 @@ use std::io::{ErrorKind, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
+use tracing::warn;
+
 const APP_DIR: &str = "corvo-wan-p2p";
 
 /// The data folder: `$XDG_CONFIG_HOME/corvo-wan-p2p`, else
@@ -93,13 +95,21 @@ pub(crate) fn write_private_atomic_with(
         return Err(e);
     }
     fs::rename(&tmp, path)?;
-    sync_parent(path)
+    // The file is in place. A folder that won't sync only makes the rename
+    // less sure to survive a power cut, so it's noted, not reported.
+    if let Err(e) = sync_parent(path) {
+        let file = path.file_name().unwrap_or_default().to_string_lossy();
+        warn!(%file, error = %e, "couldn't sync the folder after saving");
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 thread_local! {
     /// The folders [`sync_parent`] synced, so tests can see it ran.
     static SYNCED: std::cell::RefCell<Vec<PathBuf>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// Makes [`sync_parent`] fail, as a full or failing disk might.
+    static FAIL_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Makes a rename in `path`'s folder survive a power cut. Unix only: there
@@ -108,6 +118,10 @@ fn sync_parent(path: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+        #[cfg(test)]
+        if FAIL_SYNC.with(|f| f.get()) {
+            return Err(std::io::Error::other("sync failed"));
+        }
         fs::File::open(parent)?.sync_all()?;
         #[cfg(test)]
         SYNCED.with(|s| s.borrow_mut().push(parent.to_path_buf()));
@@ -170,6 +184,18 @@ mod tests {
         SYNCED.with(|s| s.borrow_mut().clear());
         write_private_atomic(&dir.path().join("key.json"), b"x").unwrap();
         assert_eq!(SYNCED.with(|s| s.borrow().clone()), [dir.path().to_path_buf()]);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_failed_folder_sync_after_the_rename_still_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("key.json");
+        FAIL_SYNC.with(|f| f.set(true));
+        let written = write_private_atomic(&path, b"new");
+        FAIL_SYNC.with(|f| f.set(false));
+        written.unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"new");
     }
 
     #[test]

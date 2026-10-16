@@ -4,7 +4,7 @@
 
 use std::path::PathBuf;
 
-use corvo_wan_p2p_core::chat::Event;
+use corvo_wan_p2p_core::chat::{Event, PathInfo};
 use corvo_wan_p2p_core::identity::{Code, Seed};
 use corvo_wan_p2p_core::store::{Person, StoreError, StoredMessage};
 use ratatui::crossterm::event::{
@@ -15,11 +15,12 @@ use zeroize::Zeroizing;
 
 use super::account::{self, PhraseDone, PhraseUse};
 use super::chat::{self, Loaded};
-use super::commands::{Cmd, HELP, Input, KEYS, may_hold_a_secret, parse};
+use super::commands::{Cmd, Input, may_hold_a_secret, parse};
 use super::complete;
 use super::people::{self, Act, Show};
-use super::state::{Screen, Secret, State, Tone, WHEEL_STEP};
+use super::state::{PATH_TICKS, Screen, Secret, State, Tone, WHEEL_STEP};
 use super::view::{areas, chat_page, input_rows, popup_area, sidebar_rows, sidebar_scrolled, sidebar_showing, tab_at};
+use super::window::{self, Overlay};
 
 #[derive(Debug)]
 pub enum Msg {
@@ -81,6 +82,8 @@ pub enum Effect {
     },
     /// You've seen everything they sent.
     MarkRead(Code),
+    /// How the connection to them goes now, for the status bar.
+    AskPath(Code),
     /// Read the `n` messages with `peer` from before the one with id `before`.
     LoadOlder {
         peer: Code,
@@ -149,6 +152,11 @@ pub enum Outcome {
         to: Code,
         text: String,
         result: Result<StoredMessage, String>,
+    },
+    /// How the connection to `peer` went, if there was one.
+    Path {
+        peer: Code,
+        info: Option<PathInfo>,
     },
     /// Something went wrong that the user should hear about.
     Failed(String),
@@ -264,6 +272,18 @@ pub fn update(state: &mut State, msg: Msg) -> Vec<Effect> {
     match msg {
         // A key while the words are up only hides them.
         Msg::Key(key) if state.reveal.is_some() && key.kind != KeyEventKind::Release => state.reveal = None,
+        // A window takes every key but Ctrl-C.
+        Msg::Key(key) if state.overlay.is_some() => match action_for(key) {
+            Some(Action::Quit) => on_action(state, Action::Quit, &mut effects),
+            _ if key.kind != KeyEventKind::Release => window::key(state, key),
+            _ => {}
+        },
+        Msg::Mouse(mouse) if state.overlay.is_some() => match mouse.kind {
+            MouseEventKind::ScrollUp => window::scroll_by(state, -(WHEEL_STEP as isize)),
+            MouseEventKind::ScrollDown => window::scroll_by(state, WHEEL_STEP as isize),
+            _ => {}
+        },
+        Msg::Paste(_) if state.overlay.is_some() => {}
         Msg::Key(key) => {
             if state.ask().is_some() {
                 state.editor.make_room_for_answer();
@@ -299,6 +319,13 @@ pub fn update(state: &mut State, msg: Msg) -> Vec<Effect> {
         }
         Msg::Focus(focused) => state.focused = focused,
         Msg::Tick => {
+            state.ticks = state.ticks.wrapping_add(1);
+            if state.ticks.is_multiple_of(PATH_TICKS)
+                && matches!(state.screen, Screen::Main)
+                && let Some(peer) = state.open_peer()
+            {
+                effects.push(Effect::AskPath(peer));
+            }
             if let Some(flash) = &mut state.flash {
                 flash.ticks_left = flash.ticks_left.saturating_sub(1);
                 if flash.ticks_left == 0 {
@@ -509,14 +536,9 @@ fn on_line(state: &mut State, line: &str, effects: &mut Vec<Effect>) {
 
 fn on_command(state: &mut State, cmd: Cmd, effects: &mut Vec<Effect>) {
     match cmd {
-        Cmd::Help => {
-            for (usage, what) in HELP {
-                state.say(Tone::Plain, format!("{usage:<18} {what}"));
-            }
-            state.say(Tone::Plain, KEYS);
-            state.select_tab(0);
-        }
+        Cmd::Help => state.overlay = Some(Overlay::Help { scroll: 0 }),
         Cmd::Clear => state.clear_tab(),
+        Cmd::Welcome => state.overlay = Some(Overlay::Welcome { scroll: 0 }),
         cmd @ (Cmd::Passphrase | Cmd::Phrase | Cmd::PhraseSave | Cmd::PhraseCopy) => account::begin(state, cmd),
         Cmd::Quit => effects.push(Effect::Quit),
         Cmd::Update { yes } => effects.push(Effect::CheckUpdate { yes }),
@@ -532,7 +554,11 @@ fn on_command(state: &mut State, cmd: Cmd, effects: &mut Vec<Effect>) {
 fn on_done(state: &mut State, outcome: Outcome, effects: &mut Vec<Effect>) {
     match outcome {
         Outcome::Started { name, code, recovery_file } => {
+            let welcome = matches!(&state.screen, Screen::Onboarding(o) if o.made_account());
             state.screen = Screen::Main;
+            if welcome {
+                state.overlay = Some(Overlay::Welcome { scroll: 0 });
+            }
             state.short_code = code.short();
             state.code = Some(code);
             state.say(Tone::Good, format!("welcome, {name}. Your code is {code}"));
@@ -548,6 +574,7 @@ fn on_done(state: &mut State, outcome: Outcome, effects: &mut Vec<Effect>) {
             }
         }
         Outcome::Fatal(why) => effects.push(Effect::Exit(why)),
+        Outcome::Path { peer, info } => state.path = info.map(|info| (peer, info)),
         Outcome::Failed(why) => state.say(Tone::Bad, why),
         Outcome::Loaded(result) => chat::loaded(state, result),
         Outcome::LoadedOlder { peer, result } => chat::loaded_older(state, peer, result),
@@ -572,6 +599,21 @@ mod tests {
     use crate::ui::state::{APP, FLASH_TICKS, Line, Tab};
     use corvo_wan_p2p_core::identity::Seed;
     use ratatui::crossterm::event::KeyEventState;
+
+    #[test]
+    fn the_open_chats_path_is_asked_every_two_seconds() {
+        let mut s = state();
+        let asked = |s: &mut State| {
+            (0..8).flat_map(|_| update(s, Msg::Tick)).filter(|e| matches!(e, Effect::AskPath(_))).collect::<Vec<_>>()
+        };
+        assert!(asked(&mut s).is_empty(), "nothing on the corvo tab");
+        s.select_tab(1);
+        let rahul = s.tabs[1].peer.unwrap();
+        assert_eq!(asked(&mut s), [Effect::AskPath(rahul)]);
+        let info = Some(PathInfo { direct: true, rtt: std::time::Duration::from_millis(5) });
+        update(&mut s, Msg::Done(Outcome::Path { peer: rahul, info }));
+        assert_eq!(s.path, info.map(|i| (rahul, i)));
+    }
 
     fn state() -> State {
         let mut state = State::new("ana".into(), "abcdefgh".into());
@@ -648,13 +690,13 @@ mod tests {
     #[test]
     fn up_and_down_browse_sent_lines_after_the_input_rows() {
         let mut s = state();
-        send(&mut s, "/help");
+        send(&mut s, "/blocked");
         send(&mut s, "/clear");
         type_text(&mut s, "draft");
         press(&mut s, KeyCode::Up);
         assert_eq!(s.editor.text(), "/clear");
         press(&mut s, KeyCode::Up);
-        assert_eq!(s.editor.text(), "/help");
+        assert_eq!(s.editor.text(), "/blocked");
         press(&mut s, KeyCode::Down);
         press(&mut s, KeyCode::Down);
         assert_eq!(s.editor.text(), "draft");
@@ -760,19 +802,6 @@ mod tests {
     }
 
     #[test]
-    fn help_lists_every_command_in_the_corvo_tab() {
-        let mut s = state();
-        alt(&mut s, KeyCode::Char('2'));
-        send(&mut s, "/h");
-        assert_eq!(s.current, 0, "help opens the corvo tab");
-        let text: Vec<&str> = s.tabs[0].lines.iter().map(|l| l.text.as_str()).collect();
-        for usage in ["/add <code>", "/accept [name]", "/phrase copy", "/quit  /q"] {
-            assert!(text.iter().any(|l| l.starts_with(usage)), "{usage} is listed");
-        }
-        assert!(text.last().unwrap().contains("Alt+Enter"));
-    }
-
-    #[test]
     fn close_closes_a_chat_but_not_corvo() {
         let mut s = state();
         alt(&mut s, KeyCode::Char('3'));
@@ -835,7 +864,7 @@ mod tests {
     #[test]
     fn a_passphrase_typed_after_the_command_is_not_kept() {
         let mut s = state();
-        send(&mut s, "/help");
+        send(&mut s, "/blocked");
         for line in
             ["/passphrase old-secret new-secret", "/PASSPHRASE old-secret", "  /phrase hunter2", "/phrase  copy now"]
         {
@@ -852,16 +881,16 @@ mod tests {
         while let Some(entry) = s.history.prev("") {
             kept.push(entry);
         }
-        assert_eq!(kept, vec!["/help"], "only the line without a passphrase in it");
+        assert_eq!(kept, vec!["/blocked"], "only the line without a passphrase in it");
     }
 
     #[test]
     fn an_unsent_passphrase_line_is_not_kept_as_a_draft() {
         let mut s = state();
-        send(&mut s, "/help");
+        send(&mut s, "/blocked");
         type_text(&mut s, "/passphrase old-secret new-secret");
         press(&mut s, KeyCode::Up);
-        assert_eq!(s.editor.text(), "/help");
+        assert_eq!(s.editor.text(), "/blocked");
         press(&mut s, KeyCode::Down);
         assert_eq!(s.editor.text(), "", "the line with a passphrase in it wasn't kept");
     }
@@ -909,7 +938,7 @@ mod tests {
                 standing: corvo_wan_p2p_core::store::Standing::Contact,
             },
         ]);
-        send(&mut s, "/help");
+        send(&mut s, "/blocked");
         type_text(&mut s, "/chat r");
         press(&mut s, KeyCode::Tab);
         assert!(s.popup.is_some());
@@ -923,7 +952,7 @@ mod tests {
         s.size = (80, 8);
         press(&mut s, KeyCode::Up);
         assert_eq!(s.popup, None);
-        assert_eq!(s.editor.text(), "/help", "↑ browses the history as if there were no list");
+        assert_eq!(s.editor.text(), "/blocked", "↑ browses the history as if there were no list");
     }
 
     #[test]

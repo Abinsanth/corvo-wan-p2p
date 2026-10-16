@@ -13,7 +13,7 @@ use std::io::{self, Write};
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Mutex, OnceLock, PoisonError};
 
 use tracing::level_filters::LevelFilter;
 use tracing_subscriber::filter::Targets;
@@ -27,11 +27,26 @@ const MAX_BYTES: u64 = 1024 * 1024;
 /// Set to change what's logged.
 const LEVEL_VAR: &str = "CORVO_WAN_P2P_LOG";
 
+/// The app's log file, kept so [`forget`] can let go of it.
+static LOG: OnceLock<LogFile> = OnceLock::new();
+
 /// Sends the app's and the chat engine's log lines to the log file in `dir`.
 /// Does nothing if logging was already set up.
 pub fn start(dir: &Path) {
     let setting = std::env::var(LEVEL_VAR).ok();
-    let _ = subscriber(LogFile::new(dir), filter(setting.as_deref())).try_init();
+    if LOG.set(LogFile::new(dir)).is_ok() {
+        let log = LOG.get().expect("set just now");
+        let _ = subscriber(log, filter(setting.as_deref())).try_init();
+    }
+}
+
+/// Deletes the log files in `dir` (after `--recover`, which forgets the old
+/// account). The next line starts a fresh file.
+pub fn forget(dir: &Path) {
+    match LOG.get().filter(|log| log.path.parent() == Some(dir)) {
+        Some(log) => log.forget(),
+        None => LogFile::new(dir).forget(),
+    }
 }
 
 /// This app's own code at the level `setting` names (warnings if it names
@@ -41,7 +56,7 @@ fn filter(setting: Option<&str>) -> Targets {
     Targets::new().with_target("corvo_wan_p2p_core", level).with_target("corvo_wan_p2p", level)
 }
 
-fn subscriber(file: LogFile, filter: Targets) -> impl tracing::Subscriber + Send + Sync {
+fn subscriber(file: &'static LogFile, filter: Targets) -> impl tracing::Subscriber + Send + Sync {
     let lines = tracing_subscriber::fmt::layer().with_writer(file).with_ansi(false);
     tracing_subscriber::registry().with(lines.with_filter(filter))
 }
@@ -76,6 +91,15 @@ impl LogFile {
         }
         file.as_mut().expect("opened above").write_all(line)
     }
+
+    /// Lets go of the open file (Windows can't delete one that's open), then
+    /// deletes both files. One that isn't there, or won't go, is left be.
+    fn forget(&self) {
+        let mut file = self.file.lock().unwrap_or_else(PoisonError::into_inner);
+        *file = None;
+        let _ = fs::remove_file(&self.path);
+        let _ = fs::remove_file(&self.old);
+    }
 }
 
 /// Appends, readable only by you on Unix (the folder is private on Windows).
@@ -103,7 +127,7 @@ impl Write for LineWriter<'_> {
     }
 }
 
-impl<'a> MakeWriter<'a> for LogFile {
+impl<'a> MakeWriter<'a> for &'static LogFile {
     type Writer = LineWriter<'a>;
 
     fn make_writer(&'a self) -> LineWriter<'a> {
@@ -118,7 +142,8 @@ pub fn start_for_tests() -> &'static Path {
     static FILE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
     FILE.get_or_init(|| {
         let dir = tempfile::tempdir().unwrap().keep();
-        subscriber(LogFile::new(&dir), filter(Some("trace"))).try_init().expect("no other logging is set up in tests");
+        let log = Box::leak(Box::new(LogFile::new(&dir)));
+        subscriber(log, filter(Some("trace"))).try_init().expect("no other logging is set up in tests");
         dir.join(LOG_FILE)
     })
 }
@@ -146,6 +171,28 @@ mod tests {
     }
 
     #[test]
+    fn forgetting_removes_both_logs_and_starts_afresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = LogFile::with_limit(dir.path(), 100);
+        for i in 0..3 {
+            log.append(format!("line {i} {}\n", "x".repeat(40)).as_bytes()).unwrap();
+        }
+        assert!(dir.path().join(OLD_LOG_FILE).exists());
+        log.forget();
+        assert!(!dir.path().join(LOG_FILE).exists());
+        assert!(!dir.path().join(OLD_LOG_FILE).exists());
+        log.append(b"after\n").unwrap();
+        assert_eq!(fs::read_to_string(dir.path().join(LOG_FILE)).unwrap(), "after\n");
+    }
+
+    #[test]
+    fn forgetting_a_folder_with_no_log_is_fine() {
+        let dir = tempfile::tempdir().unwrap();
+        forget(dir.path());
+        forget(&dir.path().join("not made yet"));
+    }
+
+    #[test]
     fn the_level_setting_never_lets_in_other_libraries_logs() {
         use tracing::Level;
         let debug = filter(Some("debug"));
@@ -165,6 +212,6 @@ mod tests {
     fn a_line_with_nowhere_to_go_is_dropped_quietly() {
         let dir = tempfile::tempdir().unwrap();
         let log = LogFile::new(&dir.path().join("not made yet"));
-        assert_eq!(log.make_writer().write(b"lost\n").unwrap(), 5);
+        assert_eq!(LineWriter(&log).write(b"lost\n").unwrap(), 5);
     }
 }

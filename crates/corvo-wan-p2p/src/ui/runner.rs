@@ -10,7 +10,7 @@ use corvo_wan_p2p_core::chat::{ChatError, Client, Config, Event};
 use corvo_wan_p2p_core::identity::{Code, Seed};
 use corvo_wan_p2p_core::net::internet_endpoint;
 use corvo_wan_p2p_core::recovery;
-use corvo_wan_p2p_core::store::{Mark, Standing, Store, StoredMessage};
+use corvo_wan_p2p_core::store::{Mark, Standing, Store, StoreError, StoredMessage};
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::SetTitle;
 
@@ -149,7 +149,13 @@ impl<W: Write> Runner<W> {
             },
             Effect::Wipe => {
                 let dir = self.dir.clone();
-                Outcome::Wiped(blocking(move || Store::wipe(&dir)).await?.map_err(|e| e.to_string()))
+                let wiped = blocking(move || {
+                    Store::wipe(&dir)?;
+                    // The log says whom the old account talked to.
+                    crate::logging::forget(&dir);
+                    Ok(())
+                });
+                Outcome::Wiped(wiped.await?.map_err(|e: StoreError| e.to_string()))
             }
             Effect::CheckRecovery => Outcome::RecoveryFile(self.recovery_file()),
             Effect::WriteRecovery { seed, overwrite } => {
@@ -176,6 +182,11 @@ impl<W: Write> Runner<W> {
                     Ok(client) => client.history_before(peer, Some(before), n).await.map_err(|e| e.to_string()),
                     Err(e) => Err(e),
                 },
+            },
+            // Quietly: it's asked every couple of seconds.
+            Effect::AskPath(peer) => match self.client() {
+                Ok(client) => Outcome::Path { peer, info: client.path(peer).await.ok().flatten() },
+                Err(_) => return Ok(Flow::Next(None)),
             },
             Effect::MarkRead(peer) => match self.client() {
                 Ok(client) => match client.mark_read(peer).await {
@@ -354,6 +365,7 @@ mod tests {
     use crate::ui::onboarding::Onboarding;
     use crate::ui::state::{Screen, State};
     use crate::ui::update::update;
+    use crate::ui::window::Overlay;
     use corvo_wan_p2p_core::identity::Seed;
     use corvo_wan_p2p_core::recovery;
     use corvo_wan_p2p_core::store::KdfParams;
@@ -468,6 +480,14 @@ mod tests {
             }
             seed
         }
+
+        /// Enter at the code starts the app; the welcome shows, and Enter closes it.
+        async fn start(&mut self) {
+            self.send("").await;
+            assert!(matches!(self.state.overlay, Some(Overlay::Welcome { .. })), "the welcome shows");
+            self.send("").await;
+            assert_eq!(self.state.overlay, None);
+        }
     }
 
     #[tokio::test]
@@ -501,7 +521,7 @@ mod tests {
         let (data, home) = (TempDir::new().unwrap(), TempDir::new().unwrap());
         let mut app = App::open(&data, &home, false);
         app.make_account().await;
-        app.send("").await;
+        app.start().await;
         for answer in ["/passphrase", "wrong", "new", "new"] {
             app.send(answer).await;
         }
@@ -525,7 +545,7 @@ mod tests {
         let (data, home) = (TempDir::new().unwrap(), TempDir::new().unwrap());
         let mut app = App::open(&data, &home, false);
         let seed = app.make_account().await;
-        app.send("").await;
+        app.start().await;
         app.send("/phrase").await;
         app.send("nope").await;
         assert_eq!(app.state.reveal, None);
@@ -557,7 +577,7 @@ mod tests {
         let (data, home) = (TempDir::new().unwrap(), TempDir::new().unwrap());
         let mut app = App::open(&data, &home, false);
         app.make_account().await;
-        app.send("").await;
+        app.start().await;
         let file = recovery::path(home.path());
         let before = std::fs::read_to_string(&file).unwrap();
         app.send("/phrase save").await;
@@ -611,6 +631,26 @@ mod tests {
         assert_eq!(app.onboarding().notes[0].text, "wrong passphrase, try again", "the old account is gone");
         app.send("other").await;
         assert_eq!(app.state.name, "ana again");
+        app.runner.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn recover_forgets_the_old_log() {
+        let (data, home) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        let mut app = App::open(&data, &home, false);
+        app.make_account().await;
+        app.send("").await;
+        app.runner.shutdown().await;
+        let dir = data.path().join("corvo-wan-p2p");
+        for file in [crate::logging::LOG_FILE, "corvo-wan-p2p.log.old"] {
+            std::fs::write(dir.join(file), "rahul's code: …\n").unwrap();
+        }
+
+        let mut app = App::open(&data, &home, true);
+        app.send("yes").await;
+        assert_eq!(app.state.ask().unwrap().label, "words: ", "wiped");
+        assert!(!dir.join(crate::logging::LOG_FILE).exists());
+        assert!(!dir.join("corvo-wan-p2p.log.old").exists());
         app.runner.shutdown().await;
     }
 

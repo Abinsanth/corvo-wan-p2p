@@ -164,6 +164,21 @@ async fn passphrase_work_does_not_hold_up_the_engine() {
     assert_answers_meanwhile(&a, phrase).await.unwrap();
 }
 
+/// Quitting while `/passphrase` is still saving waits for it: the next start
+/// opens with the new passphrase and finds the store free.
+#[tokio::test(flavor = "multi_thread")]
+async fn quitting_waits_for_a_passphrase_change() {
+    let lookup = MemoryLookup::new();
+    let a = Peer::start_with_slow_kdf(&lookup, "abin").await;
+    {
+        let change = a.client.change_passphrase("pass", "new pass");
+        // Long enough for the change to reach the engine, not to finish.
+        assert!(tokio::time::timeout(Duration::from_millis(20), change).await.is_err(), "finished too fast to tell");
+    }
+    let (dir, _) = a.stop().await;
+    drop(Store::open(dir.path(), "new pass").unwrap());
+}
+
 /// Starts `slow`, then checks that `people()` answers while it's still running.
 async fn assert_answers_meanwhile<T>(a: &Peer, slow: impl Future<Output = T>) -> T {
     let mut slow = std::pin::pin!(slow);

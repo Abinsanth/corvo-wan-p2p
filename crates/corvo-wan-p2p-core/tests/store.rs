@@ -223,6 +223,33 @@ fn the_passphrase_can_be_checked_while_the_store_is_open() {
 }
 
 #[test]
+fn two_passphrase_changes_from_the_same_old_one_only_one_wins() {
+    for _ in 0..20 {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, _) = new_account(dir.path());
+        let start = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let changes: Vec<_> = ["new a", "new b"]
+            .into_iter()
+            .map(|new| {
+                let (passphrase, start) = (store.passphrase(), start.clone());
+                std::thread::spawn(move || {
+                    start.wait();
+                    (new, passphrase.change_from("first pass", new, FAST))
+                })
+            })
+            .collect();
+        let results: Vec<_> = changes.into_iter().map(|t| t.join().unwrap()).collect();
+        let won: Vec<&str> = results.iter().filter(|(_, r)| r.is_ok()).map(|(new, _)| *new).collect();
+        assert_eq!(won.len(), 1, "exactly one change wins: {results:?}");
+        assert!(results.iter().any(|(_, r)| matches!(r, Err(StoreError::WrongPassphrase))));
+        drop(store);
+        let lost = if won[0] == "new a" { "new b" } else { "new a" };
+        assert!(Store::open(dir.path(), won[0]).is_ok());
+        assert!(matches!(Store::open(dir.path(), lost), Err(StoreError::WrongPassphrase)));
+    }
+}
+
+#[test]
 fn another_accounts_key_json_does_not_pass_the_check() {
     let (mine, theirs) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
     let (store, _) = new_account(mine.path());

@@ -109,12 +109,34 @@ impl Passphrase {
         }
     }
 
-    /// Locks the data key with a new passphrase. Only `key.json` changes.
-    pub fn change(&self, new_passphrase: &str, params: KdfParams) -> Result<(), StoreError> {
+    /// Locks the data key with `new` if `old` is the passphrase now. Only
+    /// `key.json` changes. The check and the write happen under one lock, so
+    /// of two changes from the same old passphrase only one succeeds.
+    pub fn change_from(&self, old: &str, new: &str, params: KdfParams) -> Result<(), StoreError> {
+        if new.is_empty() {
+            return Err(StoreError::EmptyPassphrase);
+        }
+        let _writing = self.writing();
+        if !self.check(old)? {
+            return Err(StoreError::WrongPassphrase);
+        }
+        self.write(new, params)
+    }
+
+    /// Locks the data key with a new passphrase, without asking for the old one.
+    fn change(&self, new_passphrase: &str, params: KdfParams) -> Result<(), StoreError> {
         if new_passphrase.is_empty() {
             return Err(StoreError::EmptyPassphrase);
         }
-        let _writing = self.key_file.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _writing = self.writing();
+        self.write(new_passphrase, params)
+    }
+
+    fn writing(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.key_file.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn write(&self, new_passphrase: &str, params: KdfParams) -> Result<(), StoreError> {
         KeyFile::lock(&self.data_key, new_passphrase, params)?.write(&self.key_path)
     }
 }

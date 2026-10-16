@@ -5,7 +5,7 @@ app to app, end-to-end encrypted, with no server holding their messages. Share
 your code with a friend, they add it, and you chat. Messages wait on your
 machine until you're both online.
 
-**Status:** `v0.1.0`, the first release.
+**Status:** `v0.1.1`.
 
 ## Install
 
@@ -81,6 +81,11 @@ A green dot next to a contact means they're online. Next to your own messages:
 | `✓` | delivered to their computer |
 | `✓✓` | read |
 
+The bar at the bottom shows your name and code, whether you're online, how
+the open chat's connection goes (**direct** between the two computers, or
+**via relay**, and how long a round trip takes), how many contacts are
+online, and how many of your messages are still waiting.
+
 ## Commands
 
 | Command | What it does |
@@ -104,7 +109,8 @@ A green dot next to a contact means they're online. Next to your own messages:
 | `/close` | close this chat tab |
 | `/clear` | clear the screen (Ctrl-L) |
 | `/update` | check for a newer version and install it |
-| `/help` | list commands |
+| `/welcome` | show the welcome again |
+| `/help` | a window with every command, the keys and the marks |
 | `/quit` | quit (Ctrl-C) |
 
 Start a message with `//` to send text that begins with `/`.
@@ -121,7 +127,7 @@ computers at once, messages go to one or the other unpredictably.
 **New computer, or forgot your passphrase?** On a new computer, choose
 *recover* at the first start and type your 12 words. On a computer that
 already has the account, run `corvo-wan-p2p --recover`: after you type `yes`,
-it deletes the account on that computer and brings it back from your words.
+it deletes the account (and its log) on that computer and brings it back from your words.
 Either way you get the **same code**, but no contacts or history. Friends who write to you show up as
 requests; accept them again.
 

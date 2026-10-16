@@ -352,7 +352,7 @@ async fn a_second_hello_closes_the_link_and_nothing_after_it_counts() {
     let (mut send, mut recv, _) = fake.hello(a.code, PROTO_VERSION).await.unwrap();
     let fc = fake.code;
     a.expect(|e| *e == Event::Online(fc)).await;
-    write_frame(&mut send, &Frame::Hello { proto: PROTO_VERSION, app_version: "again".into(), session: 1 })
+    write_frame(&mut send, &Frame::Hello { proto: PROTO_VERSION, app_version: "again".into(), session: 1, started: 0 })
         .await
         .unwrap();
     let _ = write_frame(&mut send, &Frame::Msg { id: "late".into(), sent_at: 1, text: "after".into() }).await;

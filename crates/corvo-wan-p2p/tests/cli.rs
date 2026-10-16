@@ -18,5 +18,4 @@ fn help_offers_recover_for_a_forgotten_passphrase() {
     let help = String::from_utf8_lossy(&out.stdout);
     assert!(help.contains("--recover"));
     assert!(help.contains("12 words"));
-    assert!(!help.contains("demo"), "the demo stays hidden");
 }

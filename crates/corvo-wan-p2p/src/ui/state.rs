@@ -315,6 +315,8 @@ pub enum Tone {
     Good,
     Warn,
     Bad,
+    /// Your own messages, so no one's name can make theirs look like yours.
+    Own,
 }
 
 /// One line of a tab. It may hold line breaks; `view` splits and wraps it.

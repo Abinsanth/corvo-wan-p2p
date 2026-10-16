@@ -19,6 +19,9 @@ use crate::store::Person;
 pub const SEPARATOR: char = '·';
 /// How much of the code a label shows at first.
 const TAIL: usize = 4;
+/// What the screen calls you. Someone whose name looks like it always shows a
+/// tail, so their lines can't pass for yours.
+pub const YOU: &str = "you";
 
 /// A label for each person, all different from each other however they're
 /// compared. Someone whose app hasn't sent a name yet is shown by the start of
@@ -27,7 +30,7 @@ pub fn labels(people: &[Person]) -> HashMap<Code, String> {
     // How much of each person's code their label shows; 0 means just the name.
     let names = name_skeletons(people);
     let mut tails: Vec<usize> =
-        people.iter().map(|p| if looks_like_a_label(&p.name, &names) { TAIL } else { 0 }).collect();
+        people.iter().map(|p| if looks_like_a_label(&p.name, &names) || is_you(&p.name) { TAIL } else { 0 }).collect();
     loop {
         let mut seen: HashMap<String, Vec<usize>> = HashMap::new();
         for (i, p) in people.iter().enumerate() {
@@ -56,8 +59,14 @@ fn label(p: &Person, tail: usize) -> String {
     }
 }
 
+/// Everyone's names as skeletons, and [`YOU`], since labels can't pass for it either.
 fn name_skeletons(people: &[Person]) -> HashSet<String> {
-    people.iter().filter(|p| !p.name.is_empty()).map(|p| skeleton(&p.name)).collect()
+    let names = people.iter().filter(|p| !p.name.is_empty()).map(|p| skeleton(&p.name));
+    names.chain([YOU.to_string()]).collect()
+}
+
+fn is_you(name: &str) -> bool {
+    skeleton(name) == YOU
 }
 
 /// A name split the way a label is: what comes before its last separator (any
@@ -253,6 +262,24 @@ mod tests {
         assert_eq!(labels[&meera.code], "meera");
         if tail(&one, TAIL) != tail(&two, TAIL) {
             assert_eq!(labels[&one.code], format!("rahul·{}", tail(&one, TAIL)));
+        }
+    }
+
+    #[test]
+    fn a_peer_called_you_gets_a_tail() {
+        // Cyrillic у and о, and full-width letters, all pass for "you".
+        for name in ["you", "You", "YOU", "\u{0443}\u{043E}u", "ｙｏｕ"] {
+            let (them, abin) = (person(name), person("abin"));
+            let labels = labels(&[them.clone(), abin.clone()]);
+            assert_eq!(labels[&them.code], format!("{name}·{}", tail(&them, TAIL)), "{name:?}");
+            assert_eq!(labels[&abin.code], "abin");
+            assert_eq!(find(&[them.clone(), abin], &labels[&them.code]), Ok(them.code));
+        }
+        let fake = person("you.m4x8");
+        assert!(labels(&[fake.clone()])[&fake.code].starts_with("you.m4x8·"), "can't pass for a you label");
+        for name in ["yours", "youssef"] {
+            let p = person(name);
+            assert_eq!(labels(&[p.clone()])[&p.code], name);
         }
     }
 

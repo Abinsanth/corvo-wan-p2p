@@ -18,6 +18,7 @@ use std::str::Chars;
 
 use corvo_wan_p2p_core::VERSION;
 use corvo_wan_p2p_core::identity::{Code, is_invisible};
+use corvo_wan_p2p_core::names::YOU;
 use corvo_wan_p2p_core::store::{Mark, Standing};
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
@@ -113,7 +114,7 @@ pub fn tab_lines(state: &State, tab: &Tab) -> (Vec<Line>, usize) {
             last_day = day;
         }
         let time = at.map_or_else(|| "--:--".into(), |t| t.format("%H:%M").to_string());
-        let who = if m.mark.is_outgoing() { "you" } else { label.as_str() };
+        let (who, line_tone) = if m.mark.is_outgoing() { (YOU, Tone::Own) } else { (label.as_str(), Tone::Plain) };
         // Later lines of a message start under its text's first column.
         let text = m.text.replace('\n', &format!("\n{}", " ".repeat(time.len() + 1)));
         let mark = match m.mark {
@@ -122,7 +123,7 @@ pub fn tab_lines(state: &State, tab: &Tab) -> (Vec<Line>, usize) {
             Mark::Read => " ✓✓",
             Mark::Received => "",
         };
-        lines.push(Line { text: format!("{time} {who}: {text}{mark}"), tone: Tone::Plain });
+        lines.push(Line { text: format!("{time} {who}: {text}{mark}"), tone: line_tone });
     }
     // Never cleared: everything shows, the request line too.
     let clear_line = if tab.cleared == 0 { 0 } else { clear_line.unwrap_or(lines.len()) };
@@ -376,6 +377,7 @@ fn tone(tone: Tone) -> Style {
         Tone::Good => Style::new().fg(Color::Green),
         Tone::Warn => Style::new().fg(Color::Yellow),
         Tone::Bad => Style::new().fg(Color::Red),
+        Tone::Own => Style::new().fg(Color::Cyan),
     }
 }
 
@@ -933,6 +935,31 @@ mod tests {
         assert!(screen.contains(&format!("{at} you: read ✓✓")));
         let day = crate::ui::chat::local(t).unwrap().format("%a %-d %b").to_string();
         assert!(screen.contains(&format!("── {day} ──")), "a line for the day");
+    }
+
+    #[test]
+    fn a_peer_called_you_is_not_drawn_as_you() {
+        let mut state = busy_state();
+        let you = Seed::generate().code();
+        let mut known = state.known.clone();
+        known.push(person(you, "You", Standing::Contact));
+        state.set_people(known);
+        let t = 1_760_000_100_000;
+        state.chats.entry(you).or_default().messages = vec![
+            StoredMessage { id: "a".into(), sent_at: t, text: "theirs".into(), mark: Mark::Received },
+            StoredMessage { id: "b".into(), sent_at: t, text: "mine".into(), mark: Mark::Delivered },
+        ];
+        state.open_chat(you, true);
+        let label = state.label(&you);
+        assert!(label.starts_with("You·"), "{label}");
+        let buf = render(&state, 80, 24);
+        let all = screen(&buf);
+        assert!(all.contains(&format!("{label}: theirs")), "{all}");
+        let y_of = |text: &str| (0..24).find(|&y| row(&buf, y).contains(text)).unwrap();
+        let chat_x = areas((80, 24), 1).unwrap().chat.x;
+        let (mine, theirs) = (buf[(chat_x, y_of("you: mine"))].style(), buf[(chat_x, y_of("theirs"))].style());
+        assert_eq!(mine.fg, tone(Tone::Own).fg, "your own lines have their own style");
+        assert_ne!(theirs.fg, mine.fg);
     }
 
     #[test]

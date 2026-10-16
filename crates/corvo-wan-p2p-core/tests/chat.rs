@@ -30,6 +30,15 @@ async fn a_message_is_delivered_then_read() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_linked_peer_has_a_path_and_a_stranger_has_none() {
+    let lookup = MemoryLookup::new();
+    let (a, b) = friends(&lookup).await;
+    // Two apps on one machine reach each other straight away.
+    eventually(async || a.client.path(b.code).await.unwrap().is_some_and(|p| p.direct)).await;
+    assert_eq!(a.client.path(Seed::generate().code()).await.unwrap(), None);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn names_arrive_with_the_connection_and_when_changed() {
     let lookup = MemoryLookup::new();
     let (mut a, b) = friends(&lookup).await;

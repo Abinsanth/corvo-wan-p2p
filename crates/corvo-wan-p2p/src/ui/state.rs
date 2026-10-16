@@ -6,6 +6,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
+use corvo_wan_p2p_core::chat::PathInfo;
 use corvo_wan_p2p_core::identity::Code;
 use corvo_wan_p2p_core::names;
 use corvo_wan_p2p_core::store::{Person, Standing, StoredMessage};
@@ -27,6 +28,8 @@ pub const CORVO_LEN: usize = 500;
 pub const CHAT_LEN: usize = 500;
 /// How long a flash stays, in ticks (5 seconds).
 pub const FLASH_TICKS: u32 = 20;
+/// Ticks between asking how the open chat's connection goes (2 s).
+pub const PATH_TICKS: u32 = 8;
 /// Rows the mouse wheel scrolls per notch.
 pub const WHEEL_STEP: usize = 3;
 
@@ -511,6 +514,11 @@ pub struct State {
     pub can_copy: bool,
     /// A window over the main screen, while open.
     pub overlay: Option<Overlay>,
+    /// How the connection to someone went when last asked: the open chat's,
+    /// for the status bar.
+    pub path: Option<(Code, PathInfo)>,
+    /// Ticks so far, for things done every few of them.
+    pub ticks: u32,
 }
 
 impl State {
@@ -545,6 +553,8 @@ impl State {
             rows: RowCache::default(),
             can_copy: true,
             overlay: None,
+            path: None,
+            ticks: 0,
         }
     }
 

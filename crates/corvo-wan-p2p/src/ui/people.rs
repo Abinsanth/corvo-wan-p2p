@@ -4,7 +4,7 @@
 
 use corvo_wan_p2p_core::identity::Code;
 use corvo_wan_p2p_core::names;
-use corvo_wan_p2p_core::store::{Person, Standing};
+use corvo_wan_p2p_core::store::{Mark, Person, Standing};
 
 use super::account::Pending;
 use super::chat::day_and_time;
@@ -214,6 +214,7 @@ pub fn acted(state: &mut State, code: Code, act: Act, result: Result<(), String>
         }
         Act::Block => {
             state.close_chat(code);
+            drop_waiting(state, code);
             state.say(
                 Tone::Good,
                 format!("blocked {before}: they can't reach you, and you look offline to them. /unblock undoes it"),
@@ -228,6 +229,7 @@ pub fn acted(state: &mut State, code: Code, act: Act, result: Result<(), String>
                 state.chats.remove(&code);
                 state.say(Tone::Good, format!("removed {before} and your history with them"));
             } else {
+                drop_waiting(state, code);
                 state.say(Tone::Good, format!("removed {before}; your history with them is kept"));
             }
             state.refresh_sidebar();
@@ -289,6 +291,14 @@ pub fn named(state: &mut State, result: Result<String, String>) {
             state.name = name;
         }
         Err(why) => state.say(Tone::Bad, why),
+    }
+}
+
+/// Blocking or removing someone deletes what was waiting to go to them;
+/// the chat on screen drops it too.
+fn drop_waiting(state: &mut State, code: Code) {
+    if let Some(chat) = state.chats.get_mut(&code) {
+        chat.messages.retain(|m| m.mark != Mark::Waiting);
     }
 }
 
@@ -476,6 +486,22 @@ mod tests {
         assert!(!s.tabs.iter().any(|t| t.peer == Some(p.rahul)));
         assert!(s.on_corvo());
         assert!(last(&s).contains("blocked rahul"));
+    }
+
+    #[test]
+    fn blocking_or_removing_drops_their_waiting_messages() {
+        use corvo_wan_p2p_core::store::StoredMessage;
+        for (act, standing) in [(Act::Block, Some(Standing::Blocked)), (Act::Remove { history: false }, None)] {
+            let (mut s, p) = state();
+            let message = |id: &str, mark| StoredMessage { id: id.into(), sent_at: 1, text: "x".into(), mark };
+            let chat = s.chats.entry(p.rahul).or_default();
+            chat.messages = vec![message("in", Mark::Received), message("out", Mark::Waiting)];
+            let people = after(&s, p.rahul, standing);
+            done(&mut s, Outcome::Acted { code: p.rahul, act, result: Ok(()), people: Some(people) });
+            // The store deleted what was waiting to go to them.
+            let left: Vec<&str> = s.chats[&p.rahul].messages.iter().map(|m| m.id.as_str()).collect();
+            assert_eq!(left, ["in"], "{act:?}");
+        }
     }
 
     #[test]

@@ -261,3 +261,14 @@ fn absurd_settings_in_key_json_are_refused_quickly() {
         assert!(why.contains("out of range"), "{why}");
     }
 }
+
+#[test]
+fn a_garbage_store_db_is_reported_as_damaged() {
+    let dir = tempfile::tempdir().unwrap();
+    drop(new_account(dir.path()));
+    fs::write(dir.path().join(DB_FILE), "not a database at all, just some text that is long enough to look like one".repeat(4))
+        .unwrap();
+    let Err(StoreError::Damaged { file, why }) = Store::open(dir.path(), "first pass") else { panic!("expected damaged") };
+    assert!(file.ends_with(DB_FILE));
+    assert!(why.contains("isn't a corvo-wan-p2p database"), "{why}");
+}

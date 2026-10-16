@@ -18,7 +18,7 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, ErrorCode, OptionalExtension, params};
 use zeroize::Zeroizing;
 
 pub use crypt::KdfParams;
@@ -139,7 +139,13 @@ impl Store {
         let db_path = dir.join(DB_FILE);
         private_file().create(true).truncate(false).open(&db_path)?;
         let mut db = Connection::open(&db_path)?;
-        if schema::upgrade(&mut db)? == schema::Upgrade::TooNew {
+        let upgraded = schema::upgrade(&mut db).map_err(|e| match e.sqlite_error_code() {
+            Some(ErrorCode::NotADatabase | ErrorCode::DatabaseCorrupt) => {
+                StoreError::Damaged { file: db_path.clone(), why: "it isn't a corvo-wan-p2p database".into() }
+            }
+            _ => e.into(),
+        })?;
+        if upgraded == schema::Upgrade::TooNew {
             return Err(StoreError::TooNew(db_path));
         }
         let field_key = crypt::subkey(&data_key, FIELD_KEY_LABEL);

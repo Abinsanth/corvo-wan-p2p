@@ -353,7 +353,7 @@ fn draw_onboarding(frame: &mut Frame, state: &State, onboarding: &Onboarding, ar
     frame.render_widget(Paragraph::new(title).style(Style::new().add_modifier(Modifier::BOLD)), Rect::new(0, 0, w, 1));
     let body = Rect::new(1, 2, w - 2, h - 5);
     let plain = |text: &String| (text.clone(), Style::new());
-    let guidance: Vec<(String, Style)> = onboarding.guidance().iter().map(plain).collect();
+    let guidance: Vec<(String, Style)> = onboarding.guidance(state.can_copy).iter().map(plain).collect();
     let mut notes: Vec<(String, Style)> = onboarding.notes.iter().map(|n| (n.text.clone(), tone(n.tone))).collect();
     if !notes.is_empty() {
         notes.insert(0, (String::new(), Style::new()));

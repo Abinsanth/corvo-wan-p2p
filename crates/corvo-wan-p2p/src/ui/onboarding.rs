@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use corvo_wan_p2p_core::identity::{Code, PHRASE_WORDS, Seed, clean_name};
 use corvo_wan_p2p_core::store::StoreError;
 
+use super::clip::{MAYBE, NO_COPY};
 use super::state::{Ask, Editor, Line, Secret, Tone};
 use super::update::{Effect, Outcome};
 
@@ -104,8 +105,14 @@ impl Onboarding {
         Ask { label: label.into(), masked }
     }
 
-    /// What this step says above the input.
-    pub fn guidance(&self) -> Vec<String> {
+    /// At the code step, for tests.
+    #[cfg(test)]
+    pub fn at_code(code: Code, recovered: bool) -> Onboarding {
+        Onboarding { step: Step::Code { code, recovered }, notes: Vec::new() }
+    }
+
+    /// What this step says above the input; `can_copy` as in `State`.
+    pub fn guidance(&self, can_copy: bool) -> Vec<String> {
         let lines: &[&str] = match &self.step {
             Step::Unlock => &["Type your passphrase to unlock your account."],
             Step::ConfirmWipe => &[
@@ -144,12 +151,12 @@ impl Onboarding {
                 } else {
                     "Send it to friends any way you like: they add you with /add and your code."
                 };
-                return vec![
-                    "Your code, copied to the clipboard:".into(),
-                    code.to_string(),
-                    then.into(),
-                    "Press Enter to start.".into(),
-                ];
+                let copy = if can_copy {
+                    format!("Your code, sent to your clipboard {MAYBE}:")
+                } else {
+                    format!("Your code ({NO_COPY}: select it to copy it):")
+                };
+                return vec![copy, code.to_string(), then.into(), "Press Enter to start.".into()];
             }
             Step::Creating { .. } | Step::Starting => &[],
         };
@@ -433,7 +440,7 @@ mod tests {
     fn a_new_account_from_start_to_the_code() {
         let mut s = begin(false, false);
         assert_eq!(label(&s), "n or r: ");
-        assert!(onboarding(&s).guidance().iter().any(|l| l.contains("no account")));
+        assert!(onboarding(&s).guidance(true).iter().any(|l| l.contains("no account")));
         let seed = new_until_words(&mut s);
         assert_eq!(onboarding(&s).words().unwrap().len(), 12);
         let effects = type_back(&mut s, &seed);
@@ -455,7 +462,7 @@ mod tests {
         assert_eq!(effects, vec![Effect::Copy(seed.code().to_string())], "the code is copied");
         assert!(last_note(&s).text.contains("/home/ana/corvo-wan-p2p-recovery.txt"));
         assert!(last_note(&s).text.contains("delete"));
-        assert!(onboarding(&s).guidance().iter().any(|l| l.contains(&seed.code().to_string())));
+        assert!(onboarding(&s).guidance(true).iter().any(|l| l.contains(&seed.code().to_string())));
         assert_eq!(send(&mut s, ""), vec![Effect::Start]);
         assert_eq!(s.busy, Some("starting…"));
 
@@ -534,7 +541,7 @@ mod tests {
         done(&mut s, Outcome::Created(Ok(())));
         let path = PathBuf::from("/home/ana/corvo-wan-p2p-recovery.txt");
         assert!(done(&mut s, Outcome::RecoveryFile(Some(path))).is_empty());
-        assert!(onboarding(&s).guidance()[0].contains("/home/ana/corvo-wan-p2p-recovery.txt"));
+        assert!(onboarding(&s).guidance(true)[0].contains("/home/ana/corvo-wan-p2p-recovery.txt"));
         assert_eq!(label(&s), "replace it? y/n: ");
         assert!(send(&mut s, "what").is_empty());
         assert_eq!(label(&s), "replace it? y/n: ");
@@ -618,7 +625,7 @@ mod tests {
         );
         let effects = done(&mut s, Outcome::Created(Ok(())));
         assert_eq!(effects, vec![Effect::Copy(seed.code().to_string())], "no recovery file: you have the words");
-        assert!(onboarding(&s).guidance().iter().any(|l| l.contains("same as before")));
+        assert!(onboarding(&s).guidance(true).iter().any(|l| l.contains("same as before")));
         assert_eq!(send(&mut s, ""), vec![Effect::Start]);
     }
 
@@ -649,7 +656,7 @@ mod tests {
     fn recover_with_an_account_deletes_it_after_yes() {
         let mut s = begin(true, true);
         assert_eq!(label(&s), "type yes: ");
-        assert!(onboarding(&s).guidance()[0].contains("deletes"));
+        assert!(onboarding(&s).guidance(true)[0].contains("deletes"));
         assert_eq!(send(&mut s, " YES "), vec![Effect::Wipe]);
         assert_eq!(s.busy, Some("deleting…"));
         assert!(done(&mut s, Outcome::Wiped(Ok(()))).is_empty());

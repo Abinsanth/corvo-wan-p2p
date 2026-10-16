@@ -8,6 +8,7 @@ use corvo_wan_p2p_core::store::{Person, Standing};
 
 use super::account::Pending;
 use super::chat::day_and_time;
+use super::clip::{MAYBE, NO_COPY};
 use super::commands::Cmd;
 use super::state::{State, Tone};
 use super::update::Effect;
@@ -36,10 +37,14 @@ pub fn command(state: &mut State, cmd: Cmd, effects: &mut Vec<Effect>) {
             let Some(code) = state.code else { return };
             state.select_tab(0);
             state.say(Tone::Plain, format!("your code: {code}"));
+            let copy = if state.can_copy {
+                format!("sent to your clipboard, {MAYBE}.")
+            } else {
+                format!("{NO_COPY}: select it above to copy it.")
+            };
             state.say(
                 Tone::Plain,
-                "sent to your clipboard, if your terminal allows it. Send it to friends any way you like; \
-                 they add you with /add and your code.",
+                format!("{copy} Send it to friends any way you like; they add you with /add and your code."),
             );
             effects.push(Effect::Copy(code.to_string()));
         }

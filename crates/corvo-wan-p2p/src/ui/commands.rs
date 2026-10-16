@@ -72,7 +72,7 @@ pub const COMMANDS: &[&str] = &[
 
 /// What `/help` lists.
 pub const HELP: &[(&str, &str)] = &[
-    ("/code", "show your code and copy it (send it to friends any way you like)"),
+    ("/code", "show your code and send it to your clipboard, if your terminal allows it"),
     ("/add <code>", "add a friend by their code and open a chat"),
     ("/chat <name>", "open a chat (Tab completes names)"),
     ("/contacts", "your contacts, who's online, last seen"),
@@ -87,7 +87,7 @@ pub const HELP: &[(&str, &str)] = &[
     ("/passphrase", "change your history passphrase"),
     ("/phrase", "show your 12 recovery words again (asks your passphrase first)"),
     ("/phrase save", "write them to ~/corvo-wan-p2p-recovery.txt again"),
-    ("/phrase copy", "copy them to the clipboard"),
+    ("/phrase copy", "send them to your clipboard, if your terminal allows it"),
     ("/close", "close this chat tab"),
     ("/clear", "clear the screen (Ctrl-L)"),
     ("/update [yes]", "check for and install a newer version"),

@@ -5,6 +5,7 @@ use std::path::PathBuf;
 
 use corvo_wan_p2p_core::identity::Code;
 
+use super::clip::{MAYBE, NO_COPY};
 use super::commands::Cmd;
 use super::people::Act;
 use super::state::{Ask, Secret, State, Tone};
@@ -80,6 +81,10 @@ pub fn begin(state: &mut State, cmd: Cmd) {
             Pending::Passphrase(PhraseUse::Save { overwrite: false }),
             "type your passphrase to save your 12 words to the recovery file",
         ),
+        Cmd::PhraseCopy if !state.can_copy => {
+            state.select_tab(0);
+            return state.say(Tone::Bad, format!("{NO_COPY}: /phrase shows your words to write down instead"));
+        }
         Cmd::PhraseCopy => (Pending::Passphrase(PhraseUse::Copy), "type your passphrase to copy your 12 words"),
         _ => return,
     };
@@ -198,7 +203,10 @@ pub fn done(state: &mut State, outcome: Outcome) -> Vec<Effect> {
         Outcome::Phrase(Ok(PhraseDone::Shown(words))) => state.reveal = Some(words),
         Outcome::Phrase(Ok(PhraseDone::Copied)) => state.say(
             Tone::Good,
-            "copied your 12 words: paste them into a password manager, then copy something else over them",
+            format!(
+                "sent your 12 words to your clipboard, {MAYBE}: paste them into a password manager, \
+                 then copy something else over them"
+            ),
         ),
         Outcome::Phrase(Ok(PhraseDone::Saved(path))) => state.say(
             Tone::Good,
@@ -378,7 +386,7 @@ mod tests {
         assert_eq!(send(&mut s, "pw"), vec![Effect::Phrase { passphrase: secret("pw"), then: PhraseUse::Copy }]);
         done(&mut s, Outcome::Phrase(Ok(PhraseDone::Copied)));
         assert_eq!(last(&s).tone, Tone::Good);
-        assert!(last(&s).text.contains("copied"));
+        assert!(last(&s).text.contains("sent your 12 words to your clipboard"));
     }
 
     #[test]

@@ -224,7 +224,9 @@ async fn install_in(
         return Err("the new version doesn't run here; nothing changed".into());
     }
     // On disk before the swap, and the swap itself after it, in case the power goes.
-    std::fs::File::open(&new).and_then(|f| f.sync_all()).map_err(|e| e.to_string())?;
+    // Windows flushes only through a handle that can write.
+    let synced = std::fs::OpenOptions::new().write(true).open(&new).and_then(|f| f.sync_all());
+    synced.map_err(|e| format!("couldn't save the new version: {e}; nothing changed"))?;
     swap_in(&new, target).map_err(|e| cant_replace(target, &e.to_string()))?;
     #[cfg(unix)]
     if let Some(dir) = target.parent() {
@@ -237,11 +239,16 @@ async fn install_in(
 async fn prints_version(exe: &Path, version: &Version) -> bool {
     let run = tokio::process::Command::new(exe).arg("--version").kill_on_drop(true).output();
     match tokio::time::timeout(VERSION_WAIT, run).await {
-        Ok(Ok(out)) => {
-            out.status.success() && String::from_utf8_lossy(&out.stdout).trim() == format!("corvo-wan-p2p {version}")
-        }
+        Ok(Ok(out)) => out.status.success() && says_version(&String::from_utf8_lossy(&out.stdout), version),
         _ => false,
     }
+}
+
+/// Whether `--version` output says `corvo-wan-p2p <version>` on its first
+/// line. Only that start counts, so a later release can add to it.
+fn says_version(stdout: &str, version: &Version) -> bool {
+    let mut words = stdout.lines().next().unwrap_or_default().split_whitespace();
+    words.next() == Some("corvo-wan-p2p") && words.next() == Some(version.to_string().as_str())
 }
 
 /// Windows' own bsdtar reads zip; a GNU tar from Git for Windows on PATH doesn't.
@@ -391,6 +398,7 @@ pub mod testing {
         /// Prints `corvo-wan-p2p 9.0.0`, like the real one (a shell script, so Unix only).
         Works,
         /// Fails when run.
+        #[cfg_attr(not(unix), allow(dead_code))]
         Broken,
         /// The text `new`: for systems where it isn't run.
         Text,
@@ -610,6 +618,20 @@ mod tests {
         sweep_leftovers(bin.path());
         assert!(busy.exists(), "another update is using it");
         assert!(!done.exists() && !old.exists(), "left by updates that were cut short");
+    }
+
+    #[test]
+    fn the_new_version_counts_by_its_first_line() {
+        let version = v("9.0.0");
+        assert!(says_version("corvo-wan-p2p 9.0.0\n", &version));
+        assert!(
+            says_version("corvo-wan-p2p 9.0.0 (abc1234 2027-01-02)\nbuilt with love\n", &version),
+            "more can follow"
+        );
+        assert!(!says_version("corvo-wan-p2p 9.0.1\n", &version));
+        assert!(!says_version("corvo-wan-p2p 9.0.0-rc.1\n", &version));
+        assert!(!says_version("something-else 9.0.0\n", &version));
+        assert!(!says_version("", &version));
     }
 
     #[test]

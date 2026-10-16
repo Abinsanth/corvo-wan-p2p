@@ -274,7 +274,8 @@ pub fn read_open_chat(state: &mut State, effects: &mut Vec<Effect>) {
         && matches!(state.screen, Screen::Main)
         && areas(state.size, input_rows(state)).is_some()
         && !state.scroll.is_scrolled()
-        && state.reveal.is_none();
+        && state.reveal.is_none()
+        && state.overlay.is_none();
     if !visible {
         return;
     }
@@ -572,6 +573,9 @@ mod tests {
         s.reveal = Some(crate::ui::state::Secret::new("words".into()));
         assert!(!update(&mut s, received(rahul, "x2")).contains(&Effect::MarkRead(rahul)), "the words cover it");
         s.reveal = None;
+        s.overlay = Some(crate::ui::window::Overlay::Welcome { scroll: 0 });
+        assert!(!update(&mut s, received(rahul, "x2b")).contains(&Effect::MarkRead(rahul)), "the welcome covers it");
+        assert!(key(&mut s, KeyCode::Esc, KeyModifiers::NONE).contains(&Effect::MarkRead(rahul)), "closed");
         update(&mut s, Msg::Resize(30, 8));
         assert!(!update(&mut s, received(rahul, "x3")).contains(&Effect::MarkRead(rahul)), "too small to draw");
         assert!(update(&mut s, Msg::Resize(80, 24)).contains(&Effect::MarkRead(rahul)));

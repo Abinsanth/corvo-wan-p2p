@@ -86,18 +86,22 @@ pub fn input_rows(state: &State) -> usize {
     state.editor.rows().len().clamp(1, MAX_INPUT_ROWS)
 }
 
+/// One line of a tab and how long its head is: the bytes of `text` before
+/// a message's own text (its time and who sent it), 0 for other lines.
+pub type Shown = (Line, usize);
+
 /// What a tab shows, and the line its last `/clear` was at. A chat tab's
 /// lines come from its messages: a line for each new day, the time, who
 /// sent it and, for yours, its mark.
-pub fn tab_lines(state: &State, tab: &Tab) -> (Vec<Line>, usize) {
+pub fn tab_lines(state: &State, tab: &Tab) -> (Vec<Shown>, usize) {
     let Some(peer) = tab.peer else {
-        return (tab.lines.clone(), tab.cleared);
+        return (tab.lines.iter().map(|l| (l.clone(), 0)).collect(), tab.cleared);
     };
     let label = state.label(&peer);
     let mut lines = Vec::new();
     if state.standing(&peer) == Some(Standing::Request) {
         let text = format!("{label} isn't a contact yet: /accept adds them, /block stops them");
-        lines.push(Line { text, tone: Tone::Warn });
+        lines.push((Line { text, tone: Tone::Warn }, 0));
     }
     let messages = state.chats.get(&peer).map_or(&[][..], |c| &c.messages[..]);
     let mut clear_line = None;
@@ -110,20 +114,20 @@ pub fn tab_lines(state: &State, tab: &Tab) -> (Vec<Line>, usize) {
         let day = at.map(|t| t.date_naive());
         if day != last_day {
             let text = at.map_or_else(|| "── ? ──".into(), |t| format!("── {} ──", t.format("%a %-d %b")));
-            lines.push(Line { text, tone: Tone::Dim });
+            lines.push((Line { text, tone: Tone::Dim }, 0));
             last_day = day;
         }
         let time = at.map_or_else(|| "--:--".into(), |t| t.format("%H:%M").to_string());
         let (who, line_tone) = if m.mark.is_outgoing() { (YOU, Tone::Own) } else { (label.as_str(), Tone::Plain) };
-        // Later lines of a message start under its text's first column.
-        let text = m.text.replace('\n', &format!("\n{}", " ".repeat(time.len() + 1)));
         let mark = match m.mark {
             Mark::Waiting => " ·",
             Mark::Delivered => " ✓",
             Mark::Read => " ✓✓",
             Mark::Received => "",
         };
-        lines.push(Line { text: format!("{time} {who}: {text}{mark}"), tone: line_tone });
+        let head = format!("{time} {}: ", one_line(who));
+        let head_len = head.len();
+        lines.push((Line { text: format!("{head}{}{mark}", m.text), tone: line_tone }, head_len));
     }
     // Never cleared: everything shows, the request line too.
     let clear_line = if tab.cleared == 0 { 0 } else { clear_line.unwrap_or(lines.len()) };
@@ -135,16 +139,31 @@ pub fn chat_rows(state: &State, tab: &Tab, width: u16) -> (Vec<(String, Tone)>, 
     let (lines, cleared) = tab_lines(state, tab);
     let mut rows = Vec::new();
     let mut clear_row = None;
-    for (i, line) in lines.iter().enumerate() {
+    for (i, (line, head)) in lines.iter().enumerate() {
         if i == cleared {
             clear_row = Some(rows.len());
         }
-        for piece in line.text.split('\n') {
-            rows.extend(wrap(&clean(piece), width.into()).into_iter().map(|r| (r, line.tone)));
-        }
+        rows.extend(line_rows(&line.text, *head, width.into()).into_iter().map(|r| (r, line.tone)));
     }
     let clear_row = clear_row.unwrap_or(rows.len());
     (rows, clear_row)
+}
+
+/// One line's rows at `width`. After its first `head` bytes, the text wraps
+/// with a hanging indent, so every row of it starts under its first column;
+/// not when the head takes more than half the width.
+fn line_rows(text: &str, head: usize, width: usize) -> Vec<String> {
+    let indent = text.get(..head).map_or(0, |h| h.width());
+    let (lead, body, indent) =
+        if head > 0 && indent * 2 <= width { (&text[..head], &text[head..], indent) } else { ("", text, 0) };
+    let mut rows = Vec::new();
+    for piece in body.split('\n') {
+        for row in wrap(&clean(piece), width - indent) {
+            let before = if rows.is_empty() { lead.to_string() } else { " ".repeat(indent) };
+            rows.push(format!("{before}{row}"));
+        }
+    }
+    rows
 }
 
 /// (rows to scroll through, rows visible) in the chat area. After a `/clear`
@@ -960,6 +979,31 @@ mod tests {
         let (mine, theirs) = (buf[(chat_x, y_of("you: mine"))].style(), buf[(chat_x, y_of("theirs"))].style());
         assert_eq!(mine.fg, tone(Tone::Own).fg, "your own lines have their own style");
         assert_ne!(theirs.fg, mine.fg);
+    }
+
+    #[test]
+    fn continuation_rows_line_up_under_the_text() {
+        let mut state = busy_state();
+        let rahul = rahul(&state);
+        let long = "word ".repeat(30);
+        state.chats.get_mut(&rahul).unwrap().messages =
+            vec![received(1, "first line\nsecond line"), received(2, long.trim_end())];
+        state.select_tab(1);
+        let buf = render(&state, 80, 24);
+        let rows: Vec<String> = (0..24).map(|y| row(&buf, y)).collect();
+        let column = |r: &str, text: &str| r.find(text).map(|at| r[..at].chars().count());
+        let first = rows.iter().find(|r| r.contains("first line")).unwrap();
+        let text_at = column(first, "first line").unwrap();
+        assert!(first.contains("rahul: first line"));
+        let second = rows.iter().find(|r| r.contains("second line")).unwrap();
+        assert_eq!(column(second, "second line"), Some(text_at), "after a line break:\n{}", rows.join("\n"));
+        let wrapped: Vec<&String> = rows.iter().filter(|r| r.contains("word")).collect();
+        assert!(wrapped.len() >= 3, "the long one wraps");
+        for r in &wrapped[1..] {
+            assert_eq!(column(r, "word"), Some(text_at), "after a wrap:\n{}", rows.join("\n"));
+        }
+        let words: usize = wrapped.iter().map(|r| r.matches("word").count()).sum();
+        assert_eq!(words, 30, "nothing is lost");
     }
 
     #[test]

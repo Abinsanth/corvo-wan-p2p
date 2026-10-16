@@ -15,7 +15,7 @@ use zeroize::Zeroizing;
 
 use super::account::{self, PhraseDone, PhraseUse};
 use super::chat::{self, Loaded};
-use super::commands::{Cmd, HELP, Input, KEYS, parse};
+use super::commands::{Cmd, HELP, Input, KEYS, may_hold_a_secret, parse};
 use super::complete;
 use super::people::{self, Act, Show};
 use super::state::{Screen, Secret, State, Tone, WHEEL_STEP};
@@ -436,7 +436,10 @@ fn on_key(state: &mut State, action: Action, effects: &mut Vec<Effect>) {
             } else if asking {
                 effects.extend(account::answer(state, Secret::new(line)));
             } else {
-                state.history.push(&line);
+                let line = Zeroizing::new(line);
+                if !may_hold_a_secret(&line) {
+                    state.history.push(&line);
+                }
                 on_line(state, &line, effects);
             }
         }
@@ -827,6 +830,29 @@ mod tests {
         update(&mut s, Msg::Core(Event::Problem("the store is full".into())));
         assert_eq!(last_corvo(&s).text, "the store is full");
         assert_eq!(last_corvo(&s).tone, Tone::Bad);
+    }
+
+    #[test]
+    fn a_passphrase_typed_after_the_command_is_not_kept() {
+        let mut s = state();
+        send(&mut s, "/help");
+        for line in
+            ["/passphrase old-secret new-secret", "/PASSPHRASE old-secret", "  /phrase hunter2", "/phrase  copy now"]
+        {
+            send(&mut s, line);
+            assert!(!last_corvo(&s).text.contains("secret") && !last_corvo(&s).text.contains("hunter2"));
+        }
+        assert_eq!(s.ask(), None, "nothing is asked");
+        assert!(s.tabs[0].lines.iter().any(|l| l.text == "type /passphrase alone; it asks for them hidden"));
+        assert_eq!(
+            last_corvo(&s).text,
+            "type /phrase alone, or /phrase save or /phrase copy; it asks for your passphrase hidden"
+        );
+        let mut kept = Vec::new();
+        while let Some(entry) = s.history.prev("") {
+            kept.push(entry);
+        }
+        assert_eq!(kept, vec!["/help"], "only the line without a passphrase in it");
     }
 
     #[test]

@@ -124,7 +124,8 @@ pub fn parse(line: &str) -> Input {
         "contacts" => no_args(args, "contacts", Cmd::Contacts),
         "requests" => no_args(args, "requests", Cmd::Requests),
         "blocked" => no_args(args, "blocked", Cmd::Blocked),
-        "passphrase" => no_args(args, "passphrase", Cmd::Passphrase),
+        "passphrase" if args.is_empty() => Ok(Cmd::Passphrase),
+        "passphrase" => Err("type /passphrase alone; it asks for them hidden".into()),
         "close" => no_args(args, "close", Cmd::Close),
         "clear" => no_args(args, "clear", Cmd::Clear),
         "help" | "h" => no_args(args, "help", Cmd::Help),
@@ -143,7 +144,7 @@ pub fn parse(line: &str) -> Input {
             [] => Ok(Cmd::Phrase),
             ["save"] => Ok(Cmd::PhraseSave),
             ["copy"] => Ok(Cmd::PhraseCopy),
-            _ => Err("try: /phrase, /phrase save or /phrase copy".into()),
+            _ => Err("type /phrase alone, or /phrase save or /phrase copy; it asks for your passphrase hidden".into()),
         },
         "update" => match words.as_slice() {
             [] => Ok(Cmd::Update { yes: false }),
@@ -155,6 +156,19 @@ pub fn parse(line: &str) -> Input {
     match cmd {
         Ok(cmd) => Input::Cmd(cmd),
         Err(why) => Input::Wrong(why),
+    }
+}
+
+/// Whether `line` may hold a passphrase: `/passphrase` or `/phrase` with
+/// more after it than they take. Such a line isn't kept in the input history.
+pub fn may_hold_a_secret(line: &str) -> bool {
+    let Some(rest) = line.trim().strip_prefix('/') else { return false };
+    let (name, args) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+    let words: Vec<&str> = args.split_whitespace().collect();
+    match name.to_lowercase().as_str() {
+        "passphrase" => !words.is_empty(),
+        "phrase" => !matches!(words.as_slice(), [] | ["save"] | ["copy"]),
+        _ => false,
     }
 }
 
@@ -296,7 +310,7 @@ mod tests {
             ("/contacts all", "try: /contacts"),
             ("/requests x", "try: /requests"),
             ("/blocked x", "try: /blocked"),
-            ("/passphrase new", "try: /passphrase"),
+            ("/passphrase new", "type /passphrase alone; it asks for them hidden"),
             ("/close bob", "try: /close"),
             ("/clear all", "try: /clear"),
             ("/help me", "try: /help"),
@@ -358,8 +372,9 @@ mod tests {
     fn phrase_and_update_take_a_fixed_word() {
         assert_eq!(cmd("/phrase save"), Cmd::PhraseSave);
         assert_eq!(cmd("/phrase copy"), Cmd::PhraseCopy);
-        assert_eq!(wrong("/phrase print"), "try: /phrase, /phrase save or /phrase copy");
-        assert_eq!(wrong("/phrase save now"), "try: /phrase, /phrase save or /phrase copy");
+        let alone = "type /phrase alone, or /phrase save or /phrase copy; it asks for your passphrase hidden";
+        assert_eq!(wrong("/phrase print"), alone);
+        assert_eq!(wrong("/phrase save now"), alone);
         assert_eq!(cmd("/update"), Cmd::Update { yes: false });
         assert_eq!(cmd("/update yes"), Cmd::Update { yes: true });
         assert_eq!(cmd("/update y"), Cmd::Update { yes: true });

@@ -182,11 +182,16 @@ pub fn loaded(state: &mut State, result: Result<Loaded, String>) {
 pub fn loaded_older(state: &mut State, peer: Code, result: Result<(Vec<StoredMessage>, usize), String>) {
     let Some(chat) = state.chats.get_mut(&peer) else { return };
     chat.loading = false;
+    // Not asked for again when it fails or nothing in it can be read: the
+    // view would still be at the top, and it would ask again at once, forever.
     let (page, unreadable) = match result {
         Ok(page) => page,
-        Err(why) => return state.say(Tone::Bad, format!("couldn't read older messages: {why}")),
+        Err(why) => {
+            chat.older = false;
+            return state.say(Tone::Bad, format!("couldn't read older messages: {why}"));
+        }
     };
-    chat.older = page.len() + unreadable >= OLDER_PAGE;
+    chat.older = !page.is_empty() && page.len() + unreadable >= OLDER_PAGE;
     let added = page.len();
     let open = state.open_peer() == Some(peer);
     let before = if open { chat_page(state).0 } else { 0 };
@@ -640,6 +645,29 @@ mod tests {
         key(&mut s, KeyCode::Esc, KeyModifiers::NONE);
         assert_eq!(ids(&s).len(), CHAT_LEN, "back at the end, the oldest go again");
         assert_eq!(ids(&s).last().unwrap(), "n9");
+    }
+
+    #[test]
+    fn a_failed_or_unreadable_older_page_is_not_asked_for_again() {
+        let failed: Result<(Vec<StoredMessage>, usize), String> = Err("the store is busy".into());
+        for result in [failed, Ok((Vec::new(), OLDER_PAGE))] {
+            let (mut s, rahul, _) = state();
+            s.size = (80, 24);
+            let people = s.known.clone();
+            let messages: Vec<_> = (0..CHAT_LEN).map(|i| message(&format!("m{i:04}"), "x", Mark::Read)).collect();
+            let chats = vec![History { code: rahul, messages, read_upto: None, unreadable: 0 }];
+            update(&mut s, Msg::Done(Outcome::Loaded(Ok(Loaded { people, chats, unreadable_people: 0 }))));
+            s.open_chat(rahul, true);
+            let asks = |effects: &[Effect]| effects.iter().any(|e| matches!(e, Effect::LoadOlder { .. }));
+            let mut asked = false;
+            for _ in 0..CHAT_LEN {
+                asked |= asks(&key(&mut s, KeyCode::PageUp, KeyModifiers::NONE));
+            }
+            assert!(asked);
+            let effects = update(&mut s, Msg::Done(Outcome::LoadedOlder { peer: rahul, result }));
+            assert!(!asks(&effects), "not asked again at once: the loop would never read a key");
+            assert!(!asks(&key(&mut s, KeyCode::PageUp, KeyModifiers::NONE)));
+        }
     }
 
     #[test]

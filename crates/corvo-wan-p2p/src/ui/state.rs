@@ -12,6 +12,7 @@ use corvo_wan_p2p_core::store::{Person, Standing, StoredMessage};
 use zeroize::Zeroizing;
 
 use super::account::Pending;
+use super::commands::may_hold_a_secret;
 use super::onboarding::Onboarding;
 
 pub const APP: &str = "corvo-wan-p2p";
@@ -283,7 +284,8 @@ impl History {
         let at = match self.at {
             None if self.entries.is_empty() => return None,
             None => {
-                self.draft = current.to_string();
+                // A line with a passphrase in it isn't kept, even as the draft.
+                self.draft = if may_hold_a_secret(current) { String::new() } else { current.to_string() };
                 self.entries.len() - 1
             }
             Some(0) => return None,

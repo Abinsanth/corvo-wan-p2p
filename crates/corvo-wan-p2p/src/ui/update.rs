@@ -854,6 +854,17 @@ mod tests {
     }
 
     #[test]
+    fn an_unsent_passphrase_line_is_not_kept_as_a_draft() {
+        let mut s = state();
+        send(&mut s, "/help");
+        type_text(&mut s, "/passphrase old-secret new-secret");
+        press(&mut s, KeyCode::Up);
+        assert_eq!(s.editor.text(), "/help");
+        press(&mut s, KeyCode::Down);
+        assert_eq!(s.editor.text(), "", "the line with a passphrase in it wasn't kept");
+    }
+
+    #[test]
     fn editor_does_not_reallocate_while_typing_an_answer() {
         let mut s = state();
         send(&mut s, "/passphrase");

@@ -191,7 +191,12 @@ impl Onboarding {
     pub fn answer(&mut self, text: Secret, editor: &mut Editor) -> Vec<Effect> {
         self.notes.clear();
         let mut effects = Vec::new();
-        let typed = lowered(&text);
+        // Only answers that are compared: never a passphrase.
+        let compared = matches!(
+            self.step,
+            Step::ConfirmWipe | Step::Choose | Step::Words | Step::TypeBack { .. } | Step::Replace { .. }
+        );
+        let typed = if compared { lowered(&text) } else { Zeroizing::default() };
         let typed = typed.as_str();
         let step = std::mem::replace(&mut self.step, Step::Starting);
         self.step = match step {
@@ -360,9 +365,17 @@ impl Onboarding {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// How many answers were lower-cased, for tests.
+    static LOWERED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// An answer trimmed and in lower case, for comparing; wiped after use,
 /// since it may be a passphrase.
 pub fn lowered(text: &Secret) -> Zeroizing<String> {
+    #[cfg(test)]
+    LOWERED.with(|l| l.set(l.get() + 1));
     Zeroizing::new(text.expose().trim().to_lowercase())
 }
 
@@ -443,6 +456,19 @@ mod tests {
         let second = onboarding(state).asked_word().expect("a second word is asked");
         assert!(second > first, "two different words, in order");
         send(state, &seed.words()[second - 1].to_uppercase())
+    }
+
+    #[test]
+    fn a_passphrase_is_never_lowercased() {
+        let mut s = State::onboarding(Onboarding::start(false, false));
+        send(&mut s, "n");
+        send(&mut s, "ana");
+        let before = LOWERED.with(|l| l.get());
+        send(&mut s, "Pass-Word");
+        send(&mut s, "Pass-Word");
+        let mut s = State::onboarding(Onboarding::start(true, false));
+        send(&mut s, "Pass-Word");
+        assert_eq!(LOWERED.with(|l| l.get()), before, "no lower-case copy of a passphrase");
     }
 
     #[test]

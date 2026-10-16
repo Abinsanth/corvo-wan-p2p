@@ -11,11 +11,6 @@ use super::state::{APP, CHAT_LEN, Chat, Screen, State, Tone};
 use super::update::Effect;
 use super::view::{areas, chat_page, input_rows};
 
-/// Wait this long (10 seconds of ticks) for the first connection before
-/// saying "offline": the engine reports offline at start, before its relay
-/// has had a chance to answer.
-pub const CONNECTING_TICKS: u32 = 40;
-
 /// How many older messages to load at a time.
 pub const OLDER_PAGE: usize = 100;
 
@@ -99,23 +94,24 @@ pub fn on_event(state: &mut State, event: Event) {
                 state.set_people(people);
             }
         }
+        // Once per person and version: the engine doesn't repeat it.
         Event::VersionMismatch { peer, theirs } => {
             let label = state.label(&peer);
+            let (app, todo) = if theirs > PROTO_VERSION {
+                ("newer", "/update to talk to them")
+            } else {
+                ("older", "they need to update")
+            };
             state.say(
                 Tone::Warn,
                 format!(
-                    "{label}'s app speaks version {theirs} of the protocol and yours speaks {PROTO_VERSION}: \
-                     whoever has the older app should /update. Messages wait until then."
+                    "{label}'s app is {app} (protocol {theirs}, yours {PROTO_VERSION}): {todo}. \
+                     Your messages to them wait until then."
                 ),
             );
         }
-        Event::Network { online: true } => state.online = Some(true),
-        // Before the first connection, `tick` decides when it's really offline.
-        Event::Network { online: false } => {
-            if state.online.is_some() {
-                state.online = Some(false);
-            }
-        }
+        // The engine waits for its relay before a first "offline".
+        Event::Network { online } => state.online = Some(online),
         Event::Problem(text) => state.say(Tone::Bad, text),
     }
 }
@@ -263,14 +259,6 @@ pub fn local(ms: i64) -> Option<DateTime<Local>> {
 /// A day and time, like `Thu 15 Oct 14:02`.
 pub fn day_and_time(ms: i64) -> String {
     local(ms).map_or_else(|| "--".into(), |t| t.format("%a %-d %b %H:%M").to_string())
-}
-
-/// Four times a second.
-pub fn tick(state: &mut State) {
-    state.since_start = state.since_start.saturating_add(1);
-    if state.online.is_none() && state.since_start >= CONNECTING_TICKS {
-        state.online = Some(false);
-    }
 }
 
 /// Marks the open chat read when its newest messages are on screen: the
@@ -440,19 +428,18 @@ mod tests {
     }
 
     #[test]
-    fn offline_is_only_said_after_waiting_for_a_first_connection() {
+    fn the_status_is_connecting_until_the_engine_says() {
         let (mut s, _, _) = state();
-        update(&mut s, Msg::Core(Event::Network { online: false }));
-        for _ in 1..CONNECTING_TICKS {
+        for _ in 0..200 {
             update(&mut s, Msg::Tick);
         }
-        assert_eq!(s.online, None, "still connecting");
-        update(&mut s, Msg::Tick);
+        assert_eq!(s.online, None, "the engine decides when it's offline, after its own wait");
+        update(&mut s, Msg::Core(Event::Network { online: false }));
         assert_eq!(s.online, Some(false));
         update(&mut s, Msg::Core(Event::Network { online: true }));
         assert_eq!(s.online, Some(true));
         update(&mut s, Msg::Core(Event::Network { online: false }));
-        assert_eq!(s.online, Some(false), "once online, offline shows at once");
+        assert_eq!(s.online, Some(false));
     }
 
     #[test]
@@ -480,6 +467,21 @@ mod tests {
         update(&mut s, Msg::Core(Event::VersionMismatch { peer: rahul, theirs: 2 }));
         assert!(last_corvo(&s).contains("rahul k"));
         assert!(last_corvo(&s).contains("/update"));
+    }
+
+    #[test]
+    fn the_version_mismatch_line_says_who_should_update() {
+        let (mut s, rahul, _) = state();
+        update(&mut s, Msg::Core(Event::VersionMismatch { peer: rahul, theirs: PROTO_VERSION + 1 }));
+        let newer = last_corvo(&s);
+        assert!(newer.contains("newer") && newer.contains("/update"), "{newer}");
+        update(&mut s, Msg::Core(Event::VersionMismatch { peer: rahul, theirs: PROTO_VERSION - 1 }));
+        let older = last_corvo(&s);
+        assert!(older.contains("older") && older.contains("they need to update"), "{older}");
+        assert!(!older.contains("/update"), "nothing for you to do: {older}");
+        for line in [newer, older] {
+            assert!(line.contains("wait"), "messages wait: {line}");
+        }
     }
 
     #[test]
@@ -543,9 +545,7 @@ mod tests {
     #[test]
     fn a_slow_unlock_still_starts_as_connecting() {
         let mut s = State::onboarding(crate::ui::onboarding::Onboarding::start(true, false));
-        for _ in 0..CONNECTING_TICKS + 5 {
-            update(&mut s, Msg::Tick);
-        }
+        s.online = Some(false);
         let code = Seed::generate().code();
         update(&mut s, Msg::Done(Outcome::Started { name: "ana".into(), code, recovery_file: None }));
         assert_eq!(s.online, None, "the wait starts once the engine does");

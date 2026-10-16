@@ -493,8 +493,6 @@ pub struct State {
     pub chats: HashMap<Code, Chat>,
     /// Whether the window has focus: messages are only marked read while it does.
     pub focused: bool,
-    /// Ticks since the engine started, to wait a little before saying "offline".
-    pub since_start: u32,
     /// The completion list, while open.
     pub popup: Option<Popup>,
     /// The sidebar's first row shown, when it has more than fit.
@@ -534,7 +532,6 @@ impl State {
             connected: HashSet::new(),
             chats: HashMap::new(),
             focused: true,
-            since_start: 0,
             popup: None,
             sidebar_top: 0,
             sidebar_for: None,

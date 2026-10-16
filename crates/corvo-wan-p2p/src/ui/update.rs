@@ -297,7 +297,6 @@ pub fn update(state: &mut State, msg: Msg) -> Vec<Effect> {
         }
         Msg::Focus(focused) => state.focused = focused,
         Msg::Tick => {
-            chat::tick(state);
             if let Some(flash) = &mut state.flash {
                 flash.ticks_left = flash.ticks_left.saturating_sub(1);
                 if flash.ticks_left == 0 {
@@ -536,8 +535,7 @@ fn on_done(state: &mut State, outcome: Outcome, effects: &mut Vec<Effect>) {
             state.code = Some(code);
             state.say(Tone::Good, format!("welcome, {name}. Your code is {code}"));
             state.name = name;
-            // The wait for a first connection starts now, not during onboarding.
-            state.since_start = 0;
+            // "connecting" until the engine says.
             state.online = None;
             effects.push(Effect::Load);
             if let Some(path) = recovery_file {

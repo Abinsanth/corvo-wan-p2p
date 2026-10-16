@@ -216,14 +216,14 @@ impl<W: Write> Runner<W> {
     /// Everyone, and the chats with contacts and requests.
     async fn load(&self) -> Result<Loaded, ChatError> {
         let client = self.client.as_ref().ok_or(ChatError::Stopped)?;
-        let people = client.people().await?;
+        let (people, unreadable_people) = client.people_checked().await?;
         let mut chats = Vec::new();
         for p in people.iter().filter(|p| p.standing != Standing::Blocked) {
-            let messages = client.history(p.code).await?;
+            let (messages, unreadable) = client.history_checked(p.code).await?;
             let read_upto = client.read_upto(p.code).await?;
-            chats.push(History { code: p.code, messages, read_upto });
+            chats.push(History { code: p.code, messages, read_upto, unreadable });
         }
-        Ok(Loaded { people, chats })
+        Ok(Loaded { people, chats, unreadable_people })
     }
 
     async fn act(&self, code: Code, act: Act) -> Result<(), String> {

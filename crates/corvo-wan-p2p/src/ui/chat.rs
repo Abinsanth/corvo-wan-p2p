@@ -21,6 +21,8 @@ pub const CONNECTING_TICKS: u32 = 40;
 pub struct Loaded {
     pub people: Vec<Person>,
     pub chats: Vec<History>,
+    /// People whose saved details couldn't be read (a damaged store).
+    pub unreadable_people: usize,
 }
 
 /// One conversation as stored, and the newest of their messages you've read.
@@ -29,6 +31,8 @@ pub struct History {
     pub code: Code,
     pub messages: Vec<StoredMessage>,
     pub read_upto: Option<String>,
+    /// Messages that couldn't be read (a damaged store); the rest are here.
+    pub unreadable: usize,
 }
 
 pub fn on_event(state: &mut State, event: Event) {
@@ -145,12 +149,27 @@ pub fn sent(state: &mut State, to: Code, text: String, result: Result<StoredMess
 
 pub fn loaded(state: &mut State, result: Result<Loaded, String>) {
     match result {
-        Ok(Loaded { people, chats }) => {
-            for History { code, messages, read_upto } in chats {
+        Ok(Loaded { people, chats, unreadable_people }) => {
+            let mut damaged = Vec::new();
+            for History { code, messages, read_upto, unreadable } in chats {
                 let unread = unread_after(&messages, read_upto.as_deref());
                 state.chats.insert(code, Chat { messages, unread });
+                if unreadable > 0 {
+                    damaged.push((unreadable, code));
+                }
             }
             state.set_people(people);
+            const DAMAGED: &str = "couldn't be read: that part of your saved chats is damaged. The rest is fine.";
+            for (n, code) in damaged {
+                let messages = if n == 1 { "message" } else { "messages" };
+                let label = state.label(&code);
+                state.say(Tone::Warn, format!("{n} {messages} with {label} {DAMAGED}"));
+            }
+            if unreadable_people > 0 {
+                let n = unreadable_people;
+                let who = if n == 1 { "person you know" } else { "people you know" };
+                state.say(Tone::Warn, format!("{n} {who} {DAMAGED}"));
+            }
         }
         Err(why) => state.say(Tone::Bad, format!("couldn't read your chats: {why}")),
     }
@@ -399,10 +418,10 @@ mod tests {
             message("04", "c", Mark::Received),
         ];
         let chats = vec![
-            History { code: rahul, messages: history.clone(), read_upto: Some("02".into()) },
-            History { code: bob, messages: history, read_upto: None },
+            History { code: rahul, messages: history.clone(), read_upto: Some("02".into()), unreadable: 0 },
+            History { code: bob, messages: history, read_upto: None, unreadable: 0 },
         ];
-        update(&mut s, Msg::Done(Outcome::Loaded(Ok(Loaded { people, chats }))));
+        update(&mut s, Msg::Done(Outcome::Loaded(Ok(Loaded { people, chats, unreadable_people: 0 }))));
         assert_eq!(s.chats[&rahul].unread, 1);
         assert_eq!(s.chats[&bob].unread, 3);
         assert_eq!(s.title, format!("(4) {APP}"));
@@ -453,10 +472,29 @@ mod tests {
     fn a_message_already_loaded_is_not_counted_twice() {
         let (mut s, rahul, _) = state();
         let people = s.known.clone();
-        let chats = vec![History { code: rahul, messages: vec![message("01", "a", Mark::Received)], read_upto: None }];
-        update(&mut s, Msg::Done(Outcome::Loaded(Ok(Loaded { people, chats }))));
+        let chats = vec![History {
+            code: rahul,
+            messages: vec![message("01", "a", Mark::Received)],
+            read_upto: None,
+            unreadable: 0,
+        }];
+        update(&mut s, Msg::Done(Outcome::Loaded(Ok(Loaded { people, chats, unreadable_people: 0 }))));
         update(&mut s, received(rahul, "01"));
         assert_eq!(s.chats[&rahul].messages.len(), 1);
         assert_eq!(s.chats[&rahul].unread, 1);
+    }
+
+    #[test]
+    fn unreadable_rows_are_mentioned_and_the_rest_is_shown() {
+        let (mut s, rahul, _) = state();
+        let people = s.known.clone();
+        let messages = vec![message("01", "a", Mark::Received)];
+        let chats = vec![History { code: rahul, messages, read_upto: None, unreadable: 2 }];
+        update(&mut s, Msg::Done(Outcome::Loaded(Ok(Loaded { people, chats, unreadable_people: 1 }))));
+        assert_eq!(s.chats[&rahul].messages.len(), 1);
+        assert_eq!(s.known.len(), 2);
+        let said: Vec<&str> = s.tabs[0].lines.iter().map(|l| l.text.as_str()).collect();
+        assert!(said.iter().any(|l| l.starts_with("2 messages with rahul couldn't be read")), "{said:?}");
+        assert!(said.iter().any(|l| l.starts_with("1 person you know couldn't be read")), "{said:?}");
     }
 }

@@ -5,7 +5,7 @@
 use iroh_base::PublicKey;
 use rusqlite::{OptionalExtension, params};
 
-use super::{Store, StoreError, crypt};
+use super::{Store, StoreError, crypt, readable};
 use crate::identity::Code;
 
 /// Where someone stands with you.
@@ -213,15 +213,23 @@ impl Store {
         Ok(n as usize)
     }
 
-    /// Everyone you know of, in the order you first knew of them.
+    /// Everyone you know of who can be read, in the order you first knew of them.
     pub fn people(&self) -> Result<Vec<Person>, StoreError> {
+        Ok(self.people_checked()?.0)
+    }
+
+    /// [`Store::people`], and how many people couldn't be read (damaged).
+    pub fn people_checked(&self) -> Result<(Vec<Person>, usize), StoreError> {
         let mut query = self.db.prepare(&format!("SELECT {COLUMNS} FROM contacts ORDER BY rowid"))?;
         let rows = query.query_map([], row)?;
-        let mut people = Vec::new();
+        let (mut people, mut damaged) = (Vec::new(), 0);
         for r in rows {
-            people.push(self.person_from_row(r?)?);
+            match readable(self.person_from_row(r?))? {
+                Some(person) => people.push(person),
+                None => damaged += 1,
+            }
         }
-        Ok(people)
+        Ok((people, damaged))
     }
 
     /// Your contacts, in the order you added them.

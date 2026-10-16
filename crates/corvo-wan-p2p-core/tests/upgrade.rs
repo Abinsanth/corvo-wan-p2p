@@ -65,7 +65,8 @@ fn write_rc2_fixture() {
     let meera_tag: Vec<u8> = {
         let s = Store::open(dir, PASSPHRASE).unwrap();
         let first = s.people().unwrap().iter().position(|p| p.code == meera()).unwrap();
-        db.query_row("SELECT peer FROM contacts ORDER BY rowid LIMIT 1 OFFSET ?1", [first as i64], |r| r.get(0)).unwrap()
+        db.query_row("SELECT peer FROM contacts ORDER BY rowid LIMIT 1 OFFSET ?1", [first as i64], |r| r.get(0))
+            .unwrap()
     };
     db.execute("UPDATE contacts SET standing = NULL WHERE peer = ?1", [meera_tag]).unwrap();
     fs::remove_file(dir.join("lock")).unwrap();
@@ -114,7 +115,8 @@ fn an_rc2_store_upgrades_with_nothing_lost() {
         assert_eq!(s.request_messages(&stranger()).unwrap(), 1);
         drop(s);
         let db = rusqlite::Connection::open(dir.path().join(DB_FILE)).unwrap();
-        let missing: i64 = db.query_row("SELECT COUNT(*) FROM contacts WHERE standing IS NULL", [], |r| r.get(0)).unwrap();
+        let missing: i64 =
+            db.query_row("SELECT COUNT(*) FROM contacts WHERE standing IS NULL", [], |r| r.get(0)).unwrap();
         assert_eq!(missing, 0, "every standing is sealed now");
         let version: i64 = db.pragma_query_value(None, "user_version", |r| r.get(0)).unwrap();
         assert_eq!(version, 5);

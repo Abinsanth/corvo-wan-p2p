@@ -235,6 +235,16 @@ impl Store {
     }
 }
 
+/// A row's value, or `None` if the row is damaged: one unreadable row
+/// shouldn't hide the rest. Other errors (the database itself failing) stay errors.
+fn readable<T>(read: Result<T, StoreError>) -> Result<Option<T>, StoreError> {
+    match read {
+        Ok(value) => Ok(Some(value)),
+        Err(StoreError::Damaged { .. }) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
 /// Associated data for a value in one row: the column name, then each part of
 /// the row's key, each preceded by its length.
 fn row_aad(column: &[u8], row: &[&[u8]]) -> Vec<u8> {

@@ -181,11 +181,6 @@ fn spelled(groups: &[u8]) -> String {
     groups.iter().map(|&g| char::from(ALPHABET.as_bytes()[usize::from(g)])).collect()
 }
 
-/// Whether `c` is one of the 32 characters codes are written in.
-pub fn is_code_char(c: char) -> bool {
-    char_value(c).is_some()
-}
-
 fn char_value(c: char) -> Option<u8> {
     ALPHABET.find(c).and_then(|i| u8::try_from(i).ok())
 }

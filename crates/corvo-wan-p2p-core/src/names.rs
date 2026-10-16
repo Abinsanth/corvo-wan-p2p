@@ -7,11 +7,12 @@
 //! and Greek letters that pass for Latin ones, so a request from "Rаhul" (with
 //! a Cyrillic а) can't pass for your contact rahul.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use unicode_normalization::UnicodeNormalization;
+use unicode_normalization::char::is_combining_mark;
 
-use crate::identity::{CODE_PREFIX, Code, KEY_CHARS, is_code_char};
+use crate::identity::{CODE_PREFIX, Code, KEY_CHARS};
 use crate::store::Person;
 
 /// Between a name and the start of the code in a label.
@@ -24,7 +25,9 @@ const TAIL: usize = 4;
 /// their code.
 pub fn labels(people: &[Person]) -> HashMap<Code, String> {
     // How much of each person's code their label shows; 0 means just the name.
-    let mut tails: Vec<usize> = people.iter().map(|p| if looks_like_a_label(&p.name) { TAIL } else { 0 }).collect();
+    let names = name_skeletons(people);
+    let mut tails: Vec<usize> =
+        people.iter().map(|p| if looks_like_a_label(&p.name, &names) { TAIL } else { 0 }).collect();
     loop {
         let mut seen: HashMap<String, Vec<usize>> = HashMap::new();
         for (i, p) in people.iter().enumerate() {
@@ -53,13 +56,26 @@ fn label(p: &Person, tail: usize) -> String {
     }
 }
 
-/// Whether a name ends the way labels do: `·` or `.` and at least [`TAIL`]
-/// code characters. Such a name always shows a tail of its own, so it can't
-/// pass for the label someone else gets once a namesake of theirs appears.
-fn looks_like_a_label(name: &str) -> bool {
-    skeleton(name).rsplit_once('.').is_some_and(|(before, tail)| {
-        !before.is_empty() && tail.chars().count() >= TAIL && tail.chars().all(is_code_char)
-    })
+fn name_skeletons(people: &[Person]) -> HashSet<String> {
+    people.iter().filter(|p| !p.name.is_empty()).map(|p| skeleton(&p.name)).collect()
+}
+
+/// A name split the way a label is: what comes before its last separator (any
+/// mark that isn't a letter, digit, space or accent) and the letters and
+/// digits after it. `None` when it doesn't end like that.
+fn split_tail(name: &str) -> Option<(&str, &str)> {
+    let separator = |c: char| !c.is_alphanumeric() && !c.is_whitespace() && !is_combining_mark(c);
+    let (at, c) = name.char_indices().rfind(|&(_, c)| separator(c))?;
+    let (before, tail) = (name[..at].trim(), &name[at + c.len_utf8()..]);
+    (!before.is_empty() && !tail.is_empty() && tail.chars().all(char::is_alphanumeric)).then_some((before, tail))
+}
+
+/// Whether a name looks like another person's label would: their name, a
+/// separator and something after it (`rahul·m4x8`, `rahul.m4x8`). Such a name
+/// always shows a tail of its own, so it can't pass for the label that person
+/// gets once a namesake of theirs appears.
+fn looks_like_a_label(name: &str, names: &HashSet<String>) -> bool {
+    split_tail(name).is_some_and(|(before, _)| names.contains(&skeleton(before)))
 }
 
 /// The code without its prefix.
@@ -89,7 +105,23 @@ pub fn find(people: &[Person], typed: &str) -> Result<Code, FindError> {
     if let Some(p) = people.iter().find(|p| skeleton(&labels[&p.code]) == wanted) {
         return Ok(p.code);
     }
-    let named: Vec<&Person> = people.iter().filter(|p| !p.name.is_empty() && skeleton(&p.name) == wanted).collect();
+    // A label from before (when they had a namesake) still means the person
+    // whose code it shows, never someone who took it as their name.
+    if let Some((name, tail)) = split_tail(typed) {
+        let (name, tail) = (skeleton(name), tail.to_lowercase());
+        let owners: Vec<&Person> = people
+            .iter()
+            .filter(|p| !p.name.is_empty() && skeleton(&p.name) == name && key_text(&p.code).starts_with(&tail))
+            .collect();
+        if let [owner] = owners.as_slice() {
+            return Ok(owner.code);
+        }
+    }
+    let names = name_skeletons(people);
+    let named: Vec<&Person> = people
+        .iter()
+        .filter(|p| !p.name.is_empty() && skeleton(&p.name) == wanted && !looks_like_a_label(&p.name, &names))
+        .collect();
     match named.as_slice() {
         [] => Err(FindError::NoOne(typed.to_string())),
         [one] => Ok(one.code),
@@ -114,10 +146,26 @@ pub fn skeleton(name: &str) -> String {
             continue;
         }
         for c in c.to_lowercase().filter(|&c| !is_ignorable(c)) {
-            out.push(if c == SEPARATOR { '.' } else { latin_lookalike(c).unwrap_or(c) });
+            out.push(if c == SEPARATOR || is_dot_lookalike(c) { '.' } else { latin_lookalike(c).unwrap_or(c) });
         }
     }
     out
+}
+
+/// Dots drawn like the `·` in labels.
+fn is_dot_lookalike(c: char) -> bool {
+    matches!(
+        c,
+        '\u{0387}' // Greek ano teleia
+            | '\u{1427}' // Canadian syllabics final middle dot
+            | '\u{2022}' // bullet
+            | '\u{2027}' // hyphenation point
+            | '\u{2219}' // bullet operator
+            | '\u{22C5}' // dot operator
+            | '\u{2E31}' // word separator middle dot
+            | '\u{30FB}' // katakana middle dot
+            | '\u{A78F}' // Latin letter sinological dot
+    )
 }
 
 /// Marks that change nothing visible in a name.
@@ -270,11 +318,52 @@ mod tests {
             all.dedup();
             assert_eq!(all.len(), 3, "labels clash: {three:?}");
         }
-        // Ordinary names with a dot keep their plain label.
-        for plain in ["a.b. smith", "dr. rahul", "rahul.", "v1.0"] {
+    }
+
+    #[test]
+    fn lookalike_dots_and_letters_cannot_pass_for_a_label() {
+        let rahul = person("rahul");
+        let t = tail(&rahul, TAIL);
+        let armenian = format!("rahul·{}\u{0570}", &t[..3]);
+        for fake in ['\u{22C5}', '\u{2022}', '\u{2219}', '\u{30FB}', '\u{FF65}', '\u{A78F}']
+            .map(|dot| format!("rahul{dot}{t}"))
+            .into_iter()
+            .chain([armenian])
+        {
+            let fake = person(&fake);
+            let other = person("rahul");
+            let labels = labels(&[rahul.clone(), fake.clone(), other]);
+            assert!(
+                labels[&fake.code].starts_with(&format!("{}·", fake.name)),
+                "{:?} got {}",
+                fake.name,
+                labels[&fake.code]
+            );
+        }
+    }
+
+    #[test]
+    fn dotted_names_get_a_tail_only_next_to_the_name_before_the_dot() {
+        for plain in ["mary.jane", "dr.mehta", "st.jude", "a.b. smith", "dr. rahul", "rahul.", "v1.0", "ராகுல்"]
+        {
             let p = person(plain);
             assert_eq!(labels(std::slice::from_ref(&p))[&p.code], plain);
         }
+        let (mary, mary_jane) = (person("mary"), person("mary.jane"));
+        let labels = labels(&[mary.clone(), mary_jane.clone()]);
+        assert_eq!(labels[&mary.code], "mary");
+        assert!(labels[&mary_jane.code].starts_with("mary.jane·"));
+    }
+
+    #[test]
+    fn a_typed_label_finds_the_person_whose_code_it_is() {
+        let rahul = person("rahul");
+        let t = tail(&rahul, TAIL);
+        let impostor = person(&format!("rahul.{t}"));
+        let people = [rahul.clone(), impostor.clone()];
+        assert_eq!(find(&people, &format!("rahul·{t}")), Ok(rahul.code));
+        assert_eq!(find(&people, &format!("rahul.{t}")), Ok(rahul.code));
+        assert_eq!(find(&people, &labels(&people)[&impostor.code]), Ok(impostor.code));
     }
 
     #[test]

@@ -1,0 +1,11 @@
+{
+  "format": 1,
+  "kdf": "argon2id",
+  "params": {
+    "m_kib": 8,
+    "t": 1,
+    "p": 1
+  },
+  "salt": "6084beb44bdf2874f991aaf94037d8c0",
+  "data_key": "9ac0c3907c9296f46f21681996980221be736e8b09df211198cc1e14dd96e38a3396ea67dabef8dc7f13afa4eb07c4aea08d2de2435c9ca55a99734e9d21625e701676adef528a60"
+}

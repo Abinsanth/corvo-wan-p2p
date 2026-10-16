@@ -92,7 +92,29 @@ pub(crate) fn write_private_atomic_with(
         let _ = fs::remove_file(&tmp);
         return Err(e);
     }
-    fs::rename(&tmp, path)
+    fs::rename(&tmp, path)?;
+    sync_parent(path)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The folders [`sync_parent`] synced, so tests can see it ran.
+    static SYNCED: std::cell::RefCell<Vec<PathBuf>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Makes a rename in `path`'s folder survive a power cut. Unix only: there
+/// the rename lives in the folder, which needs its own sync; NTFS journals it.
+fn sync_parent(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+        fs::File::open(parent)?.sync_all()?;
+        #[cfg(test)]
+        SYNCED.with(|s| s.borrow_mut().push(parent.to_path_buf()));
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
 }
 
 fn remove_if_present(path: &Path) -> std::io::Result<()> {
@@ -139,6 +161,20 @@ mod tests {
         write_private_atomic(&path, b"two").unwrap();
         assert_eq!(fs::read(&path).unwrap(), b"two");
         assert!(!dir.path().join("key.json.tmp").exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn atomic_write_syncs_the_folder_after_the_rename() {
+        let dir = tempfile::tempdir().unwrap();
+        SYNCED.with(|s| s.borrow_mut().clear());
+        write_private_atomic(&dir.path().join("key.json"), b"x").unwrap();
+        assert_eq!(SYNCED.with(|s| s.borrow().clone()), [dir.path().to_path_buf()]);
+    }
+
+    #[test]
+    fn sync_parent_handles_a_bare_file_name() {
+        sync_parent(Path::new("key.json")).unwrap();
     }
 
     #[test]

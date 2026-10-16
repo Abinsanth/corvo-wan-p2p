@@ -4,7 +4,7 @@
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
-use super::{Store, StoreError, crypt};
+use super::{Store, StoreError, crypt, readable};
 use crate::identity::Code;
 
 /// Where a message stands.
@@ -98,25 +98,43 @@ impl Store {
 
     /// Your messages to `to` that their app hasn't confirmed yet, oldest first.
     pub fn waiting(&self, to: &Code) -> Result<Vec<StoredMessage>, StoreError> {
-        self.select(to, "AND waiting = 1", "")
+        Ok(self.select(to, "AND waiting = 1", "")?.0)
     }
 
-    /// The oldest `n` of [`Store::waiting`], without reading the rest.
+    /// The oldest `n` of [`Store::waiting`], without reading the rest. A
+    /// waiting message that can't be read is taken out of the outbox, so it
+    /// doesn't hold up the ones after it.
     pub fn oldest_waiting(&self, to: &Code, n: usize) -> Result<Vec<StoredMessage>, StoreError> {
-        self.select(to, "AND waiting = 1", &format!("LIMIT {n}"))
+        let (waiting, damaged) = self.select(to, "AND waiting = 1", &format!("LIMIT {n}"))?;
+        if damaged.is_empty() {
+            return Ok(waiting);
+        }
+        let peer = self.peer_tag(to);
+        for msg in damaged {
+            self.db.execute("UPDATE messages SET waiting = 0 WHERE peer = ?1 AND msg = ?2", params![peer, msg])?;
+        }
+        self.oldest_waiting(to, n)
     }
 
-    /// Everything between you and `peer`, oldest first.
+    /// Everything between you and `peer` that can be read, oldest first.
     pub fn history(&self, peer: &Code) -> Result<Vec<StoredMessage>, StoreError> {
-        self.select(peer, "", "")
+        Ok(self.history_checked(peer)?.0)
     }
 
-    /// Whether a message with this id from or to `peer` is saved.
+    /// [`Store::history`], and how many messages couldn't be read (damaged).
+    pub fn history_checked(&self, peer: &Code) -> Result<(Vec<StoredMessage>, usize), StoreError> {
+        let (messages, damaged) = self.select(peer, "", "")?;
+        Ok((messages, damaged.len()))
+    }
+
+    /// Whether a message with this id from or to `peer` is saved, or was
+    /// until its history was deleted.
     pub fn has_message(&self, peer: &Code, id: &str) -> Result<bool, StoreError> {
         let found = self
             .db
             .query_row(
-                "SELECT 1 FROM messages WHERE peer = ?1 AND msg = ?2",
+                "SELECT 1 FROM messages WHERE peer = ?1 AND msg = ?2
+                 UNION ALL SELECT 1 FROM forgotten WHERE peer = ?1 AND msg = ?2 LIMIT 1",
                 params![self.peer_tag(peer), self.msg_tag(id)],
                 |_| Ok(()),
             )
@@ -135,24 +153,34 @@ impl Store {
         Ok(())
     }
 
-    /// Deletes every message between you and `peer`.
+    /// Deletes every message between you and `peer`, keeping only their ids'
+    /// tags (see [`Store::has_message`]). Call it inside a transaction.
     pub(super) fn delete_history(&self, peer: &Code) -> Result<(), StoreError> {
-        self.db.execute("DELETE FROM messages WHERE peer = ?1", [self.peer_tag(peer)])?;
+        let peer = self.peer_tag(peer);
+        self.db.execute(
+            "INSERT OR IGNORE INTO forgotten (peer, msg) SELECT peer, msg FROM messages WHERE peer = ?1",
+            [peer],
+        )?;
+        self.db.execute("DELETE FROM messages WHERE peer = ?1", [peer])?;
         Ok(())
     }
 
-    fn select(&self, peer: &Code, filter: &str, limit: &str) -> Result<Vec<StoredMessage>, StoreError> {
+    /// The messages that open, and the `msg` tags of those that don't.
+    fn select(&self, peer: &Code, filter: &str, limit: &str) -> Result<(Vec<StoredMessage>, Vec<Vec<u8>>), StoreError> {
         let peer = self.peer_tag(peer);
         let sql = format!("SELECT msg, body, mark FROM messages WHERE peer = ?1 {filter} ORDER BY seq {limit}");
         let mut query = self.db.prepare(&sql)?;
         let rows = query
             .query_map([peer], |r| Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, Vec<u8>>(1)?, r.get::<_, Vec<u8>>(2)?)))?;
-        let mut out = Vec::new();
+        let (mut out, mut damaged) = (Vec::new(), Vec::new());
         for row in rows {
             let (msg, body, mark) = row?;
-            out.push(self.message_from_row(&peer, &msg, &body, &mark)?);
+            match readable(self.message_from_row(&peer, &msg, &body, &mark))? {
+                Some(message) => out.push(message),
+                None => damaged.push(msg),
+            }
         }
-        Ok(out)
+        Ok((out, damaged))
     }
 
     fn message_from_row(&self, peer: &[u8], msg: &[u8], body: &[u8], mark: &[u8]) -> Result<StoredMessage, StoreError> {
@@ -214,7 +242,7 @@ impl Store {
             query.query_map(params![peer, target], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?;
         let mut changed = false;
         for (msg, mark) in rows {
-            if matches!(self.open_mark(&peer, &msg, &mark)?, Mark::Waiting | Mark::Delivered) {
+            if matches!(readable(self.open_mark(&peer, &msg, &mark))?, Some(Mark::Waiting | Mark::Delivered)) {
                 self.set_mark(&peer, &msg, Mark::Read)?;
                 changed = true;
             }

@@ -28,7 +28,13 @@ ulid.workspace = true
 unicode-normalization.workspace = true
 zeroize.workspace = true
 
+[features]
+# The fast, weak passphrase settings, for tests only. Release builds never
+# turn this on (CI checks).
+insecure-test-kdf = []
+
 [dev-dependencies]
+corvo-wan-p2p-core = { path = ".", features = ["insecure-test-kdf"] }
 tempfile.workspace = true
 
 [lints]

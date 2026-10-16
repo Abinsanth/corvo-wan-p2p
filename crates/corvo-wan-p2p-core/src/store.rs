@@ -18,7 +18,7 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, ErrorCode, OptionalExtension, params};
 use zeroize::Zeroizing;
 
 pub use crypt::KdfParams;
@@ -129,22 +129,43 @@ impl Store {
         let lock = take_lock(dir)?;
         let key_path = dir.join(KEY_FILE);
         let data_key = KeyFile::read(&key_path)?.unlock(passphrase, &key_path)?;
-        let store = Store::assemble(dir, data_key, lock)?;
-        store.profile()?; // fail now, not later, if store.db doesn't match key.json
-        Ok(store)
+        // `assemble` checks that store.db matches key.json.
+        Store::assemble(dir, data_key, lock)
     }
 
     /// Opens `store.db` (creating it privately if missing) and brings its tables up to date.
     fn assemble(dir: &Path, data_key: Zeroizing<[u8; 32]>, lock: File) -> Result<Store, StoreError> {
         let db_path = dir.join(DB_FILE);
         private_file().create(true).truncate(false).open(&db_path)?;
-        let mut db = Connection::open(&db_path)?;
-        if schema::upgrade(&mut db)? == schema::Upgrade::TooNew {
-            return Err(StoreError::TooNew(db_path));
-        }
+        let db = Connection::open(&db_path)?;
         let field_key = crypt::subkey(&data_key, FIELD_KEY_LABEL);
         let tag_key = crypt::subkey(&data_key, TAG_KEY_LABEL);
-        Ok(Store { dir: dir.to_path_buf(), db, data_key, field_key, tag_key, _lock: lock })
+        let store = Store { dir: dir.to_path_buf(), db, data_key, field_key, tag_key, _lock: lock };
+        let not_ours = |e: StoreError| match e {
+            StoreError::Db(e)
+                if matches!(e.sqlite_error_code(), Some(ErrorCode::NotADatabase | ErrorCode::DatabaseCorrupt)) =>
+            {
+                StoreError::Damaged { file: db_path.clone(), why: "it isn't a corvo-wan-p2p database".into() }
+            }
+            e => e,
+        };
+        // Data steps seal values with these keys, so first make sure they're
+        // this store's: a store.db beside another account's key.json would be
+        // spoiled for good otherwise. (The profile has been there since step 1.)
+        if schema::version(&store.db).map_err(|e| not_ours(e.into()))? > 0 {
+            store.profile()?;
+        }
+        let upgraded = schema::upgrade(&store.db, &mut |step| store.data_step(step)).map_err(not_ours)?;
+        if upgraded == schema::Upgrade::TooNew {
+            return Err(StoreError::TooNew(db_path));
+        }
+        Ok(store)
+    }
+
+    fn data_step(&self, step: schema::DataStep) -> Result<(), StoreError> {
+        match step {
+            schema::DataStep::SealMissingStandings => self.seal_missing_standings(),
+        }
     }
 
     /// Your seed and name.
@@ -217,6 +238,16 @@ impl Store {
 
     fn damaged(&self, why: &str) -> StoreError {
         StoreError::Damaged { file: self.dir.join(DB_FILE), why: why.into() }
+    }
+}
+
+/// A row's value, or `None` if the row is damaged: one unreadable row
+/// shouldn't hide the rest. Other errors (the database itself failing) stay errors.
+fn readable<T>(read: Result<T, StoreError>) -> Result<Option<T>, StoreError> {
+    match read {
+        Ok(value) => Ok(Some(value)),
+        Err(StoreError::Damaged { .. }) => Ok(None),
+        Err(e) => Err(e),
     }
 }
 

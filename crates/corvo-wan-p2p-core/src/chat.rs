@@ -157,9 +157,9 @@ enum Command {
     Send(Code, String, Reply<String>),
     MarkRead(Code, Reply<()>),
     SetName(String, Reply<String>),
-    People(Reply<Vec<Person>>),
+    People(Reply<(Vec<Person>, usize)>),
     Contacts(Reply<Vec<Person>>),
-    History(Code, Reply<Vec<StoredMessage>>),
+    History(Code, Reply<(Vec<StoredMessage>, usize)>),
     ReadUpto(Code, Reply<Option<String>>),
     ChangePassphrase { old: Zeroizing<String>, new: Zeroizing<String>, reply: Reply<()> },
     Phrase(Zeroizing<String>, Reply<Seed>),
@@ -301,6 +301,11 @@ impl Client {
 
     /// Everyone you know of: contacts, requests and blocked people.
     pub async fn people(&self) -> Result<Vec<Person>, ChatError> {
+        Ok(self.people_checked().await?.0)
+    }
+
+    /// [`Client::people`], and how many people couldn't be read (a damaged store).
+    pub async fn people_checked(&self) -> Result<(Vec<Person>, usize), ChatError> {
         self.ask(Command::People).await
     }
 
@@ -309,6 +314,11 @@ impl Client {
     }
 
     pub async fn history(&self, peer: Code) -> Result<Vec<StoredMessage>, ChatError> {
+        Ok(self.history_checked(peer).await?.0)
+    }
+
+    /// [`Client::history`], and how many messages couldn't be read (a damaged store).
+    pub async fn history_checked(&self, peer: Code) -> Result<(Vec<StoredMessage>, usize), ChatError> {
         self.ask(|r| Command::History(peer, r)).await
     }
 
@@ -458,13 +468,13 @@ impl Core {
                 let _ = reply.send(self.set_name(&name));
             }
             Command::People(reply) => {
-                let _ = reply.send(self.store.people().map_err(ChatError::from));
+                let _ = reply.send(self.store.people_checked().map_err(ChatError::from));
             }
             Command::Contacts(reply) => {
                 let _ = reply.send(self.store.contacts().map_err(ChatError::from));
             }
             Command::History(peer, reply) => {
-                let _ = reply.send(self.store.history(&peer).map_err(ChatError::from));
+                let _ = reply.send(self.store.history_checked(&peer).map_err(ChatError::from));
             }
             Command::ReadUpto(peer, reply) => {
                 let _ = reply.send(self.store.read_upto(&peer).map_err(ChatError::from));

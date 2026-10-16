@@ -184,6 +184,27 @@ async fn a_message_resent_after_removal_is_acked_but_is_not_a_request() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_message_resent_after_removal_with_history_is_not_a_request() {
+    let lookup = MemoryLookup::new();
+    let mut a = Peer::start(&lookup, "abin").await;
+    let fake = Fake::new(&lookup).await;
+    a.client.add_contact(fake.code).await.unwrap();
+    let (mut send, mut recv, _) = fake.hello(a.code, PROTO_VERSION).await.unwrap();
+    say(&mut send, "m1", "hello").await;
+    next_frame(&mut recv, |f| matches!(f, Frame::Ack { .. })).await;
+    a.client.remove(fake.code, true).await.unwrap();
+    a.skip_pending().await;
+    assert!(is_cut_off(&mut recv).await);
+    // Their app never saw the ack, so it sends m1 again on the next connection.
+    let (mut send, mut recv, _) = fake.hello(a.code, PROTO_VERSION).await.unwrap();
+    say(&mut send, "m1", "hello").await;
+    assert_eq!(next_frame(&mut recv, |f| matches!(f, Frame::Ack { .. })).await, Frame::Ack { id: "m1".into() });
+    a.expect_none(QUIET, |e| matches!(e, Event::Request { .. } | Event::Received { .. })).await;
+    assert!(a.client.people().await.unwrap().is_empty());
+    assert!(a.client.history(fake.code).await.unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_request_saves_only_so_many_messages() {
     let lookup = MemoryLookup::new();
     let mut a = Peer::start(&lookup, "abin").await;

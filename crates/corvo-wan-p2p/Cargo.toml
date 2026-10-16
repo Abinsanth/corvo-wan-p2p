@@ -24,6 +24,7 @@ unicode-width.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
+corvo-wan-p2p-core = { workspace = true, features = ["insecure-test-kdf"] }
 iroh.workspace = true
 tempfile.workspace = true
 

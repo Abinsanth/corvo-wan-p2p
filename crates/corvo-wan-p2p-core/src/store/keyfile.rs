@@ -33,6 +33,9 @@ pub(crate) struct KeyFile {
 impl KeyFile {
     /// Locks `data_key` with `passphrase`, using a fresh salt.
     pub(crate) fn lock(data_key: &[u8; 32], passphrase: &str, params: KdfParams) -> Result<KeyFile, StoreError> {
+        if !params.usable() {
+            return Err(StoreError::BadKdfParams);
+        }
         let salt: [u8; 16] = rand::random();
         let key = crypt::passphrase_key(passphrase, &salt, params).ok_or(StoreError::BadKdfParams)?;
         Ok(KeyFile {
@@ -50,6 +53,9 @@ impl KeyFile {
         let damaged = |why: &str| StoreError::Damaged { file: path.to_path_buf(), why: why.into() };
         if self.format != FORMAT || self.kdf != KDF {
             return Err(damaged("unknown format"));
+        }
+        if !self.params.usable() {
+            return Err(damaged("passphrase settings are out of range"));
         }
         let salt = HEXLOWER.decode(self.salt.as_bytes()).map_err(|_| damaged("bad salt"))?;
         let sealed = HEXLOWER.decode(self.data_key.as_bytes()).map_err(|_| damaged("bad data key"))?;

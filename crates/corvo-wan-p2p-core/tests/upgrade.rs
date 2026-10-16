@@ -122,3 +122,27 @@ fn an_rc2_store_upgrades_with_nothing_lost() {
         assert_eq!(version, 5);
     }
 }
+
+/// Brings a current store back to how 0.1.0-rc.2 left it: version 3, no
+/// `forgotten` table, and one contact without a standing.
+fn back_to_version_3(dir: &Path) {
+    let db = rusqlite::Connection::open(dir.join(DB_FILE)).unwrap();
+    db.execute_batch("UPDATE contacts SET standing = NULL; DROP TABLE forgotten; PRAGMA user_version = 3;").unwrap();
+}
+
+#[test]
+fn another_accounts_key_json_does_not_upgrade_this_store() {
+    let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    drop(Store::create(a.path(), "pass a", KdfParams::FAST_INSECURE, &Seed::generate(), "a").unwrap());
+    Store::create(b.path(), "pass b", KdfParams::FAST_INSECURE, &Seed::generate(), "b")
+        .unwrap()
+        .add_contact(&rahul())
+        .unwrap();
+    back_to_version_3(b.path());
+    let b_key = fs::read(b.path().join(KEY_FILE)).unwrap();
+    fs::copy(a.path().join(KEY_FILE), b.path().join(KEY_FILE)).unwrap();
+    assert!(Store::open(b.path(), "pass a").is_err());
+    fs::write(b.path().join(KEY_FILE), b_key).unwrap();
+    let s = Store::open(b.path(), "pass b").unwrap();
+    assert_eq!(s.standing(&rahul()).unwrap(), Some(Standing::Contact), "upgraded with the right key");
+}

@@ -390,3 +390,20 @@ fn a_read_receipt_skips_a_damaged_mark() {
     assert!(s.mark_read(&rahul, "r2").unwrap());
     assert_eq!(s.history(&rahul).unwrap().iter().map(|m| m.mark).collect::<Vec<_>>(), [Mark::Read]);
 }
+
+#[test]
+fn a_damaged_read_receipt_counts_as_nothing_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let rahul = someone();
+    {
+        let s = store(dir.path());
+        s.add_contact(&rahul).unwrap();
+        s.add_incoming(&rahul, "x1", 1, "hi").unwrap();
+        s.note_read(&rahul, "x1").unwrap();
+    }
+    let db = rusqlite::Connection::open(dir.path().join(DB_FILE)).unwrap();
+    db.execute("UPDATE contacts SET read_upto = x'00'", []).unwrap();
+    drop(db);
+    let s = Store::open(dir.path(), "pass").unwrap();
+    assert_eq!(s.read_upto(&rahul).unwrap(), None);
+}

@@ -295,13 +295,14 @@ impl Store {
         let peer = self.peer_tag(code);
         let sealed: Option<Option<Vec<u8>>> =
             self.db.query_row("SELECT read_upto FROM contacts WHERE peer = ?1", [peer], |r| r.get(0)).optional()?;
-        match sealed.flatten() {
-            Some(sealed) => {
-                let id = self.open_at(b"contacts.read_upto", &[&peer], &sealed)?;
-                Ok(Some(String::from_utf8(id.to_vec()).map_err(|_| self.damaged("a read receipt isn't text"))?))
-            }
-            None => Ok(None),
-        }
+        let Some(sealed) = sealed.flatten() else { return Ok(None) };
+        // A damaged one counts as nothing read: their messages show as unread,
+        // rather than the chat failing to load.
+        let id = readable(
+            self.open_at(b"contacts.read_upto", &[&peer], &sealed)
+                .and_then(|id| String::from_utf8(id.to_vec()).map_err(|_| self.damaged("a read receipt isn't text"))),
+        )?;
+        Ok(id)
     }
 
     pub(super) fn open_i64(&self, column: &[u8], row: &[&[u8]], sealed: &[u8]) -> Result<i64, StoreError> {

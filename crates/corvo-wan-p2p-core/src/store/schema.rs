@@ -79,13 +79,18 @@ pub(crate) enum Upgrade {
     TooNew,
 }
 
+/// How many steps `db` has had.
+pub(crate) fn version(db: &Connection) -> rusqlite::Result<i64> {
+    db.pragma_query_value(None, "user_version", |row| row.get(0))
+}
+
 /// Brings `db` up to the newest schema. `data` carries out the data steps on
 /// the same connection. Each step and its version bump are one transaction.
 pub(crate) fn upgrade(
     db: &Connection,
     data: &mut dyn FnMut(DataStep) -> Result<(), StoreError>,
 ) -> Result<Upgrade, StoreError> {
-    let current: i64 = db.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    let current = version(db)?;
     let target = STEPS.len() as i64;
     if current > target {
         return Ok(Upgrade::TooNew);

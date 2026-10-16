@@ -129,9 +129,8 @@ impl Store {
         let lock = take_lock(dir)?;
         let key_path = dir.join(KEY_FILE);
         let data_key = KeyFile::read(&key_path)?.unlock(passphrase, &key_path)?;
-        let store = Store::assemble(dir, data_key, lock)?;
-        store.profile()?; // fail now, not later, if store.db doesn't match key.json
-        Ok(store)
+        // `assemble` checks that store.db matches key.json.
+        Store::assemble(dir, data_key, lock)
     }
 
     /// Opens `store.db` (creating it privately if missing) and brings its tables up to date.
@@ -142,14 +141,21 @@ impl Store {
         let field_key = crypt::subkey(&data_key, FIELD_KEY_LABEL);
         let tag_key = crypt::subkey(&data_key, TAG_KEY_LABEL);
         let store = Store { dir: dir.to_path_buf(), db, data_key, field_key, tag_key, _lock: lock };
-        let upgraded = schema::upgrade(&store.db, &mut |step| store.data_step(step)).map_err(|e| match e {
+        let not_ours = |e: StoreError| match e {
             StoreError::Db(e)
                 if matches!(e.sqlite_error_code(), Some(ErrorCode::NotADatabase | ErrorCode::DatabaseCorrupt)) =>
             {
                 StoreError::Damaged { file: db_path.clone(), why: "it isn't a corvo-wan-p2p database".into() }
             }
             e => e,
-        })?;
+        };
+        // Data steps seal values with these keys, so first make sure they're
+        // this store's: a store.db beside another account's key.json would be
+        // spoiled for good otherwise. (The profile has been there since step 1.)
+        if schema::version(&store.db).map_err(|e| not_ours(e.into()))? > 0 {
+            store.profile()?;
+        }
+        let upgraded = schema::upgrade(&store.db, &mut |step| store.data_step(step)).map_err(not_ours)?;
         if upgraded == schema::Upgrade::TooNew {
             return Err(StoreError::TooNew(db_path));
         }

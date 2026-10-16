@@ -13,11 +13,14 @@
 //!  ana · abcdefgh · online                  status line
 //! ```
 
+use std::borrow::Cow;
 use std::iter::Peekable;
 use std::str::Chars;
+use std::sync::Arc;
 
 use corvo_wan_p2p_core::VERSION;
 use corvo_wan_p2p_core::identity::{Code, is_invisible};
+use corvo_wan_p2p_core::names::YOU;
 use corvo_wan_p2p_core::store::{Mark, Standing};
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
@@ -25,10 +28,11 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line as TextLine, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use zeroize::Zeroizing;
 
 use super::chat::local;
 use super::onboarding::Onboarding;
-use super::state::{APP, Line, MAX_INPUT_ROWS, Screen, Secret, State, Tab, Tone};
+use super::state::{APP, Line, MAX_INPUT_ROWS, RowKey, Rows, Screen, Secret, State, Tab, Tone};
 
 /// Smaller than this, only [`TOO_SMALL`] is drawn.
 pub const MIN_WIDTH: u16 = 40;
@@ -85,18 +89,22 @@ pub fn input_rows(state: &State) -> usize {
     state.editor.rows().len().clamp(1, MAX_INPUT_ROWS)
 }
 
+/// One line of a tab and how long its head is: the bytes of `text` before
+/// a message's own text (its time and who sent it), 0 for other lines.
+pub type Shown = (Line, usize);
+
 /// What a tab shows, and the line its last `/clear` was at. A chat tab's
 /// lines come from its messages: a line for each new day, the time, who
 /// sent it and, for yours, its mark.
-pub fn tab_lines(state: &State, tab: &Tab) -> (Vec<Line>, usize) {
+pub fn tab_lines(state: &State, tab: &Tab) -> (Vec<Shown>, usize) {
     let Some(peer) = tab.peer else {
-        return (tab.lines.clone(), tab.cleared);
+        return (tab.lines.iter().map(|l| (l.clone(), 0)).collect(), tab.cleared);
     };
     let label = state.label(&peer);
     let mut lines = Vec::new();
     if state.standing(&peer) == Some(Standing::Request) {
         let text = format!("{label} isn't a contact yet: /accept adds them, /block stops them");
-        lines.push(Line { text, tone: Tone::Warn });
+        lines.push((Line { text, tone: Tone::Warn }, 0));
     }
     let messages = state.chats.get(&peer).map_or(&[][..], |c| &c.messages[..]);
     let mut clear_line = None;
@@ -109,41 +117,76 @@ pub fn tab_lines(state: &State, tab: &Tab) -> (Vec<Line>, usize) {
         let day = at.map(|t| t.date_naive());
         if day != last_day {
             let text = at.map_or_else(|| "── ? ──".into(), |t| format!("── {} ──", t.format("%a %-d %b")));
-            lines.push(Line { text, tone: Tone::Dim });
+            lines.push((Line { text, tone: Tone::Dim }, 0));
             last_day = day;
         }
         let time = at.map_or_else(|| "--:--".into(), |t| t.format("%H:%M").to_string());
-        let who = if m.mark.is_outgoing() { "you" } else { label.as_str() };
-        // Later lines of a message start under its text's first column.
-        let text = m.text.replace('\n', &format!("\n{}", " ".repeat(time.len() + 1)));
+        let (who, line_tone) = if m.mark.is_outgoing() { (YOU, Tone::Own) } else { (label.as_str(), Tone::Plain) };
         let mark = match m.mark {
             Mark::Waiting => " ·",
             Mark::Delivered => " ✓",
             Mark::Read => " ✓✓",
             Mark::Received => "",
         };
-        lines.push(Line { text: format!("{time} {who}: {text}{mark}"), tone: Tone::Plain });
+        let head = format!("{time} {}: ", one_line(who));
+        let head_len = head.len();
+        lines.push((Line { text: format!("{head}{}{mark}", m.text), tone: line_tone }, head_len));
     }
     // Never cleared: everything shows, the request line too.
     let clear_line = if tab.cleared == 0 { 0 } else { clear_line.unwrap_or(lines.len()) };
     (lines, clear_line)
 }
 
-/// A tab's rows at `width`, and the row its last `/clear` was at.
-pub fn chat_rows(state: &State, tab: &Tab, width: u16) -> (Vec<(String, Tone)>, usize) {
+#[cfg(test)]
+thread_local! {
+    /// How many times a tab's rows were built, for tests.
+    static BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The open tab's rows at `width`, and the row its last `/clear` was at.
+/// Built once per change and width, then reused.
+pub fn chat_rows(state: &State, width: u16) -> (Arc<Rows>, usize) {
+    let key = RowKey { tab: state.current, peer: state.tab().peer, width, changes: state.changes };
+    if let Some(hit) = state.rows.get(&key) {
+        return hit;
+    }
+    let (rows, clear_row) = build_rows(state, state.tab(), width);
+    let rows = Arc::new(rows);
+    state.rows.put(key, rows.clone(), clear_row);
+    (rows, clear_row)
+}
+
+fn build_rows(state: &State, tab: &Tab, width: u16) -> (Rows, usize) {
+    #[cfg(test)]
+    BUILDS.with(|b| b.set(b.get() + 1));
     let (lines, cleared) = tab_lines(state, tab);
     let mut rows = Vec::new();
     let mut clear_row = None;
-    for (i, line) in lines.iter().enumerate() {
+    for (i, (line, head)) in lines.iter().enumerate() {
         if i == cleared {
             clear_row = Some(rows.len());
         }
-        for piece in line.text.split('\n') {
-            rows.extend(wrap(&clean(piece), width.into()).into_iter().map(|r| (r, line.tone)));
-        }
+        rows.extend(line_rows(&line.text, *head, width.into()).into_iter().map(|r| (r, line.tone)));
     }
     let clear_row = clear_row.unwrap_or(rows.len());
     (rows, clear_row)
+}
+
+/// One line's rows at `width`. After its first `head` bytes, the text wraps
+/// with a hanging indent, so every row of it starts under its first column;
+/// not when the head takes more than half the width.
+fn line_rows(text: &str, head: usize, width: usize) -> Vec<String> {
+    let indent = text.get(..head).map_or(0, |h| h.width());
+    let (lead, body, indent) =
+        if head > 0 && indent * 2 <= width { (&text[..head], &text[head..], indent) } else { ("", text, 0) };
+    let mut rows = Vec::new();
+    for piece in body.split('\n') {
+        for row in wrap(&clean(piece), width - indent) {
+            let before = if rows.is_empty() { lead.to_string() } else { " ".repeat(indent) };
+            rows.push(format!("{before}{row}"));
+        }
+    }
+    rows
 }
 
 /// (rows to scroll through, rows visible) in the chat area. After a `/clear`
@@ -153,9 +196,14 @@ pub fn chat_page(state: &State) -> (usize, usize) {
     let Some(areas) = areas(state.size, input_rows(state)) else {
         return (0, 0);
     };
-    let (rows, clear_row) = chat_rows(state, state.tab(), areas.chat.width);
+    let (rows, clear_row) = chat_rows(state, areas.chat.width);
     let height = areas.chat.height as usize;
-    (rows.len().max(clear_row + height), height)
+    (scroll_total(rows.len(), clear_row, height), height)
+}
+
+/// Rows to scroll through: after a `/clear`, enough below its mark to fill the area.
+fn scroll_total(rows: usize, clear_row: usize, height: usize) -> usize {
+    rows.max(clear_row + height)
 }
 
 /// Text from someone else, made safe to draw: escape sequences, control
@@ -241,15 +289,21 @@ pub fn wrap(text: &str, width: usize) -> Vec<String> {
 }
 
 /// The 12 words in numbered columns, as many as fit in `width` (2 to 4),
-/// numbered down each column.
-pub fn word_grid(words: &[&str], width: u16) -> Vec<String> {
+/// numbered down each column. Each row is wiped after use.
+pub fn word_grid(words: &[&str], width: u16) -> Vec<Zeroizing<String>> {
+    use std::fmt::Write;
     let cols = (usize::from(width) / WORD_CELL).clamp(2, 4);
     let rows = words.len().div_ceil(cols);
     (0..rows)
         .map(|r| {
-            let cells = (0..cols).filter_map(|c| words.get(c * rows + r).map(|w| (c * rows + r + 1, w)));
-            let row: String = cells.map(|(n, w)| format!("{n:>2}. {w:<width$}", width = WORD_CELL - 4)).collect();
-            row.trim_end().to_string()
+            // Written straight into a buffer that's big enough, so no copy is left behind.
+            let mut row = Zeroizing::new(String::with_capacity(cols * WORD_CELL));
+            for (n, w) in (0..cols).filter_map(|c| words.get(c * rows + r).map(|w| (c * rows + r + 1, w))) {
+                let _ = write!(row, "{n:>2}. {w:<width$}", width = WORD_CELL - 4);
+            }
+            let end = row.trim_end().len();
+            row.truncate(end);
+            row
         })
         .collect()
 }
@@ -306,33 +360,33 @@ fn draw_onboarding(frame: &mut Frame, state: &State, onboarding: &Onboarding, ar
     let title = format!(" {APP} {VERSION}");
     frame.render_widget(Paragraph::new(title).style(Style::new().add_modifier(Modifier::BOLD)), Rect::new(0, 0, w, 1));
     let body = Rect::new(1, 2, w - 2, h - 5);
-    let plain = |text: &String| (text.clone(), Style::new());
-    let guidance: Vec<(String, Style)> = onboarding.guidance().iter().map(plain).collect();
-    let mut notes: Vec<(String, Style)> = onboarding.notes.iter().map(|n| (n.text.clone(), tone(n.tone))).collect();
+    let guidance_text = onboarding.guidance(state.can_copy);
+    let guidance: Vec<(Cow<str>, Style)> = guidance_text.iter().map(|t| plain(t)).collect();
+    let mut notes: Vec<(Cow<str>, Style)> =
+        onboarding.notes.iter().map(|n| (Cow::Borrowed(n.text.as_str()), tone(n.tone))).collect();
     if !notes.is_empty() {
-        notes.insert(0, (String::new(), Style::new()));
+        notes.insert(0, plain(""));
     }
-    let lines = match onboarding.words() {
+    // Borrowed from here on, so the words aren't copied.
+    let grid_rows = onboarding.words().map(|words| word_grid(&words, body.width));
+    let lines = match &grid_rows {
         None => [guidance, notes].concat(),
-        Some(words) => {
-            let grid: Vec<(String, Style)> = word_grid(&words, body.width).iter().map(plain).collect();
-            let blank = vec![(String::new(), Style::new())];
-            let all = [guidance.clone(), blank, grid.clone(), notes.clone()].concat();
+        Some(grid_rows) => {
+            let grid: Vec<(Cow<str>, Style)> = grid_rows.iter().map(|r| plain(r)).collect();
+            let all = [guidance.clone(), vec![plain("")], grid.clone(), notes.clone()].concat();
             if text_rows(&all, body.width) <= body.height.into() {
                 all
             } else if grid.len() <= body.height.into() {
                 // The words matter most: they go first, and the rest as fits.
                 [grid, notes, guidance].concat()
             } else {
-                [vec![(BIGGER_FOR_WORDS.to_string(), tone(Tone::Warn))], notes, guidance].concat()
+                [vec![(Cow::Borrowed(BIGGER_FOR_WORDS), tone(Tone::Warn))], notes, guidance].concat()
             }
         }
     };
     let rows: Vec<TextLine> = lines
         .iter()
-        .flat_map(|(text, style)| {
-            wrap(&one_line(text), body.width.into()).into_iter().map(|r| TextLine::styled(r, *style))
-        })
+        .flat_map(|(text, style)| rows_of(text, body.width).into_iter().map(|r| TextLine::styled(r, *style)))
         .collect();
     frame.render_widget(Paragraph::new(rows), body);
     draw_flash(frame, state, Rect::new(0, h - 3, w, 1));
@@ -340,9 +394,25 @@ fn draw_onboarding(frame: &mut Frame, state: &State, onboarding: &Onboarding, ar
     draw_input(frame, state, Rect::new(0, h - 1, w, 1));
 }
 
+/// A line without a style.
+fn plain(text: &str) -> (Cow<'_, str>, Style) {
+    (Cow::Borrowed(text), Style::new())
+}
+
 /// How many rows `lines` take at `width`, wrapped.
-fn text_rows(lines: &[(String, Style)], width: u16) -> usize {
-    lines.iter().map(|(text, _)| wrap(&one_line(text), width.into()).len()).sum()
+fn text_rows(lines: &[(Cow<str>, Style)], width: u16) -> usize {
+    lines.iter().map(|(text, _)| rows_of(text, width).len()).sum()
+}
+
+/// `text` as rows at `width`: itself, not a copy, when it's safe to draw and
+/// fits (like a row of the 12 words); otherwise cleaned and wrapped.
+fn rows_of(text: &str, width: u16) -> Vec<Cow<'_, str>> {
+    let safe = !text.chars().any(|c| c.is_control() || is_invisible(c));
+    if safe && text.width() <= width.into() {
+        vec![Cow::Borrowed(text)]
+    } else {
+        wrap(&one_line(text), width.into()).into_iter().map(Cow::Owned).collect()
+    }
 }
 
 /// Your 12 words over the chat, from `/phrase`.
@@ -350,7 +420,8 @@ fn draw_reveal(frame: &mut Frame, words: &Secret, area: Rect) {
     let words: Vec<&str> = words.expose().split_whitespace().collect();
     let block = Block::bordered().title(" your recovery words ");
     let inner = block.inner(area);
-    let grid: Vec<TextLine> = word_grid(&words, inner.width).into_iter().map(TextLine::from).collect();
+    let grid_rows = word_grid(&words, inner.width);
+    let grid: Vec<TextLine> = grid_rows.iter().map(|r| TextLine::from(r.as_str())).collect();
     let hint = TextLine::styled("press any key to hide them", dim());
     let fits = |rows: usize| rows <= inner.height.into();
     let lines = if fits(grid.len() + 4) {
@@ -376,6 +447,7 @@ fn tone(tone: Tone) -> Style {
         Tone::Good => Style::new().fg(Color::Green),
         Tone::Warn => Style::new().fg(Color::Yellow),
         Tone::Bad => Style::new().fg(Color::Red),
+        Tone::Own => Style::new().fg(Color::Cyan),
     }
 }
 
@@ -446,13 +518,77 @@ fn sidebar(state: &State) -> Vec<(TextLine<'static>, Option<Code>)> {
     lines
 }
 
-/// Who each sidebar row opens, top to bottom, for clicks.
+/// The first sidebar row shown when it's scrolled to `top`, kept in range.
+fn sidebar_first(total: usize, height: usize, top: usize) -> usize {
+    top.min(total.saturating_sub(height))
+}
+
+/// Whether row `i` of `total` is drawn in `height` rows from `first`: the
+/// top and bottom rows give way to "↑ N more" and "↓ N more" when there is.
+fn sidebar_shows(i: usize, total: usize, height: usize, first: usize) -> bool {
+    let above = first > 0;
+    let below = first + height < total;
+    i >= first + usize::from(above) && i + usize::from(below) < first + height
+}
+
+/// The sidebar's rows from the top it's scrolled to, as drawn in `height`
+/// rows, each with the person a click on it opens.
+fn sidebar_page(state: &State, height: usize) -> Vec<(TextLine<'static>, Option<Code>)> {
+    let lines = sidebar(state);
+    let total = lines.len();
+    let first = sidebar_first(total, height, state.sidebar_top);
+    let more = |hidden: &[(TextLine<'static>, Option<Code>)], arrow: &str| {
+        let people: Vec<Code> = hidden.iter().filter_map(|(_, code)| *code).collect();
+        let requests = people.iter().filter(|c| state.people.iter().any(|p| p.code == **c && p.request)).count();
+        // Too narrow to say more: hidden requests make it stand out instead.
+        let style = if requests > 0 { tone(Tone::Warn) } else { dim() };
+        (TextLine::styled(format!("{arrow} {} more", people.len()), style), None)
+    };
+    let mut page = Vec::new();
+    for (i, line) in lines.iter().enumerate().skip(first).take(height) {
+        if sidebar_shows(i, total, height, first) {
+            page.push(line.clone());
+        } else if i == first {
+            page.push(more(&lines[..=first], "↑"));
+        } else {
+            page.push(more(&lines[i..], "↓"));
+        }
+    }
+    page
+}
+
+/// Rows in the sidebar: (all of them, how many fit).
+fn sidebar_size(state: &State) -> (usize, usize) {
+    let height = areas(state.size, input_rows(state)).map_or(0, |a| usize::from(a.sidebar.height));
+    (sidebar(state).len(), height)
+}
+
+/// Where the sidebar is scrolled after the wheel moves it by `delta` rows.
+pub fn sidebar_scrolled(state: &State, delta: isize) -> usize {
+    let (total, height) = sidebar_size(state);
+    let first = sidebar_first(total, height, state.sidebar_top) as isize;
+    sidebar_first(total, height, (first + delta).max(0) as usize)
+}
+
+/// Where the sidebar is scrolled so `code`'s row is in view; where it is if it already is.
+pub fn sidebar_showing(state: &State, code: Code) -> usize {
+    let (total, height) = sidebar_size(state);
+    let mut first = sidebar_first(total, height, state.sidebar_top);
+    let Some(i) = sidebar(state).iter().position(|(_, c)| *c == Some(code)) else { return first };
+    while height > 2 && !sidebar_shows(i, total, height, first) {
+        if i < first + 1 { first -= 1 } else { first += 1 }
+    }
+    first
+}
+
+/// Who each sidebar row on screen opens, top to bottom, for clicks.
 pub fn sidebar_rows(state: &State) -> Vec<Option<Code>> {
-    sidebar(state).into_iter().map(|(_, code)| code).collect()
+    let (_, height) = sidebar_size(state);
+    sidebar_page(state, height).into_iter().map(|(_, code)| code).collect()
 }
 
 fn draw_sidebar(frame: &mut Frame, state: &State, area: Rect) {
-    let lines: Vec<TextLine> = sidebar(state).into_iter().map(|(line, _)| line).collect();
+    let lines: Vec<TextLine> = sidebar_page(state, area.height.into()).into_iter().map(|(line, _)| line).collect();
     frame.render_widget(Paragraph::new(lines).block(Block::new().borders(Borders::RIGHT).border_style(dim())), area);
 }
 
@@ -496,11 +632,12 @@ fn draw_popup(frame: &mut Frame, state: &State, input: Rect) {
 }
 
 fn draw_chat(frame: &mut Frame, state: &State, area: Rect) {
-    let (rows, _) = chat_rows(state, state.tab(), area.width);
-    let (total, height) = chat_page(state);
+    let (rows, clear_row) = chat_rows(state, area.width);
+    let height = usize::from(area.height);
+    let total = scroll_total(rows.len(), clear_row, height);
     let top = state.scroll.top(total, height);
     let shown: Vec<TextLine> =
-        rows.into_iter().skip(top).take(height).map(|(text, t)| TextLine::styled(text, tone(t))).collect();
+        rows.iter().skip(top).take(height).map(|(text, t)| TextLine::styled(text.as_str(), tone(*t))).collect();
     frame.render_widget(Paragraph::new(shown), area);
     if state.scroll.is_scrolled() && area.height > 0 {
         let more = " ↓ more ";
@@ -936,6 +1073,77 @@ mod tests {
     }
 
     #[test]
+    fn a_peer_called_you_is_not_drawn_as_you() {
+        let mut state = busy_state();
+        let you = Seed::generate().code();
+        let mut known = state.known.clone();
+        known.push(person(you, "You", Standing::Contact));
+        state.set_people(known);
+        let t = 1_760_000_100_000;
+        state.chats.entry(you).or_default().messages = vec![
+            StoredMessage { id: "a".into(), sent_at: t, text: "theirs".into(), mark: Mark::Received },
+            StoredMessage { id: "b".into(), sent_at: t, text: "mine".into(), mark: Mark::Delivered },
+        ];
+        state.open_chat(you, true);
+        let label = state.label(&you);
+        assert!(label.starts_with("You·"), "{label}");
+        let buf = render(&state, 80, 24);
+        let all = screen(&buf);
+        assert!(all.contains(&format!("{label}: theirs")), "{all}");
+        let y_of = |text: &str| (0..24).find(|&y| row(&buf, y).contains(text)).unwrap();
+        let chat_x = areas((80, 24), 1).unwrap().chat.x;
+        let (mine, theirs) = (buf[(chat_x, y_of("you: mine"))].style(), buf[(chat_x, y_of("theirs"))].style());
+        assert_eq!(mine.fg, tone(Tone::Own).fg, "your own lines have their own style");
+        assert_ne!(theirs.fg, mine.fg);
+    }
+
+    #[test]
+    fn rows_are_built_once_per_change() {
+        let mut state = busy_state();
+        state.size = (80, 24);
+        state.select_tab(1);
+        let start = BUILDS.with(|b| b.get());
+        let built = || BUILDS.with(|b| b.get()) - start;
+        render(&state, 80, 24);
+        render(&state, 80, 24);
+        update(&mut state, Msg::Tick);
+        render(&state, 80, 24);
+        assert_eq!(built(), 1, "a frame that changes nothing reuses the rows");
+        let rahul = rahul(&state);
+        update(&mut state, Msg::Core(corvo_wan_p2p_core::chat::Event::Online(rahul)));
+        update(&mut state, Msg::Key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE)));
+        render(&state, 80, 24);
+        assert_eq!(built(), 2, "once after a change, scrolling included");
+        render(&state, 100, 30);
+        assert_eq!(built(), 3, "and again at a new width");
+    }
+
+    #[test]
+    fn continuation_rows_line_up_under_the_text() {
+        let mut state = busy_state();
+        let rahul = rahul(&state);
+        let long = "word ".repeat(30);
+        state.chats.get_mut(&rahul).unwrap().messages =
+            vec![received(1, "first line\nsecond line"), received(2, long.trim_end())];
+        state.select_tab(1);
+        let buf = render(&state, 80, 24);
+        let rows: Vec<String> = (0..24).map(|y| row(&buf, y)).collect();
+        let column = |r: &str, text: &str| r.find(text).map(|at| r[..at].chars().count());
+        let first = rows.iter().find(|r| r.contains("first line")).unwrap();
+        let text_at = column(first, "first line").unwrap();
+        assert!(first.contains("rahul: first line"));
+        let second = rows.iter().find(|r| r.contains("second line")).unwrap();
+        assert_eq!(column(second, "second line"), Some(text_at), "after a line break:\n{}", rows.join("\n"));
+        let wrapped: Vec<&String> = rows.iter().filter(|r| r.contains("word")).collect();
+        assert!(wrapped.len() >= 3, "the long one wraps");
+        for r in &wrapped[1..] {
+            assert_eq!(column(r, "word"), Some(text_at), "after a wrap:\n{}", rows.join("\n"));
+        }
+        let words: usize = wrapped.iter().map(|r| r.matches("word").count()).sum();
+        assert_eq!(words, 30, "nothing is lost");
+    }
+
+    #[test]
     fn peer_text_is_drawn_cleaned() {
         let mut state = busy_state();
         let rahul = rahul(&state);
@@ -1031,6 +1239,58 @@ mod tests {
         update(&mut state, click(3, 4));
         update(&mut state, click(40, 10));
         assert_eq!(state.open_peer(), Some(rahul(&state)), "clicking elsewhere changes nothing");
+    }
+
+    #[test]
+    fn the_sidebar_scrolls_to_the_open_chat_and_shows_requests() {
+        use ratatui::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let mut state = State::new("ana".into(), "abcdefgh".into());
+        state.size = (80, 24);
+        let mut people: Vec<Person> =
+            (0..30).map(|i| person(Seed::generate().code(), &format!("p{i:02}"), Standing::Contact)).collect();
+        people.push(person(Seed::generate().code(), "zed", Standing::Request));
+        state.set_people(people.clone());
+        let mouse = |kind, column, row| Msg::Mouse(MouseEvent { kind, column, row, modifiers: KeyModifiers::NONE });
+        let sidebar = areas((80, 24), 1).unwrap().sidebar;
+        let shown = |state: &State| {
+            let buf = render(state, 80, 24);
+            (sidebar.y..sidebar.bottom())
+                .map(|y| row(&buf, y).chars().take(sidebar.width as usize - 1).collect::<String>())
+                .collect::<Vec<_>>()
+        };
+
+        let rows = shown(&state);
+        assert!(rows.last().unwrap().contains("↓ 13 more"), "{rows:#?}");
+        let more = render(&state, 80, 24)[(2, sidebar.bottom() - 1)].fg;
+        assert_eq!(more, Color::Yellow, "hidden requests make it stand out");
+
+        send(&mut state, "/chat p29");
+        let rows = shown(&state);
+        assert!(rows.iter().any(|r| r.contains("p29")), "the open chat is in view: {rows:#?}");
+        assert!(rows[0].contains("↑"), "{rows:#?}");
+
+        for _ in 0..10 {
+            update(&mut state, mouse(MouseEventKind::ScrollDown, 3, 5));
+        }
+        let rows = shown(&state);
+        let y = rows.iter().position(|r| r.contains("zed")).expect("the request is reachable") as u16;
+        assert!(rows.iter().any(|r| r.starts_with("Requests (1)")));
+        update(&mut state, mouse(MouseEventKind::Down(MouseButton::Left), 4, sidebar.y + y));
+        assert_eq!(state.open_peer(), Some(people[30].code), "the click lands on the request");
+        assert!(shown(&state).iter().any(|r| r.contains("zed")), "opening it doesn't move it out of view");
+
+        for _ in 0..20 {
+            update(&mut state, mouse(MouseEventKind::ScrollUp, 3, 5));
+        }
+        let rows = shown(&state);
+        assert!(rows[0].starts_with("○ p00"), "back at the top: {rows:#?}");
+        let y = rows.iter().position(|r| r.contains("p05")).unwrap() as u16;
+        update(&mut state, mouse(MouseEventKind::Down(MouseButton::Left), 3, sidebar.y + y));
+        assert_eq!(state.open_peer(), Some(people[5].code));
+        assert!(!state.scroll.is_scrolled(), "the wheel over the sidebar doesn't scroll the chat");
+        let last = sidebar.bottom() - 1;
+        update(&mut state, mouse(MouseEventKind::Down(MouseButton::Left), 3, last));
+        assert_eq!(state.open_peer(), Some(people[5].code), "the ↓ row opens no one");
     }
 
     #[test]

@@ -11,14 +11,15 @@ use ratatui::crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use ratatui::layout::Position;
+use zeroize::Zeroizing;
 
 use super::account::{self, PhraseDone, PhraseUse};
 use super::chat::{self, Loaded};
-use super::commands::{Cmd, HELP, Input, KEYS, parse};
+use super::commands::{Cmd, HELP, Input, KEYS, may_hold_a_secret, parse};
 use super::complete;
 use super::people::{self, Act, Show};
 use super::state::{Screen, Secret, State, Tone, WHEEL_STEP};
-use super::view::{areas, chat_page, input_rows, popup_area, sidebar_rows, tab_at};
+use super::view::{areas, chat_page, input_rows, popup_area, sidebar_rows, sidebar_scrolled, sidebar_showing, tab_at};
 
 #[derive(Debug)]
 pub enum Msg {
@@ -80,6 +81,12 @@ pub enum Effect {
     },
     /// You've seen everything they sent.
     MarkRead(Code),
+    /// Read the `n` messages with `peer` from before the one with id `before`.
+    LoadOlder {
+        peer: Code,
+        before: String,
+        n: usize,
+    },
     Act {
         code: Code,
         act: Act,
@@ -132,6 +139,11 @@ pub enum Outcome {
     PassphraseChanged(Result<(), String>),
     Phrase(Result<PhraseDone, String>),
     Loaded(Result<Loaded, String>),
+    /// Older messages, and how many of them couldn't be read.
+    LoadedOlder {
+        peer: Code,
+        result: Result<(Vec<StoredMessage>, usize), String>,
+    },
     /// The message as saved, waiting to be sent; `text` is what was typed.
     Sent {
         to: Code,
@@ -239,6 +251,10 @@ fn action_for(key: KeyEvent) -> Option<Action> {
 
 pub fn update(state: &mut State, msg: Msg) -> Vec<Effect> {
     let mut effects = Vec::new();
+    let resized = matches!(msg, Msg::Resize(..));
+    if !matches!(msg, Msg::Tick) {
+        state.changes += 1;
+    }
     // Typing means the window has focus, even where the terminal doesn't say.
     if matches!(msg, Msg::Key(_) | Msg::Paste(_)) {
         state.focused = true;
@@ -247,34 +263,40 @@ pub fn update(state: &mut State, msg: Msg) -> Vec<Effect> {
         // A key while the words are up only hides them.
         Msg::Key(key) if state.reveal.is_some() && key.kind != KeyEventKind::Release => state.reveal = None,
         Msg::Key(key) => {
+            if state.ask().is_some() {
+                state.editor.make_room_for_answer();
+            }
             if let Some(action) = action_for(key) {
                 on_action(state, action, &mut effects);
             }
         }
-        Msg::Paste(_) if state.reveal.is_some() => state.reveal = None,
-        // An answer is one line: a passphrase copied with its line break still
-        // works, and words pasted one per line become one line.
+        Msg::Paste(text) if state.reveal.is_some() => {
+            drop(Zeroizing::new(text));
+            state.reveal = None;
+        }
         Msg::Paste(text) if state.ask().is_some() => {
-            let text = text.trim_end_matches(['\r', '\n']).replace("\r\n", " ").replace(['\r', '\n'], " ");
-            state.editor.insert_str(&text);
+            state.editor.make_room_for_answer();
+            state.editor.insert_str(&one_line_answer(text));
         }
         Msg::Paste(text) => {
             state.popup = None;
             state.editor.insert_str(&text);
         }
         Msg::Mouse(mouse) => match mouse.kind {
-            MouseEventKind::ScrollUp => scroll_by(state, -(WHEEL_STEP as isize)),
-            MouseEventKind::ScrollDown => scroll_by(state, WHEEL_STEP as isize),
+            MouseEventKind::ScrollUp => wheel(state, mouse, -(WHEEL_STEP as isize)),
+            MouseEventKind::ScrollDown => wheel(state, mouse, WHEEL_STEP as isize),
             MouseEventKind::Down(MouseButton::Left) => {
                 state.focused = true;
                 click(state, mouse.column, mouse.row);
             }
             _ => {}
         },
-        Msg::Resize(w, h) => state.size = (w, h),
+        Msg::Resize(w, h) => {
+            state.size = (w, h);
+            drop_hidden_popup(state);
+        }
         Msg::Focus(focused) => state.focused = focused,
         Msg::Tick => {
-            chat::tick(state);
             if let Some(flash) = &mut state.flash {
                 flash.ticks_left = flash.ticks_left.saturating_sub(1);
                 if flash.ticks_left == 0 {
@@ -291,13 +313,41 @@ pub fn update(state: &mut State, msg: Msg) -> Vec<Effect> {
     if let Some(busy) = effects.iter().find_map(Effect::busy) {
         state.busy = Some(busy);
     }
+    chat::trim(state);
+    chat::load_older(state, &mut effects);
     chat::read_open_chat(state, &mut effects);
+    if state.open_peer() != state.sidebar_for || resized {
+        state.sidebar_for = state.open_peer();
+        if let Some(code) = state.sidebar_for {
+            state.sidebar_top = sidebar_showing(state, code);
+        }
+    }
     let title = chat::title(state);
     if state.title != title {
         state.title = title.clone();
         effects.push(Effect::SetTitle(title));
     }
     effects
+}
+
+/// A pasted answer as one line: a passphrase copied with its line break still
+/// works, and words pasted one per line become one line. Wiped after use.
+pub fn one_line_answer(text: String) -> Zeroizing<String> {
+    let text = Zeroizing::new(text);
+    let trimmed = text.trim_end_matches(['\r', '\n']);
+    let mut line = Zeroizing::new(String::with_capacity(trimmed.len()));
+    let mut chars = trimmed.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\r' => {
+                chars.next_if_eq(&'\n');
+                line.push(' ');
+            }
+            '\n' => line.push(' '),
+            c => line.push(c),
+        }
+    }
+    line
 }
 
 /// A left click: on a tab selects it, on a name in the sidebar opens the chat.
@@ -329,12 +379,32 @@ fn click(state: &mut State, x: u16, y: u16) {
     }
 }
 
+/// The wheel scrolls the sidebar when it's over it, and the chat otherwise.
+fn wheel(state: &mut State, mouse: MouseEvent, delta: isize) {
+    let over_sidebar = areas(state.size, input_rows(state))
+        .is_some_and(|a| a.sidebar.contains(Position::new(mouse.column, mouse.row)));
+    if over_sidebar && matches!(state.screen, Screen::Main) {
+        state.sidebar_top = sidebar_scrolled(state, delta);
+    } else {
+        scroll_by(state, delta);
+    }
+}
+
 fn scroll_by(state: &mut State, delta: isize) {
     let (total, height) = chat_page(state);
     state.scroll.by(delta, total, height);
 }
 
+/// A completion list that isn't drawn closes, so keys don't go to it unseen.
+fn drop_hidden_popup(state: &mut State) {
+    let drawn = areas(state.size, input_rows(state)).is_some_and(|a| popup_area(state, a.input).is_some());
+    if !drawn {
+        state.popup = None;
+    }
+}
+
 fn on_action(state: &mut State, action: Action, effects: &mut Vec<Effect>) {
+    drop_hidden_popup(state);
     if state.popup.is_some() {
         match action {
             Action::Complete | Action::Down => return complete::step(state, 1),
@@ -365,7 +435,10 @@ fn on_key(state: &mut State, action: Action, effects: &mut Vec<Effect>) {
             } else if asking {
                 effects.extend(account::answer(state, Secret::new(line)));
             } else {
-                state.history.push(&line);
+                let line = Zeroizing::new(line);
+                if !may_hold_a_secret(&line) {
+                    state.history.push(&line);
+                }
                 on_line(state, &line, effects);
             }
         }
@@ -462,8 +535,7 @@ fn on_done(state: &mut State, outcome: Outcome, effects: &mut Vec<Effect>) {
             state.code = Some(code);
             state.say(Tone::Good, format!("welcome, {name}. Your code is {code}"));
             state.name = name;
-            // The wait for a first connection starts now, not during onboarding.
-            state.since_start = 0;
+            // "connecting" until the engine says.
             state.online = None;
             effects.push(Effect::Load);
             if let Some(path) = recovery_file {
@@ -476,6 +548,7 @@ fn on_done(state: &mut State, outcome: Outcome, effects: &mut Vec<Effect>) {
         Outcome::Fatal(why) => effects.push(Effect::Exit(why)),
         Outcome::Failed(why) => state.say(Tone::Bad, why),
         Outcome::Loaded(result) => chat::loaded(state, result),
+        Outcome::LoadedOlder { peer, result } => chat::loaded_older(state, peer, result),
         Outcome::Sent { to, text, result } => chat::sent(state, to, text, result),
         Outcome::Acted { code, act, result, people } => people::acted(state, code, act, result, people),
         Outcome::Named(result) => people::named(state, result),
@@ -755,6 +828,100 @@ mod tests {
         update(&mut s, Msg::Core(Event::Problem("the store is full".into())));
         assert_eq!(last_corvo(&s).text, "the store is full");
         assert_eq!(last_corvo(&s).tone, Tone::Bad);
+    }
+
+    #[test]
+    fn a_passphrase_typed_after_the_command_is_not_kept() {
+        let mut s = state();
+        send(&mut s, "/help");
+        for line in
+            ["/passphrase old-secret new-secret", "/PASSPHRASE old-secret", "  /phrase hunter2", "/phrase  copy now"]
+        {
+            send(&mut s, line);
+            assert!(!last_corvo(&s).text.contains("secret") && !last_corvo(&s).text.contains("hunter2"));
+        }
+        assert_eq!(s.ask(), None, "nothing is asked");
+        assert!(s.tabs[0].lines.iter().any(|l| l.text == "type /passphrase alone; it asks for them hidden"));
+        assert_eq!(
+            last_corvo(&s).text,
+            "type /phrase alone, or /phrase save or /phrase copy; it asks for your passphrase hidden"
+        );
+        let mut kept = Vec::new();
+        while let Some(entry) = s.history.prev("") {
+            kept.push(entry);
+        }
+        assert_eq!(kept, vec!["/help"], "only the line without a passphrase in it");
+    }
+
+    #[test]
+    fn an_unsent_passphrase_line_is_not_kept_as_a_draft() {
+        let mut s = state();
+        send(&mut s, "/help");
+        type_text(&mut s, "/passphrase old-secret new-secret");
+        press(&mut s, KeyCode::Up);
+        assert_eq!(s.editor.text(), "/help");
+        press(&mut s, KeyCode::Down);
+        assert_eq!(s.editor.text(), "", "the line with a passphrase in it wasn't kept");
+    }
+
+    #[test]
+    fn editor_does_not_reallocate_while_typing_an_answer() {
+        let mut s = state();
+        send(&mut s, "/passphrase");
+        for question in 0..3 {
+            press(&mut s, KeyCode::Char('x'));
+            let (at, room) = (s.editor.text().as_ptr(), s.editor.capacity());
+            type_text(&mut s, &"y".repeat(300));
+            update(&mut s, Msg::Paste("pasted-part ".repeat(20)));
+            assert_eq!(s.editor.text().as_ptr(), at, "question {question}: the buffer never moved");
+            assert_eq!(s.editor.capacity(), room);
+            press(&mut s, KeyCode::Enter);
+        }
+    }
+
+    #[test]
+    fn secret_text_is_wiped_after_use() {
+        use zeroize::Zeroizing;
+        let pasted: Zeroizing<String> = one_line_answer("my pass\r\nphrase\n".into());
+        assert_eq!(pasted.as_str(), "my pass phrase");
+        let _: Zeroizing<String> = crate::ui::clip::osc52("words");
+        let _: Vec<Zeroizing<String>> = crate::ui::view::word_grid(&["abandon", "ability"], 80);
+        let _: Zeroizing<String> = crate::ui::onboarding::lowered(&Secret::new(" Pass ".into()));
+        assert_eq!(crate::ui::onboarding::lowered(&Secret::new(" Pass ".into())).as_str(), "pass");
+    }
+
+    #[test]
+    fn a_list_that_is_not_drawn_takes_no_keys() {
+        let mut s = state();
+        s.set_people(vec![
+            corvo_wan_p2p_core::store::Person {
+                code: Seed::generate().code(),
+                name: "rahul".into(),
+                last_seen: None,
+                standing: corvo_wan_p2p_core::store::Standing::Contact,
+            },
+            corvo_wan_p2p_core::store::Person {
+                code: Seed::generate().code(),
+                name: "rani".into(),
+                last_seen: None,
+                standing: corvo_wan_p2p_core::store::Standing::Contact,
+            },
+        ]);
+        send(&mut s, "/help");
+        type_text(&mut s, "/chat r");
+        press(&mut s, KeyCode::Tab);
+        assert!(s.popup.is_some());
+        update(&mut s, Msg::Resize(80, 8));
+        assert_eq!(s.popup, None, "a resize to too small clears it");
+
+        update(&mut s, Msg::Resize(80, 24));
+        press(&mut s, KeyCode::Tab);
+        assert!(s.popup.is_some());
+        // Drawn nowhere, as if the window shrank without saying.
+        s.size = (80, 8);
+        press(&mut s, KeyCode::Up);
+        assert_eq!(s.popup, None);
+        assert_eq!(s.editor.text(), "/help", "↑ browses the history as if there were no list");
     }
 
     #[test]

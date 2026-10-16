@@ -4,6 +4,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::sync::{Arc, Mutex};
 
 use corvo_wan_p2p_core::identity::Code;
 use corvo_wan_p2p_core::names;
@@ -11,6 +12,7 @@ use corvo_wan_p2p_core::store::{Person, Standing, StoredMessage};
 use zeroize::Zeroizing;
 
 use super::account::Pending;
+use super::commands::may_hold_a_secret;
 use super::onboarding::Onboarding;
 
 pub const APP: &str = "corvo-wan-p2p";
@@ -19,6 +21,9 @@ pub const MAX_INPUT_ROWS: usize = 5;
 pub const HISTORY_LEN: usize = 100;
 /// Lines kept in the `corvo` tab; older ones are dropped.
 pub const CORVO_LEN: usize = 500;
+/// Messages a chat keeps in memory, the newest; older ones load when it's
+/// scrolled to the top, and go again once it's back at the end.
+pub const CHAT_LEN: usize = 500;
 /// How long a flash stays, in ticks (5 seconds).
 pub const FLASH_TICKS: u32 = 20;
 /// Rows the mouse wheel scrolls per notch.
@@ -70,10 +75,15 @@ pub enum Screen {
     Main,
 }
 
+/// Room the input box makes before an answer is typed, so it never moves
+/// while a passphrase is in it (a move would leave a copy behind).
+pub const ANSWER_ROOM: usize = 1024;
+
 /// The multi-line input box. `cursor` is a byte index on a char boundary.
+/// What's typed is wiped from memory when it's replaced or dropped.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Editor {
-    text: String,
+    text: Zeroizing<String>,
     cursor: usize,
 }
 
@@ -86,18 +96,35 @@ impl Editor {
         self.text.is_empty()
     }
 
+    /// Bytes the buffer holds before it has to move.
+    #[cfg(test)]
+    pub fn capacity(&self) -> usize {
+        self.text.capacity()
+    }
+
     pub fn set(&mut self, text: String) {
         self.cursor = text.len();
-        self.text = text;
+        self.text = Zeroizing::new(text);
+    }
+
+    /// Makes [`ANSWER_ROOM`] before an answer is typed. The text moves to the
+    /// new buffer and the old one is wiped.
+    pub fn make_room_for_answer(&mut self) {
+        if self.text.capacity() < ANSWER_ROOM {
+            let mut roomy = Zeroizing::new(String::with_capacity(ANSWER_ROOM.max(self.text.len())));
+            roomy.push_str(&self.text);
+            self.text = roomy;
+        }
     }
 
     pub fn clear(&mut self) {
         self.set(String::new());
     }
 
+    /// The text, moved out (not copied); the box is left empty.
     pub fn take(&mut self) -> String {
         self.cursor = 0;
-        std::mem::take(&mut self.text)
+        std::mem::take(&mut *self.text)
     }
 
     pub fn before_cursor(&self) -> &str {
@@ -117,9 +144,20 @@ impl Editor {
 
     /// Pasted text: CRLF and lone CR become newlines, tabs become spaces.
     pub fn insert_str(&mut self, s: &str) {
-        let s = s.replace("\r\n", "\n").replace('\r', "\n").replace('\t', "    ");
-        self.text.insert_str(self.cursor, &s);
-        self.cursor += s.len();
+        let mut pasted = Zeroizing::new(String::with_capacity(s.len() * 4));
+        let mut chars = s.chars().peekable();
+        while let Some(c) = chars.next() {
+            match c {
+                '\r' => {
+                    chars.next_if_eq(&'\n');
+                    pasted.push('\n');
+                }
+                '\t' => pasted.push_str("    "),
+                c => pasted.push(c),
+            }
+        }
+        self.text.insert_str(self.cursor, &pasted);
+        self.cursor += pasted.len();
     }
 
     pub fn newline(&mut self) {
@@ -246,7 +284,8 @@ impl History {
         let at = match self.at {
             None if self.entries.is_empty() => return None,
             None => {
-                self.draft = current.to_string();
+                // A line with a passphrase in it isn't kept, even as the draft.
+                self.draft = if may_hold_a_secret(current) { String::new() } else { current.to_string() };
                 self.entries.len() - 1
             }
             Some(0) => return None,
@@ -305,6 +344,13 @@ impl Scroll {
     pub fn follow_end(&mut self) {
         self.top = None;
     }
+
+    /// Keeps the same rows in view after `rows` more are added above them.
+    pub fn shift(&mut self, rows: usize) {
+        if let Some(top) = &mut self.top {
+            *top += rows;
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -315,6 +361,8 @@ pub enum Tone {
     Good,
     Warn,
     Bad,
+    /// Your own messages, so no one's name can make theirs look like yours.
+    Own,
 }
 
 /// One line of a tab. It may hold line breaks; `view` splits and wraps it.
@@ -346,6 +394,39 @@ impl Tab {
     }
 }
 
+/// A tab's rows on screen, wrapped, each with its tone.
+pub type Rows = Vec<(String, Tone)>;
+
+/// What a tab's rows were built for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RowKey {
+    pub tab: usize,
+    pub peer: Option<Code>,
+    pub width: u16,
+    /// [`State::changes`] when they were built.
+    pub changes: u64,
+}
+
+/// The open tab's rows as last built, so a frame that changes nothing
+/// doesn't build them again. Kept by `view`, which can't change anything
+/// else: a memo, not state.
+#[derive(Debug, Default)]
+pub struct RowCache(Mutex<Option<(RowKey, Arc<Rows>, usize)>>);
+
+impl RowCache {
+    /// The rows and the `/clear` row, if they were built for `key`.
+    pub fn get(&self, key: &RowKey) -> Option<(Arc<Rows>, usize)> {
+        let cached = self.0.lock().ok()?;
+        cached.as_ref().filter(|(k, ..)| k == key).map(|(_, rows, clear)| (rows.clone(), *clear))
+    }
+
+    pub fn put(&self, key: RowKey, rows: Arc<Rows>, clear_row: usize) {
+        if let Ok(mut cached) = self.0.lock() {
+            *cached = Some((key, rows, clear_row));
+        }
+    }
+}
+
 /// Someone in the sidebar.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Peer {
@@ -359,12 +440,16 @@ pub struct Peer {
     pub unread: usize,
 }
 
-/// One conversation: its messages, oldest first, and how many of theirs you
-/// haven't seen.
+/// One conversation: its newest messages, oldest first, and how many of
+/// theirs you haven't seen.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Chat {
     pub messages: Vec<StoredMessage>,
     pub unread: usize,
+    /// There may be older messages in the store than these.
+    pub older: bool,
+    /// Older ones have been asked for.
+    pub loading: bool,
 }
 
 /// A short message under the chat area that goes away by itself.
@@ -411,10 +496,18 @@ pub struct State {
     pub chats: HashMap<Code, Chat>,
     /// Whether the window has focus: messages are only marked read while it does.
     pub focused: bool,
-    /// Ticks since the engine started, to wait a little before saying "offline".
-    pub since_start: u32,
     /// The completion list, while open.
     pub popup: Option<Popup>,
+    /// The sidebar's first row shown, when it has more than fit.
+    pub sidebar_top: usize,
+    /// The chat the sidebar was last scrolled to show.
+    pub sidebar_for: Option<Code>,
+    /// Counts the changes that can change what a tab shows; `update` adds one
+    /// for every message but the tick.
+    pub changes: u64,
+    pub rows: RowCache,
+    /// Whether the terminal may copy to the clipboard (see `clip::can_copy`).
+    pub can_copy: bool,
 }
 
 impl State {
@@ -442,8 +535,12 @@ impl State {
             connected: HashSet::new(),
             chats: HashMap::new(),
             focused: true,
-            since_start: 0,
             popup: None,
+            sidebar_top: 0,
+            sidebar_for: None,
+            changes: 0,
+            rows: RowCache::default(),
+            can_copy: true,
         }
     }
 
@@ -469,15 +566,29 @@ impl State {
         self.known.iter().find(|p| p.code == *code).map(|p| p.standing)
     }
 
-    /// Replaces everyone known, then relabels.
+    /// Replaces everyone known, then relabels, and says who's called
+    /// something new: whichever brings a rename first, a refresh or the
+    /// engine's event, says it.
     pub fn set_people(&mut self, people: Vec<Person>) {
+        let renamed: Vec<(String, Code)> = people
+            .iter()
+            .filter(|p| self.known.iter().any(|k| k.code == p.code && k.name != p.name))
+            .map(|p| (self.label(&p.code), p.code))
+            .collect();
         self.known = people;
         self.relabel();
+        for (before, code) in renamed {
+            let after = self.label(&code);
+            if after != before {
+                self.say(Tone::Plain, format!("{before} is now called {after}"));
+            }
+        }
     }
 
     /// Recomputes the labels after a change to `known`, and with them the
     /// sidebar and the chat tabs' titles.
     pub fn relabel(&mut self) {
+        self.changes += 1;
         self.labels = names::labels(&self.known);
         for i in 1..self.tabs.len() {
             if let Some(code) = self.tabs[i].peer {
@@ -563,6 +674,7 @@ impl State {
 
     /// Adds a line to the `corvo` tab, and flashes it if it's a warning or an error.
     pub fn say(&mut self, tone: Tone, text: impl Into<String>) {
+        self.changes += 1;
         let line = Line { text: text.into(), tone };
         if matches!(tone, Tone::Warn | Tone::Bad) {
             self.flash = Some(Flash { line: line.clone(), ticks_left: FLASH_TICKS });
@@ -578,6 +690,7 @@ impl State {
     /// Like a terminal's `clear`: the open tab shows empty, and scrolling up
     /// shows what came before.
     pub fn clear_tab(&mut self) {
+        self.changes += 1;
         let tab = &self.tabs[self.current];
         // A chat tab's mark counts its messages; the corvo tab's, its lines.
         let len = match tab.peer {

@@ -18,7 +18,7 @@ use super::account::{PhraseDone, PhraseUse};
 use super::chat::{History, Loaded};
 use super::clip::osc52;
 use super::people::Act;
-use super::state::Secret;
+use super::state::{CHAT_LEN, Secret};
 use super::update::{Effect, Msg, Outcome};
 use crate::selfupdate::{self, Release, Urls};
 
@@ -149,6 +149,13 @@ impl<W: Write> Runner<W> {
                     result.map(|id| StoredMessage { id, sent_at: now_ms(), text: text.clone(), mark: Mark::Waiting });
                 Outcome::Sent { to, text, result }
             }
+            Effect::LoadOlder { peer, before, n } => Outcome::LoadedOlder {
+                peer,
+                result: match self.client() {
+                    Ok(client) => client.history_before(peer, Some(before), n).await.map_err(|e| e.to_string()),
+                    Err(e) => Err(e),
+                },
+            },
             Effect::MarkRead(peer) => match self.client() {
                 Ok(client) => match client.mark_read(peer).await {
                     Ok(()) => return Ok(Flow::Next(None)),
@@ -219,7 +226,7 @@ impl<W: Write> Runner<W> {
         let (people, unreadable_people) = client.people_checked().await?;
         let mut chats = Vec::new();
         for p in people.iter().filter(|p| p.standing != Standing::Blocked) {
-            let (messages, unreadable) = client.history_checked(p.code).await?;
+            let (messages, unreadable) = client.history_before(p.code, None, CHAT_LEN).await?;
             let read_upto = client.read_upto(p.code).await?;
             chats.push(History { code: p.code, messages, read_upto, unreadable });
         }
@@ -239,8 +246,8 @@ impl<W: Write> Runner<W> {
     }
 
     fn copy(&mut self, text: &str) -> std::io::Result<()> {
-        let sequence = Secret::new(osc52(text));
-        self.out.write_all(sequence.expose().as_bytes())?;
+        let sequence = osc52(text);
+        self.out.write_all(sequence.as_bytes())?;
         self.out.flush()
     }
 
@@ -290,6 +297,9 @@ impl<W: Write> Runner<W> {
             PhraseUse::Copy => {
                 self.copy(words.expose()).map_err(|e| format!("couldn't copy them: {e}"))?;
                 Ok(PhraseDone::Copied)
+            }
+            PhraseUse::Save { overwrite: false } if let Some(path) = self.recovery_file() => {
+                Ok(PhraseDone::Exists(path))
             }
             PhraseUse::Save { overwrite } => self.write_recovery(&seed, overwrite).map(PhraseDone::Saved),
         }
@@ -454,7 +464,7 @@ mod tests {
             assert!(file.contains(&format!("{:>2}. {word}", i + 1)));
         }
         assert!(file.contains(&seed.code().to_string()));
-        assert!(app.written().contains(&osc52(&seed.code().to_string())), "the code is copied");
+        assert!(app.written().contains(osc52(&seed.code().to_string()).as_str()), "the code is copied");
         assert_eq!(app.send("").await, None);
         assert!(matches!(app.state.screen, Screen::Main));
         assert_eq!(app.state.code, Some(seed.code()));
@@ -512,7 +522,7 @@ mod tests {
 
         app.send("/phrase copy").await;
         app.send("pw").await;
-        assert!(app.written().contains(&osc52(&seed.phrase())));
+        assert!(app.written().contains(osc52(&seed.phrase()).as_str()));
 
         recovery::remove(home.path()).unwrap();
         app.send("/phrase save").await;
@@ -523,6 +533,26 @@ mod tests {
         assert_eq!(app.state.ask().unwrap().label, "replace it? y/n: ");
         app.send("y").await;
         assert!(app.said().last().unwrap().starts_with("your words are saved in"));
+        app.runner.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn phrase_save_checks_the_passphrase_before_asking_to_replace() {
+        let (data, home) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        let mut app = App::open(&data, &home, false);
+        app.make_account().await;
+        app.send("").await;
+        let file = recovery::path(home.path());
+        let before = std::fs::read_to_string(&file).unwrap();
+        app.send("/phrase save").await;
+        app.send("nope").await;
+        assert_eq!(app.state.ask(), None, "no question after a wrong passphrase");
+        assert_eq!(app.said().last().unwrap(), "wrong passphrase");
+        app.send("/phrase save").await;
+        app.send("pw").await;
+        assert_eq!(app.state.ask().unwrap().label, "replace it? y/n: ");
+        app.send("n").await;
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), before, "kept");
         app.runner.shutdown().await;
     }
 

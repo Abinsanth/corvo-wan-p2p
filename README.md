@@ -82,7 +82,7 @@ A green dot next to a contact means they're online. Next to your own messages:
 
 | Command | What it does |
 |---|---|
-| `/code` | show your code and copy it |
+| `/code` | show your code and send it to your clipboard, if your terminal allows it |
 | `/add <code>` | add a friend by their code and open a chat |
 | `/chat <name>` | open a chat (Tab completes names) |
 | `/contacts` | your contacts, who's online, last seen |
@@ -97,7 +97,7 @@ A green dot next to a contact means they're online. Next to your own messages:
 | `/passphrase` | change your passphrase |
 | `/phrase` | show your 12 words again (asks your passphrase first) |
 | `/phrase save` | write them to `~/corvo-wan-p2p-recovery.txt` again |
-| `/phrase copy` | copy them to the clipboard |
+| `/phrase copy` | send them to your clipboard, if your terminal allows it (not in Terminal.app) |
 | `/close` | close this chat tab |
 | `/clear` | clear the screen (Ctrl-L) |
 | `/update` | check for a newer version and install it |
@@ -148,8 +148,8 @@ requests; accept them again.
   `CORVO_WAN_P2P_LOG=debug` for more while looking into a problem (still
   only the app's own notes). Past 1 MB it starts over, keeping one old file.
 - **The recovery file** holds your 12 words in plain text. Delete it once
-  you've copied them. `/phrase copy` puts the words on your clipboard, where
-  clipboard history apps may keep them.
+  you've copied them. `/phrase copy` sends the words to your clipboard if your terminal allows it,
+  and clipboard history apps may keep them there.
 
 ## Uninstall
 

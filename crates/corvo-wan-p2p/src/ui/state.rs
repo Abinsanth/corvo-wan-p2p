@@ -14,6 +14,7 @@ use zeroize::Zeroizing;
 use super::account::Pending;
 use super::commands::may_hold_a_secret;
 use super::onboarding::Onboarding;
+use super::window::Overlay;
 
 pub const APP: &str = "corvo-wan-p2p";
 /// The input box grows up to this many rows, then scrolls.
@@ -508,6 +509,8 @@ pub struct State {
     pub rows: RowCache,
     /// Whether the terminal may copy to the clipboard (see `clip::can_copy`).
     pub can_copy: bool,
+    /// A window over the main screen, while open.
+    pub overlay: Option<Overlay>,
 }
 
 impl State {
@@ -541,6 +544,7 @@ impl State {
             changes: 0,
             rows: RowCache::default(),
             can_copy: true,
+            overlay: None,
         }
     }
 

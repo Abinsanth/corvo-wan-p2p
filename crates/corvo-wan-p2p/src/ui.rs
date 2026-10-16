@@ -13,6 +13,7 @@ pub mod runner;
 pub mod state;
 pub mod update;
 pub mod view;
+pub mod window;
 
 use std::collections::VecDeque;
 use std::io::{Write, stdout};

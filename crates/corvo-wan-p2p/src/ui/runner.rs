@@ -360,6 +360,7 @@ mod tests {
     use crate::ui::onboarding::Onboarding;
     use crate::ui::state::{Screen, State};
     use crate::ui::update::update;
+    use crate::ui::window::Overlay;
     use corvo_wan_p2p_core::identity::Seed;
     use corvo_wan_p2p_core::recovery;
     use corvo_wan_p2p_core::store::KdfParams;
@@ -474,6 +475,14 @@ mod tests {
             }
             seed
         }
+
+        /// Enter at the code starts the app; the welcome shows, and Enter closes it.
+        async fn start(&mut self) {
+            self.send("").await;
+            assert!(matches!(self.state.overlay, Some(Overlay::Welcome { .. })), "the welcome shows");
+            self.send("").await;
+            assert_eq!(self.state.overlay, None);
+        }
     }
 
     #[tokio::test]
@@ -507,7 +516,7 @@ mod tests {
         let (data, home) = (TempDir::new().unwrap(), TempDir::new().unwrap());
         let mut app = App::open(&data, &home, false);
         app.make_account().await;
-        app.send("").await;
+        app.start().await;
         for answer in ["/passphrase", "wrong", "new", "new"] {
             app.send(answer).await;
         }
@@ -531,7 +540,7 @@ mod tests {
         let (data, home) = (TempDir::new().unwrap(), TempDir::new().unwrap());
         let mut app = App::open(&data, &home, false);
         let seed = app.make_account().await;
-        app.send("").await;
+        app.start().await;
         app.send("/phrase").await;
         app.send("nope").await;
         assert_eq!(app.state.reveal, None);
@@ -563,7 +572,7 @@ mod tests {
         let (data, home) = (TempDir::new().unwrap(), TempDir::new().unwrap());
         let mut app = App::open(&data, &home, false);
         app.make_account().await;
-        app.send("").await;
+        app.start().await;
         let file = recovery::path(home.path());
         let before = std::fs::read_to_string(&file).unwrap();
         app.send("/phrase save").await;

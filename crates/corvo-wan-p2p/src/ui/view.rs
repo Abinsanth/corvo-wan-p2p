@@ -33,6 +33,7 @@ use zeroize::Zeroizing;
 use super::chat::local;
 use super::onboarding::Onboarding;
 use super::state::{APP, Line, MAX_INPUT_ROWS, RowKey, Rows, Screen, Secret, State, Tab, Tone};
+use super::window::{self, Overlay};
 
 /// Smaller than this, only [`TOO_SMALL`] is drawn.
 pub const MIN_WIDTH: u16 = 40;
@@ -330,6 +331,26 @@ pub fn draw(frame: &mut Frame, state: &State) {
     draw_input(frame, state, areas.input);
     draw_popup(frame, state, areas.input);
     draw_status(frame, state, areas.status);
+    if let Some(overlay) = &state.overlay {
+        draw_overlay(frame, overlay, area);
+    }
+}
+
+/// A window centred over the screen, scrolled as `update` left it.
+fn draw_overlay(frame: &mut Frame, overlay: &Overlay, area: Rect) {
+    let rows = window::rows(overlay, (area.width, area.height));
+    let height = window::height((area.width, area.height), rows.len()) + 2;
+    let width = window::WIDTH.min(area.width);
+    let at =
+        Rect::new(area.x + (area.width - width) / 2, area.y + (area.height.saturating_sub(height)) / 2, width, height);
+    let lines: Vec<TextLine> = rows.into_iter().map(|row| TextLine::from(format!("  {row}"))).collect();
+    frame.render_widget(Clear, at);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(Block::bordered().title(overlay.title()))
+            .scroll((window::scroll(overlay, (area.width, area.height)), 0)),
+        at,
+    );
 }
 
 /// What the app is busy with, or else the flash.
@@ -764,6 +785,31 @@ mod tests {
 
     fn row(buf: &Buffer, y: u16) -> String {
         (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect()
+    }
+
+    #[test]
+    fn the_welcome_window_reads_on_80_by_24_and_scrolls_on_less() {
+        let mut state = State::new("ana".into(), "abcdefgh".into());
+        state.overlay = Some(Overlay::Welcome { scroll: 0 });
+        let all = |buf: &Buffer| (0..buf.area.height).map(|y| row(buf, y)).collect::<Vec<_>>().join("\n");
+        let screen = all(&render(&state, 80, 24));
+        // As approved in #41.
+        for part in [
+            "┌─ Welcome to corvo ───",
+            "│  Chat with friends directly, computer to computer.   │",
+            "│  • Your 12 words are your account. Never share       │",
+            "│              /help any time · Enter to start         │",
+        ] {
+            assert!(screen.contains(part), "{part:?} missing:\n{screen}");
+        }
+        let short = all(&render(&state, 40, 12));
+        assert!(short.contains("Welcome to corvo") && !short.contains("/help any time"), "{short}");
+        let total = window::rows(&Overlay::Welcome { scroll: 0 }, (40, 12)).len();
+        state.overlay =
+            Some(Overlay::Welcome { scroll: (total - usize::from(window::height((40, 12), total))) as u16 });
+        assert!(all(&render(&state, 40, 12)).contains("/help any time"), "scrolled to the end");
+        let bigger = all(&render(&state, 80, 24));
+        assert!(bigger.contains("Chat with friends directly"), "a bigger terminal shows it all:\n{bigger}");
     }
 
     fn render(state: &State, w: u16, h: u16) -> Buffer {

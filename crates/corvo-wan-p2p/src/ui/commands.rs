@@ -29,6 +29,7 @@ pub enum Cmd {
     Update {
         yes: bool,
     },
+    Welcome,
     Help,
     Quit,
 }
@@ -64,6 +65,7 @@ pub const COMMANDS: &[&str] = &[
     "close",
     "clear",
     "update",
+    "welcome",
     "help",
     "h",
     "quit",
@@ -91,6 +93,7 @@ pub const HELP: &[(&str, &str)] = &[
     ("/close", "close this chat tab"),
     ("/clear", "clear the screen (Ctrl-L)"),
     ("/update [yes]", "check for and install a newer version"),
+    ("/welcome", "show the welcome again"),
     ("/help  /h", "list commands"),
     ("/quit  /q", "quit (Ctrl-C)"),
 ];
@@ -128,6 +131,7 @@ pub fn parse(line: &str) -> Input {
         "passphrase" => Err("type /passphrase alone; it asks for them hidden".into()),
         "close" => no_args(args, "close", Cmd::Close),
         "clear" => no_args(args, "clear", Cmd::Clear),
+        "welcome" => no_args(args, "welcome", Cmd::Welcome),
         "help" | "h" => no_args(args, "help", Cmd::Help),
         "quit" | "q" => no_args(args, "quit", Cmd::Quit),
         "add" if args.is_empty() => Err("try: /add <code>  (ask your friend for theirs; yours is /code)".into()),
@@ -248,6 +252,7 @@ impl Cmd {
             Cmd::Close => "/close",
             Cmd::Clear => "/clear",
             Cmd::Update { .. } => "/update",
+            Cmd::Welcome => "/welcome",
             Cmd::Help => "/help",
             Cmd::Quit => "/quit",
         }
@@ -292,6 +297,7 @@ mod tests {
             ("/phrase", Cmd::Phrase),
             ("/close", Cmd::Close),
             ("/clear", Cmd::Clear),
+            ("/welcome", Cmd::Welcome),
             ("/help", Cmd::Help),
             ("/h", Cmd::Help),
             ("/quit", Cmd::Quit),

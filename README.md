@@ -56,7 +56,10 @@ account or **recover** one:
    to `~/corvo-wan-p2p-recovery.txt`, readable only by you. Copy them
    somewhere safe (a password manager, paper), then delete that file. The app
    reminds you at each start until you do.
-3. Your **code** (`corvo:…`) is shown. Send it to a friend any way you like.
+3. Your **code** (`corvo1…`, 64 characters) is shown. Send it to a friend any
+   way you like. If one character of a code is mistyped, the app always
+   notices. (Codes from the test versions before `0.1.0-rc.3` started with
+   `corvo:` and no longer work; contacts you already have stay.)
 
 To chat:
 

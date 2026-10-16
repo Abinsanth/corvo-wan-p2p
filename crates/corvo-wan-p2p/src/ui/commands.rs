@@ -316,7 +316,7 @@ mod tests {
         assert!(wrong("/add").starts_with("try: /add <code>"));
         assert!(wrong(&format!("/add {}", &text[..30])).contains("probably missing"));
         // One character of the key changed: only the checksum can tell.
-        let swapped = if &text[10..11] == "a" { "b" } else { "a" };
+        let swapped = if &text[10..11] == "q" { "p" } else { "q" };
         let typo = format!("{}{swapped}{}", &text[..10], &text[11..]);
         assert!(wrong(&format!("/add {typo}")).contains("typo"));
     }

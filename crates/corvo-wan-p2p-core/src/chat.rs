@@ -20,7 +20,7 @@ use iroh::endpoint::{Connection, RelayStatus};
 use iroh::{Endpoint, Watcher};
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, oneshot};
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::Instant;
 use tracing::{debug, info, warn};
 use zeroize::Zeroizing;
@@ -271,6 +271,7 @@ impl Client {
             renames: HashMap::new(),
             run: Run { session: rand::random(), started: now_ms().max(1) as u64 },
             mismatched: HashMap::new(),
+            work: JoinSet::new(),
         };
         let task = tokio::spawn(core.run(commands_rx, internal_rx));
         Ok(Client { commands, events, me, task })
@@ -481,6 +482,8 @@ struct Core {
     /// Contacts on another protocol version, and theirs, as last reported:
     /// each is said once, not on every attempt.
     mismatched: HashMap<Code, u32>,
+    /// Passphrase work on blocking threads, waited for before the engine stops.
+    work: JoinSet<()>,
 }
 
 impl Core {
@@ -507,6 +510,8 @@ impl Core {
                 _ = sleep_until(due) => self.dial_due(),
             }
         }
+        // A passphrase change still saving finishes before the store is let go.
+        while self.work.join_next().await.is_some() {}
         accept.abort();
         network.abort();
         for link in self.links.values() {
@@ -561,19 +566,25 @@ impl Core {
             // thread, so messages keep flowing meanwhile.
             Command::ChangePassphrase { old, new, reply } => {
                 let (passphrase, kdf) = (self.store.passphrase(), self.config.kdf);
-                tokio::task::spawn_blocking(move || {
+                self.blocking(move || {
                     let _ = reply.send(change_passphrase(&passphrase, &old, &new, kdf));
                 });
             }
             Command::Phrase(typed, reply) => {
                 let passphrase = self.store.passphrase();
                 let seed = self.store.profile().map(|p| p.seed);
-                tokio::task::spawn_blocking(move || {
+                self.blocking(move || {
                     let _ = reply.send(check_passphrase(&passphrase, &typed).and_then(|()| Ok(seed?)));
                 });
             }
             Command::Shutdown => {}
         }
+    }
+
+    /// Runs `work` on a blocking thread, kept so stopping can wait for it.
+    fn blocking(&mut self, work: impl FnOnce() + Send + 'static) {
+        while self.work.try_join_next().is_some() {}
+        self.work.spawn_blocking(work);
     }
 
     fn add_contact(&mut self, code: Code) -> Result<(), ChatError> {

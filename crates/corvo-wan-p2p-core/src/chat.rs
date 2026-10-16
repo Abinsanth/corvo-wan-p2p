@@ -1267,11 +1267,10 @@ fn check_passphrase(passphrase: &Passphrase, typed: &str) -> Result<(), ChatErro
 }
 
 fn change_passphrase(passphrase: &Passphrase, old: &str, new: &str, kdf: KdfParams) -> Result<(), ChatError> {
-    if new.is_empty() {
-        return Err(StoreError::EmptyPassphrase.into());
+    match passphrase.change_from(old, new, kdf) {
+        Err(StoreError::WrongPassphrase) => Err(ChatError::WrongPassphrase),
+        result => Ok(result?),
     }
-    check_passphrase(passphrase, old)?;
-    Ok(passphrase.change(new, kdf)?)
 }
 
 #[cfg(test)]

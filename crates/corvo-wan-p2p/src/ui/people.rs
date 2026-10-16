@@ -367,7 +367,7 @@ mod tests {
         let (mut s, _) = state();
         let mut typo = Seed::generate().code().to_string();
         let end = typo.pop().unwrap();
-        typo.push(if end == 'a' { 'b' } else { 'a' });
+        typo.push(if end == 'q' { 'p' } else { 'q' });
         let effects = send(&mut s, &format!("/add {typo}"));
         assert!(!effects.iter().any(|e| matches!(e, Effect::Act { .. })));
         assert_eq!(last_line_tone(&s), Tone::Bad);

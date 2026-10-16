@@ -53,9 +53,10 @@ pub fn on_event(state: &mut State, event: Event) {
             );
         }
         Event::Received { from, id, sent_at, text } => {
-            // Only `Request` brings someone new. Someone unknown here was just
-            // removed or blocked, and this was sent before that took effect.
-            if state.standing(&from).is_none() {
+            // Only `Request` brings someone new. Someone unknown or blocked here
+            // was just removed or blocked, and this was sent before that took
+            // effect; the store keeps it in case you unblock them.
+            if !matches!(state.standing(&from), Some(Standing::Contact | Standing::Request)) {
                 return;
             }
             let chat = state.chats.entry(from).or_default();
@@ -339,6 +340,18 @@ mod tests {
 
     fn marks(state: &State, who: Code) -> Vec<Mark> {
         state.chats[&who].messages.iter().map(|m| m.mark).collect()
+    }
+
+    #[test]
+    fn a_message_from_someone_just_blocked_is_not_shown() {
+        let (mut s, rahul, _) = state();
+        update(&mut s, received(rahul, "m1"));
+        s.set_people(vec![Person { code: rahul, ..person("rahul", Standing::Blocked) }]);
+        let (unread, tabs) = (s.chats[&rahul].unread, s.tabs.len());
+        update(&mut s, received(rahul, "m2"));
+        assert_eq!(s.chats[&rahul].messages.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), ["m1"]);
+        assert_eq!(s.chats[&rahul].unread, unread);
+        assert_eq!(s.tabs.len(), tabs);
     }
 
     fn last_corvo(state: &State) -> String {

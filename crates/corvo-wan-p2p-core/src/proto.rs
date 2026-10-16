@@ -17,7 +17,14 @@ pub const MAX_ID: usize = 64;
 #[serde(tag = "t", rename_all = "snake_case")]
 pub enum Frame {
     /// Sent first, by both sides. Names follow in a [`Frame::Name`].
-    Hello { proto: u32, app_version: String },
+    /// `session` is random for each run of the app, so a link from a restarted
+    /// app can be told from a stale one. Apps before 0.1.0-rc.3 send none (0).
+    Hello {
+        proto: u32,
+        app_version: String,
+        #[serde(default)]
+        session: u64,
+    },
     /// A message. `id` is a ULID chosen by the sender; `sent_at` is Unix milliseconds.
     Msg { id: String, sent_at: i64, text: String },
     /// "I've saved your message `id`."
@@ -88,7 +95,7 @@ mod tests {
 
     fn all_kinds() -> Vec<Frame> {
         vec![
-            Frame::Hello { proto: PROTO_VERSION, app_version: "0.1.0".into() },
+            Frame::Hello { proto: PROTO_VERSION, app_version: "0.1.0".into(), session: 7 },
             Frame::Msg { id: "01J9ZQ4V6X3K8Y2M5N7P0R1S2T".into(), sent_at: 1_760_000_000_000, text: "hi 👋".into() },
             Frame::Ack { id: "01J9ZQ4V6X3K8Y2M5N7P0R1S2T".into() },
             Frame::Read { up_to: "01J9ZQ4V6X3K8Y2M5N7P0R1S2T".into() },
@@ -110,6 +117,13 @@ mod tests {
     fn the_wire_format_is_tagged_json() {
         let bytes = encode(&Frame::Ack { id: "x".into() });
         assert_eq!(&bytes[4..], br#"{"t":"ack","id":"x"}"#);
+    }
+
+    #[test]
+    fn a_hello_from_before_sessions_is_still_read() {
+        // As 0.1.0-rc.2 sends it.
+        let old = br#"{"t":"hello","proto":1,"app_version":"0.1.0-rc.2"}"#;
+        assert_eq!(decode(old).unwrap(), Frame::Hello { proto: 1, app_version: "0.1.0-rc.2".into(), session: 0 });
     }
 
     #[test]

@@ -4,7 +4,8 @@
 //!
 //! Nothing is read past their hello, and an accepted connection gets no hello
 //! of ours, until the core has looked at it and said yes. So a connection the
-//! core turns down never delivers a frame, and never sees us answer.
+//! core turns down never delivers a frame and, unless it was only turned down
+//! for speaking another protocol version, never sees us answer.
 
 use std::time::Duration;
 
@@ -13,7 +14,16 @@ use tokio::sync::{mpsc, oneshot};
 
 use super::{Internal, OUT_QUEUE, close};
 use crate::identity::Code;
-use crate::proto::{Frame, FrameError, read_frame, write_frame};
+use crate::proto::{Frame, FrameError, PROTO_VERSION, read_frame, write_frame};
+
+/// The core's answer to a hello. Dropping the sender instead turns the link down.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum Verdict {
+    Accept,
+    /// They speak another protocol version: send our hello anyway, so their
+    /// app can say who needs to update, then close.
+    TellVersion,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Role {
@@ -41,8 +51,15 @@ pub(super) async fn run(start: Start) {
     let (send, mut recv, theirs) = match handshake {
         Ok(Ok(parts)) => parts,
         _ => {
+            // An app on another protocol version may have turned us down
+            // without a hello; it names its version as the close reason.
+            let refused = if role == Role::Dialer { refused_version(&conn) } else { None };
             conn.close(close::HANDSHAKE.into(), b"handshake failed");
-            let _ = internal.send(Internal::Failed { peer, id, role }).await;
+            let failed = match refused {
+                Some(theirs) => Internal::VersionRefused { peer, id, theirs },
+                None => Internal::Failed { peer, id, role },
+            };
+            let _ = internal.send(failed).await;
             return;
         }
     };
@@ -50,12 +67,17 @@ pub(super) async fn run(start: Start) {
     if role == Role::Acceptor {
         // Our hello is the first thing written, and only once the core says
         // yes: someone turned away (blocked, say) never gets one.
-        let _ = out.try_send(hello);
+        let _ = out.try_send(hello.clone());
     }
     let (verdict, accepted) = oneshot::channel();
     let ready = Internal::Ready { peer, id, conn: conn.clone(), role, hello: theirs, out, verdict };
-    if internal.send(ready).await.is_err() || accepted.await != Ok(true) {
-        return; // the core turned it down and has closed it
+    if internal.send(ready).await.is_err() {
+        return;
+    }
+    match accepted.await {
+        Ok(Verdict::Accept) => {}
+        Ok(Verdict::TellVersion) => return tell_version(&conn, send, &hello).await,
+        Err(_) => return, // the core turned it down and has closed it
     }
     tokio::spawn(write_loop(send, out_rx));
     while let Ok(frame) = read_frame(&mut recv).await {
@@ -76,6 +98,27 @@ pub(super) async fn run(start: Start) {
     );
     conn.close(close::BYE.into(), b"bye");
     let _ = internal.send(Internal::Closed { peer, id, duplicate }).await;
+}
+
+/// Sends a peer on another protocol version our hello, gives their app a
+/// moment to read it (it closes first), then closes, naming our version.
+async fn tell_version(conn: &Connection, mut send: SendStream, hello: &Frame) {
+    if write_frame(&mut send, hello).await.is_ok() {
+        let _ = send.finish();
+        let _ = tokio::time::timeout(Duration::from_secs(1), conn.closed()).await;
+    }
+    conn.close(close::VERSION.into(), PROTO_VERSION.to_string().as_bytes());
+}
+
+/// The version an app named when it closed our connection for speaking
+/// another one, if that's why it closed.
+fn refused_version(conn: &Connection) -> Option<u32> {
+    match conn.close_reason()? {
+        ConnectionError::ApplicationClosed(c) if c.error_code == close::VERSION.into() => {
+            std::str::from_utf8(&c.reason).ok()?.parse().ok()
+        }
+        _ => None,
+    }
 }
 
 async fn shake_hands(

@@ -29,7 +29,7 @@ use crate::identity::{Code, NameError, Seed, clean_name};
 use crate::net::ALPN;
 use crate::proto::{Frame, MAX_FRAME, MAX_TEXT, PROTO_VERSION, encode};
 use crate::store::{KdfParams, Passphrase, Person, Standing, Store, StoreError, StoredMessage};
-use link::Role;
+use link::{Role, Verdict};
 
 /// The most requests waiting for an answer. Strangers are refused beyond it.
 pub const MAX_REQUESTS: usize = 20;
@@ -177,7 +177,7 @@ enum Internal {
         role: Role,
         hello: Frame,
         out: mpsc::Sender<Frame>,
-        verdict: oneshot::Sender<bool>,
+        verdict: oneshot::Sender<Verdict>,
     },
     Frame {
         peer: Code,
@@ -199,6 +199,13 @@ enum Internal {
         peer: Code,
         id: u64,
         role: Role,
+    },
+    /// We dialed, and their app closed the connection for speaking another
+    /// protocol version: `theirs`.
+    VersionRefused {
+        peer: Code,
+        id: u64,
+        theirs: u32,
     },
     /// Whether the endpoint is connected to a relay now.
     Network(bool),
@@ -237,6 +244,8 @@ impl Client {
             next_link: 0,
             online: None,
             renames: HashMap::new(),
+            session: rand::random(),
+            mismatched: HashMap::new(),
         };
         let task = tokio::spawn(core.run(commands_rx, internal_rx));
         Ok(Client { commands, events, me, task })
@@ -363,6 +372,8 @@ struct Link {
     in_flight: HashSet<String>,
     /// The name a guest's app sent, kept in case they become a request.
     heard_name: Option<String>,
+    /// Their app's run, from its hello (0 from apps before sessions).
+    session: u64,
 }
 
 impl Link {
@@ -408,6 +419,11 @@ struct Core {
     /// Name changes taken from each request, until it's answered. Kept per
     /// person, not per connection, so reconnecting doesn't earn more.
     renames: HashMap<Code, usize>,
+    /// This run of the app, sent in every hello.
+    session: u64,
+    /// Contacts on another protocol version, and theirs, as last reported:
+    /// each is said once, not on every attempt.
+    mismatched: HashMap<Code, u32>,
 }
 
 impl Core {
@@ -648,7 +664,8 @@ impl Core {
         match message {
             Internal::Incoming(conn) => self.incoming(conn),
             Internal::Ready { peer, id, conn, role, hello, out, verdict } => {
-                let link = Link { id, out, conn, initiator: peer, in_flight: HashSet::new(), heard_name: None };
+                let link =
+                    Link { id, out, conn, initiator: peer, in_flight: HashSet::new(), heard_name: None, session: 0 };
                 self.ready(peer, role, hello, link, verdict);
             }
             Internal::Frame { peer, frame } => self.frame(peer, frame),
@@ -666,6 +683,12 @@ impl Core {
                     self.dialing.remove(&peer);
                     self.back_off(peer, None);
                 }
+            }
+            Internal::VersionRefused { peer, id, theirs } => {
+                self.guests.remove(&id);
+                self.dialing.remove(&peer);
+                self.mismatch(peer, theirs);
+                self.back_off(peer, Some(self.config.retry_max));
             }
             Internal::Network(online) => {
                 if self.online.replace(online) != Some(online) {
@@ -730,12 +753,12 @@ impl Core {
     }
 
     fn hello(&self) -> Frame {
-        Frame::Hello { proto: PROTO_VERSION, app_version: VERSION.into() }
+        Frame::Hello { proto: PROTO_VERSION, app_version: VERSION.into(), session: self.session }
     }
 
     /// A link has exchanged hellos. Decides whether to keep it; a link turned
     /// down here is closed without a single frame being read from it.
-    fn ready(&mut self, peer: Code, role: Role, hello: Frame, mut link: Link, verdict: oneshot::Sender<bool>) {
+    fn ready(&mut self, peer: Code, role: Role, hello: Frame, mut link: Link, verdict: oneshot::Sender<Verdict>) {
         if role == Role::Dialer {
             self.dialing.remove(&peer);
         }
@@ -755,25 +778,37 @@ impl Core {
         if standing == Some(Standing::Blocked) || (role == Role::Dialer && !contact) {
             return refuse(self, link, close::REFUSED);
         }
-        let Frame::Hello { proto, .. } = hello else {
+        let Frame::Hello { proto, session, .. } = hello else {
             refuse(self, link, close::BAD_HELLO);
             return self.back_off(peer, None);
         };
         if proto != PROTO_VERSION {
-            refuse(self, link, close::VERSION);
+            // Either way they learn our version, so their app can say who
+            // needs to update: as a hello if they dialed, else as the close reason.
+            self.guests.remove(&link.id);
+            if role == Role::Acceptor {
+                let _ = verdict.send(Verdict::TellVersion);
+            } else {
+                link.conn.close(close::VERSION.into(), PROTO_VERSION.to_string().as_bytes());
+            }
             if contact {
-                self.emit(Event::VersionMismatch { peer, theirs: proto });
+                self.mismatch(peer, proto);
                 self.back_off(peer, Some(self.config.retry_max));
             }
             return;
         }
+        self.mismatched.remove(&peer);
+        link.session = session;
         link.initiator = if role == Role::Dialer { self.me } else { peer };
         let was_online = if let Some(existing) = self.links.get(&peer) {
+            // A link from another run of their app: the old one is dead (they
+            // restarted without closing it), so the new one wins.
+            let restarted = existing.session != link.session;
             // Both sides dialed at once. Both keep the connection opened by the
             // smaller key, so they agree; a newer connection from the same
             // side replaces a stale one.
             let smaller = if self.me.key().as_bytes() < peer.key().as_bytes() { self.me } else { peer };
-            if existing.initiator != link.initiator && existing.initiator == smaller {
+            if !restarted && existing.initiator != link.initiator && existing.initiator == smaller {
                 return refuse(self, link, close::DUPLICATE);
             }
             existing.conn.close(close::DUPLICATE.into(), b"duplicate");
@@ -782,7 +817,7 @@ impl Core {
         } else {
             self.quiet.remove(&peer)
         };
-        let _ = verdict.send(true);
+        let _ = verdict.send(Verdict::Accept);
         if !contact {
             self.guests.insert(link.id);
             self.links.insert(peer, link);
@@ -933,6 +968,13 @@ impl Core {
             self.went_offline(peer);
         }
         self.retry_in(peer, self.config.retry_first);
+    }
+
+    /// A contact's app speaks protocol `theirs`: said once, and again only if it changes.
+    fn mismatch(&mut self, peer: Code, theirs: u32) {
+        if self.mismatched.insert(peer, theirs) != Some(theirs) {
+            self.emit(Event::VersionMismatch { peer, theirs });
+        }
     }
 
     fn went_offline(&mut self, peer: Code) {

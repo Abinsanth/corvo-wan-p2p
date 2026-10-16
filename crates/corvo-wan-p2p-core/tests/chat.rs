@@ -4,7 +4,7 @@ mod common;
 
 use std::time::Duration;
 
-use common::{Fake, Peer, eventually, friends, is_cut_off, next_frame};
+use common::{Fake, Peer, eventually, friends, is_cut_off, next_frame, say};
 use corvo_wan_p2p_core::chat::{ChatError, Event};
 use corvo_wan_p2p_core::identity::Seed;
 use corvo_wan_p2p_core::proto::{Frame, MAX_FRAME, MAX_TEXT, PROTO_VERSION, write_frame};
@@ -154,6 +154,91 @@ async fn a_different_protocol_version_is_reported_and_messages_wait() {
     let fc = fake.code;
     a.expect(|e| *e == Event::VersionMismatch { peer: fc, theirs: PROTO_VERSION + 1 }).await;
     assert_eq!(a.client.history(fake.code).await.unwrap()[0].mark, Mark::Waiting);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_contact_answering_another_version_is_reported_once() {
+    let lookup = MemoryLookup::new();
+    let mut a = Peer::start(&lookup, "abin").await;
+    let fake = Fake::new(&lookup).await;
+    let dials = fake.answer_with(fake.hello_frame(PROTO_VERSION + 1));
+    a.client.add_contact(fake.code).await.unwrap();
+    a.client.send(fake.code, "waits").await.unwrap();
+    let fc = fake.code;
+    a.expect(|e| *e == Event::VersionMismatch { peer: fc, theirs: PROTO_VERSION + 1 }).await;
+    // Dialed again after retry_max (1 s here), but said only once.
+    a.expect_none(Duration::from_millis(2500), |e| matches!(e, Event::VersionMismatch { .. })).await;
+    assert!(dials.load(std::sync::atomic::Ordering::SeqCst) >= 2, "dialed again");
+    assert_eq!(a.client.history(fc).await.unwrap()[0].mark, Mark::Waiting);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_contact_dialing_on_another_version_is_reported_once() {
+    let lookup = MemoryLookup::new();
+    let mut a = Peer::start(&lookup, "abin").await;
+    let fake = Fake::new(&lookup).await;
+    fake.answer_with(fake.hello_frame(PROTO_VERSION + 1));
+    a.client.add_contact(fake.code).await.unwrap();
+    let fc = fake.code;
+    a.expect(|e| *e == Event::VersionMismatch { peer: fc, theirs: PROTO_VERSION + 1 }).await;
+    for _ in 0..2 {
+        let _ = fake.hello(a.code, PROTO_VERSION + 1).await;
+    }
+    a.expect_none(Duration::from_millis(500), |e| matches!(e, Event::VersionMismatch { .. })).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_peer_on_another_version_is_told_ours() {
+    let lookup = MemoryLookup::new();
+    let mut a = Peer::start(&lookup, "abin").await;
+    let (contact, stranger) = (Fake::new(&lookup).await, Fake::new(&lookup).await);
+    a.client.add_contact(contact.code).await.unwrap();
+    for fake in [&contact, &stranger] {
+        let (_, mut recv, theirs) = fake.hello(a.code, PROTO_VERSION + 1).await.expect("an answer");
+        assert!(matches!(theirs, Frame::Hello { proto: PROTO_VERSION, .. }), "{theirs:?}");
+        assert!(is_cut_off(&mut recv).await);
+    }
+    let sc = stranger.code;
+    a.expect_none(Duration::from_millis(500), |e| matches!(e, Event::VersionMismatch { peer, .. } if *peer == sc))
+        .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refusal_naming_another_version_is_reported() {
+    let lookup = MemoryLookup::new();
+    let mut a = Peer::start(&lookup, "abin").await;
+    let fake = Fake::new(&lookup).await;
+    fake.refuse_with(5, b"7");
+    a.client.add_contact(fake.code).await.unwrap();
+    let fc = fake.code;
+    a.expect(|e| *e == Event::VersionMismatch { peer: fc, theirs: 7 }).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_restarted_peer_replaces_its_stale_link_at_once() {
+    let lookup = MemoryLookup::new();
+    let mut a = Peer::start(&lookup, "abin").await;
+    // The key order decides which of two links both sides keep; this is the
+    // case where it used to keep the dead one.
+    let seed = loop {
+        let seed = Seed::generate();
+        if seed.code().key().as_bytes() > a.code.key().as_bytes() {
+            break seed;
+        }
+    };
+    let before = Fake::with_seed(&lookup, Seed::from_bytes(*seed.as_bytes())).await;
+    before.answer_with(before.hello_frame(PROTO_VERSION));
+    a.client.add_contact(before.code).await.unwrap();
+    let fc = before.code;
+    a.expect(|e| *e == Event::Online(fc)).await;
+    // Their app dies without a word and starts again.
+    let after = Fake::with_seed(&lookup, seed).await;
+    let started = tokio::time::Instant::now();
+    let (mut send, mut recv, _) = after.hello(a.code, PROTO_VERSION).await.expect("the new link is taken");
+    say(&mut send, "m1", "back again").await;
+    assert_eq!(next_frame(&mut recv, |f| matches!(f, Frame::Ack { .. })).await, Frame::Ack { id: "m1".into() });
+    assert!(started.elapsed() < Duration::from_secs(3));
+    drop(before);
 }
 
 #[tokio::test(flavor = "multi_thread")]

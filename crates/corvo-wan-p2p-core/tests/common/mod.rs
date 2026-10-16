@@ -4,8 +4,8 @@
 
 #![allow(dead_code)] // each test file uses a different part of this
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use corvo_wan_p2p_core::chat::{Client, Config, Event};
@@ -133,14 +133,26 @@ pub async fn friends(lookup: &MemoryLookup) -> (Peer, Peer) {
 pub struct Fake {
     pub endpoint: Endpoint,
     pub code: Code,
+    /// What this run of the fake says in its hello, like an app's start.
+    pub session: u64,
 }
 
 impl Fake {
     pub async fn new(lookup: &MemoryLookup) -> Fake {
-        let seed = Seed::generate();
+        Fake::with_seed(lookup, Seed::generate()).await
+    }
+
+    /// A fake with a chosen key. Another one with the same seed is the same
+    /// person's app after a restart.
+    pub async fn with_seed(lookup: &MemoryLookup, seed: Seed) -> Fake {
         let endpoint = local_endpoint(seed.secret_key(), lookup.clone()).await.unwrap();
         lookup.set_endpoint_info(local_addr(&endpoint));
-        Fake { code: seed.code(), endpoint }
+        Fake { code: seed.code(), endpoint, session: rand::random() }
+    }
+
+    /// The hello this fake's app would send.
+    pub fn hello_frame(&self, proto: u32) -> Frame {
+        Frame::Hello { proto, app_version: "test".into(), session: self.session }
     }
 
     /// Dials `to`, says hello with protocol `proto`, and returns the streams
@@ -156,7 +168,7 @@ impl Fake {
         let exchange = async {
             let conn = self.endpoint.connect(to.key(), ALPN).await.ok()?;
             let (mut send, mut recv) = conn.open_bi().await.ok()?;
-            write_frame(&mut send, &Frame::Hello { proto, app_version: "test".into() }).await.ok()?;
+            write_frame(&mut send, &self.hello_frame(proto)).await.ok()?;
             for frame in then {
                 write_frame(&mut send, frame).await.ok()?;
             }
@@ -186,29 +198,82 @@ impl Fake {
             .await
             .unwrap();
         lookup.set_endpoint_info(local_addr(&endpoint));
-        Fake { code: seed.code(), endpoint }
+        Fake { code: seed.code(), endpoint, session: rand::random() }
     }
 
     /// Answers every connection with `reply` where a hello should be, keeps it
     /// open, and counts the connections.
     pub fn answer_with(&self, reply: Frame) -> Arc<AtomicUsize> {
         let count = Arc::new(AtomicUsize::new(0));
-        let (endpoint, counter) = (self.endpoint.clone(), count.clone());
+        let counter = count.clone();
+        self.answer(
+            move |_| {
+                counter.fetch_add(1, Ordering::SeqCst);
+            },
+            Answer::Reply(reply),
+        );
+        count
+    }
+
+    /// Like [`Fake::answer_with`], but notes when each connection came.
+    pub fn answer_with_times(&self, reply: Frame) -> Arc<Mutex<Vec<tokio::time::Instant>>> {
+        let times = Arc::new(Mutex::new(Vec::new()));
+        let noted = times.clone();
+        self.answer(move |at| noted.lock().unwrap().push(at), Answer::Reply(reply));
+        times
+    }
+
+    /// Answers every connection with `reply`, then hangs up at once (code 0).
+    pub fn answer_and_hang_up(&self, reply: Frame) -> Arc<AtomicUsize> {
+        let count = Arc::new(AtomicUsize::new(0));
+        let counter = count.clone();
+        self.answer(
+            move |_| {
+                counter.fetch_add(1, Ordering::SeqCst);
+            },
+            Answer::ReplyThenClose(reply),
+        );
+        count
+    }
+
+    /// Reads each hello and closes the connection with `code` and `reason`,
+    /// saying nothing.
+    pub fn refuse_with(&self, code: u32, reason: &'static [u8]) {
+        self.answer(|_| {}, Answer::Close(code, reason));
+    }
+
+    fn answer(&self, mut noted: impl FnMut(tokio::time::Instant) + Send + 'static, answer: Answer) {
+        let endpoint = self.endpoint.clone();
         tokio::spawn(async move {
             while let Some(incoming) = endpoint.accept().await {
-                counter.fetch_add(1, Ordering::SeqCst);
-                let reply = reply.clone();
+                noted(tokio::time::Instant::now());
+                let answer = answer.clone();
                 tokio::spawn(async move {
                     let Ok(conn) = incoming.await else { return };
                     let Ok((mut send, mut recv)) = conn.accept_bi().await else { return };
                     let _ = read_frame(&mut recv).await;
-                    let _ = write_frame(&mut send, &reply).await;
-                    conn.closed().await;
+                    match answer {
+                        Answer::Reply(reply) => {
+                            let _ = write_frame(&mut send, &reply).await;
+                            conn.closed().await;
+                        }
+                        Answer::ReplyThenClose(reply) => {
+                            let _ = write_frame(&mut send, &reply).await;
+                            conn.close(VarInt::from_u32(0), b"bye");
+                        }
+                        Answer::Close(code, reason) => conn.close(VarInt::from_u32(code), reason),
+                    }
                 });
             }
         });
-        count
     }
+}
+
+#[derive(Clone)]
+enum Answer {
+    Reply(Frame),
+    ReplyThenClose(Frame),
+    Close(u32, &'static [u8]),
 }
 
 /// Reads frames until one that `wanted` accepts, skipping others (names, read receipts).

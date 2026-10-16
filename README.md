@@ -5,20 +5,20 @@ app to app, end-to-end encrypted, with no server holding their messages. Share
 your code with a friend, they add it, and you chat. Messages wait on your
 machine until you're both online.
 
-**Status:** early development. There's a test pre-release, `v0.1.0-rc.2`.
+**Status:** early development. There's a test pre-release, `v0.1.0-rc.3`.
 
 ## Install
 
 On macOS or Linux (x86_64 or ARM):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Abinsanth/corvo-wan-p2p/release/install.sh | CORVO_WAN_P2P_VERSION=v0.1.0-rc.2 sh
+curl -fsSL https://raw.githubusercontent.com/Abinsanth/corvo-wan-p2p/release/install.sh | CORVO_WAN_P2P_VERSION=v0.1.0-rc.3 sh
 ```
 
 On Windows 10 or 11 (x86_64), in PowerShell:
 
 ```powershell
-$env:CORVO_WAN_P2P_VERSION = 'v0.1.0-rc.2'; irm https://raw.githubusercontent.com/Abinsanth/corvo-wan-p2p/release/install.ps1 | iex
+$env:CORVO_WAN_P2P_VERSION = 'v0.1.0-rc.3'; irm https://raw.githubusercontent.com/Abinsanth/corvo-wan-p2p/release/install.ps1 | iex
 ```
 
 The installer downloads the build for your system, checks its SHA-256 and

@@ -73,14 +73,25 @@ pub fn height(size: (u16, u16), total: usize) -> u16 {
     u16::try_from(total).unwrap_or(u16::MAX).min(size.1.saturating_sub(4)).max(1)
 }
 
+/// How far down the window shows at `size`: as scrolled, but never past its
+/// end, which moves when the terminal is resized.
+pub fn scroll(overlay: &Overlay, size: (u16, u16)) -> u16 {
+    overlay.scroll().min(last(size, rows(overlay, size).len()))
+}
+
+/// The furthest `total` rows can scroll at `size`.
+fn last(size: (u16, u16), total: usize) -> u16 {
+    u16::try_from(total).unwrap_or(u16::MAX).saturating_sub(height(size, total))
+}
+
 /// A key while a window is open: Enter or Esc closes it, the arrows and
 /// PgUp/PgDn scroll it, and anything else does nothing.
 pub fn key(state: &mut State, key: KeyEvent) {
     let Some(overlay) = state.overlay else { return };
     let total = rows(&overlay, state.size).len();
     let page = height(state.size, total);
-    let last = u16::try_from(total).unwrap_or(u16::MAX).saturating_sub(page);
-    let scroll = overlay.scroll();
+    let last = last(state.size, total);
+    let scroll = scroll(&overlay, state.size);
     state.overlay = match key.code {
         KeyCode::Enter | KeyCode::Esc => None,
         KeyCode::Up => Some(overlay.scrolled_to(scroll.saturating_sub(1))),
@@ -177,5 +188,16 @@ mod tests {
         assert_eq!(usize::from(scroll), total - usize::from(height(s.size, total)), "at the end, no further");
         key(&mut s, KeyCode::Up);
         assert_eq!(s.overlay, Some(Overlay::Welcome { scroll: scroll - 1 }));
+    }
+
+    #[test]
+    fn a_bigger_terminal_brings_a_scrolled_window_back_into_view() {
+        let mut s = main_screen();
+        s.overlay = Some(Overlay::Welcome { scroll: 13 });
+        key(&mut s, KeyCode::Up);
+        assert_eq!(s.overlay, Some(Overlay::Welcome { scroll: 0 }), "it all fits on 80×24 now");
+        s.overlay = Some(Overlay::Welcome { scroll: 13 });
+        key(&mut s, KeyCode::Down);
+        assert_eq!(s.overlay, Some(Overlay::Welcome { scroll: 0 }));
     }
 }

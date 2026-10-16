@@ -346,7 +346,9 @@ fn draw_overlay(frame: &mut Frame, overlay: &Overlay, area: Rect) {
     let lines: Vec<TextLine> = rows.into_iter().map(|row| TextLine::from(format!("  {row}"))).collect();
     frame.render_widget(Clear, at);
     frame.render_widget(
-        Paragraph::new(lines).block(Block::bordered().title(overlay.title())).scroll((overlay.scroll(), 0)),
+        Paragraph::new(lines)
+            .block(Block::bordered().title(overlay.title()))
+            .scroll((window::scroll(overlay, (area.width, area.height)), 0)),
         at,
     );
 }
@@ -806,6 +808,8 @@ mod tests {
         state.overlay =
             Some(Overlay::Welcome { scroll: (total - usize::from(window::height((40, 12), total))) as u16 });
         assert!(all(&render(&state, 40, 12)).contains("/help any time"), "scrolled to the end");
+        let bigger = all(&render(&state, 80, 24));
+        assert!(bigger.contains("Chat with friends directly"), "a bigger terminal shows it all:\n{bigger}");
     }
 
     fn render(state: &State, w: u16, h: u16) -> Buffer {

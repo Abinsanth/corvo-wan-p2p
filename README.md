@@ -5,20 +5,20 @@ app to app, end-to-end encrypted, with no server holding their messages. Share
 your code with a friend, they add it, and you chat. Messages wait on your
 machine until you're both online.
 
-**Status:** early development. There's a test pre-release, `v0.1.0-rc.3`.
+**Status:** `v0.1.0`, the first release.
 
 ## Install
 
 On macOS or Linux (x86_64 or ARM):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Abinsanth/corvo-wan-p2p/release/install.sh | CORVO_WAN_P2P_VERSION=v0.1.0-rc.3 sh
+curl -fsSL https://raw.githubusercontent.com/Abinsanth/corvo-wan-p2p/release/install.sh | sh
 ```
 
 On Windows 10 or 11 (x86_64), in PowerShell:
 
 ```powershell
-$env:CORVO_WAN_P2P_VERSION = 'v0.1.0-rc.3'; irm https://raw.githubusercontent.com/Abinsanth/corvo-wan-p2p/release/install.ps1 | iex
+irm https://raw.githubusercontent.com/Abinsanth/corvo-wan-p2p/release/install.ps1 | iex
 ```
 
 The installer downloads the build for your system, checks its SHA-256 and
@@ -30,12 +30,12 @@ Windows it goes to `%LOCALAPPDATA%\Programs\corvo-wan-p2p`, added to your
 user PATH. Set `CORVO_WAN_P2P_NO_MODIFY_PATH=1` to leave your profile (or
 PATH) alone. Set
 `CORVO_WAN_P2P_INSTALL_DIR` to install somewhere else. `CORVO_WAN_P2P_VERSION`
-picks a release; leave it out for the latest full release (there isn't one
-yet, only the pre-release).
+picks a release, like `v0.1.0`, pre-releases included; leave it out for the
+latest full release.
 
 Then open a new terminal and run `corvo-wan-p2p`. Inside the app, `/update`
-installs newer versions (a copy built from source updates with `git pull`
-and `cargo build` instead).
+installs newer versions, pre-releases only if you're on one (a copy built
+from source updates with `git pull` and `cargo build` instead).
 
 Or build from source with Rust ([rustup.rs](https://rustup.rs)):
 

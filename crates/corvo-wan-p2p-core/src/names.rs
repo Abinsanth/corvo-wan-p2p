@@ -11,22 +11,20 @@ use std::collections::HashMap;
 
 use unicode_normalization::UnicodeNormalization;
 
-use crate::identity::{CODE_PREFIX, Code};
+use crate::identity::{CODE_PREFIX, Code, KEY_CHARS, is_code_char};
 use crate::store::Person;
 
 /// Between a name and the start of the code in a label.
 pub const SEPARATOR: char = '·';
 /// How much of the code a label shows at first.
 const TAIL: usize = 4;
-/// The code is 52 characters before its checksum; two codes always differ by then.
-const KEY_CHARS: usize = 52;
 
 /// A label for each person, all different from each other however they're
 /// compared. Someone whose app hasn't sent a name yet is shown by the start of
 /// their code.
 pub fn labels(people: &[Person]) -> HashMap<Code, String> {
     // How much of each person's code their label shows; 0 means just the name.
-    let mut tails = vec![0; people.len()];
+    let mut tails: Vec<usize> = people.iter().map(|p| if looks_like_a_label(&p.name) { TAIL } else { 0 }).collect();
     loop {
         let mut seen: HashMap<String, Vec<usize>> = HashMap::new();
         for (i, p) in people.iter().enumerate() {
@@ -53,6 +51,15 @@ fn label(p: &Person, tail: usize) -> String {
         (false, 0) => p.name.clone(),
         (false, n) => format!("{}{SEPARATOR}{}", p.name, &key_text(&p.code)[..n]),
     }
+}
+
+/// Whether a name ends the way labels do: `·` or `.` and at least [`TAIL`]
+/// code characters. Such a name always shows a tail of its own, so it can't
+/// pass for the label someone else gets once a namesake of theirs appears.
+fn looks_like_a_label(name: &str) -> bool {
+    skeleton(name).rsplit_once('.').is_some_and(|(before, tail)| {
+        !before.is_empty() && tail.chars().count() >= TAIL && tail.chars().all(is_code_char)
+    })
 }
 
 /// The code without its prefix.
@@ -244,6 +251,30 @@ mod tests {
         unique.dedup();
         assert_eq!(all.len(), unique.len(), "labels clash: {after:?}");
         assert_ne!(after[&copycat.code], first[&one.code]);
+    }
+
+    #[test]
+    fn a_name_shaped_like_someone_elses_label_gets_its_own_tail() {
+        let rahul = person("rahul");
+        for copy in [format!("rahul·{}", tail(&rahul, TAIL)), format!("rahul.{}", tail(&rahul, TAIL))] {
+            let copy = person(&copy);
+            let two = labels(&[rahul.clone(), copy.clone()]);
+            assert_eq!(two[&rahul.code], "rahul");
+            assert_ne!(skeleton(&two[&copy.code]), skeleton(&format!("rahul·{}", tail(&rahul, TAIL))));
+            assert!(two[&copy.code].starts_with(&format!("{}·", copy.name)), "{}", two[&copy.code]);
+            // Once a second rahul comes along, everyone still looks different.
+            let other = person("rahul");
+            let three = labels(&[rahul.clone(), copy.clone(), other]);
+            let mut all: Vec<String> = three.values().map(|l| skeleton(l)).collect();
+            all.sort();
+            all.dedup();
+            assert_eq!(all.len(), 3, "labels clash: {three:?}");
+        }
+        // Ordinary names with a dot keep their plain label.
+        for plain in ["a.b. smith", "dr. rahul", "rahul.", "v1.0"] {
+            let p = person(plain);
+            assert_eq!(labels(std::slice::from_ref(&p))[&p.code], plain);
+        }
     }
 
     #[test]

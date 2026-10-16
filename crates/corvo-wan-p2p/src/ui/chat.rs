@@ -1,6 +1,8 @@
 //! Chatting: what the engine says (messages, marks, people coming and going,
 //! the network), sending, and unread counts.
 
+use std::collections::HashSet;
+
 use chrono::{DateTime, Local};
 use corvo_wan_p2p_core::chat::Event;
 use corvo_wan_p2p_core::identity::Code;
@@ -193,6 +195,10 @@ pub fn loaded_older(state: &mut State, peer: Code, result: Result<(Vec<StoredMes
         }
     };
     chat.older = !page.is_empty() && page.len() + unreadable >= OLDER_PAGE;
+    // Trimming goes by position and paging by id, so a page can overlap
+    // what's kept: each message goes in once.
+    let have: HashSet<&str> = chat.messages.iter().map(|m| m.id.as_str()).collect();
+    let page: Vec<StoredMessage> = page.into_iter().filter(|m| !have.contains(m.id.as_str())).collect();
     let added = page.len();
     let open = state.open_peer() == Some(peer);
     let before = if open { chat_page(state).0 } else { 0 };
@@ -658,6 +664,20 @@ mod tests {
         key(&mut s, KeyCode::Esc, KeyModifiers::NONE);
         assert_eq!(ids(&s).len(), CHAT_LEN, "back at the end, the oldest go again");
         assert_eq!(ids(&s).last().unwrap(), "n9");
+    }
+
+    #[test]
+    fn an_older_page_that_overlaps_adds_each_message_once() {
+        let (mut s, rahul, _) = state();
+        let people = s.known.clone();
+        let messages: Vec<_> = (10..=20).map(|i| message(&format!("m{i:04}"), "x", Mark::Read)).collect();
+        let chats = vec![History { code: rahul, messages, read_upto: None, unreadable: 0 }];
+        update(&mut s, Msg::Done(Outcome::Loaded(Ok(Loaded { people, chats, unreadable_people: 0 }))));
+        let page: Vec<_> = (5..=12).map(|i| message(&format!("m{i:04}"), "x", Mark::Read)).collect();
+        update(&mut s, Msg::Done(Outcome::LoadedOlder { peer: rahul, result: Ok((page, 0)) }));
+        let ids: Vec<String> = s.chats[&rahul].messages.iter().map(|m| m.id.clone()).collect();
+        let expected: Vec<String> = (5..=20).map(|i| format!("m{i:04}")).collect();
+        assert_eq!(ids, expected);
     }
 
     #[test]

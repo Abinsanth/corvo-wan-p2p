@@ -1,6 +1,8 @@
 //! Copying to the clipboard through the terminal (OSC 52), so it works over
 //! SSH too. Terminals that don't support it ignore the sequence.
 
+use zeroize::Zeroizing;
+
 /// Said wherever something is sent to the clipboard: it may not have worked.
 pub const MAYBE: &str = "if your terminal allows it";
 /// Said instead where the terminal is known not to copy.
@@ -12,14 +14,22 @@ pub fn can_copy(term_program: Option<&str>) -> bool {
     term_program != Some("Apple_Terminal")
 }
 
-/// What puts `text` on the clipboard, if the terminal allows it.
-pub fn osc52(text: &str) -> String {
-    format!("\x1b]52;c;{}\x07", base64(text.as_bytes()))
+/// What puts `text` on the clipboard, if the terminal allows it. Wiped
+/// after use, since it may be your words.
+pub fn osc52(text: &str) -> Zeroizing<String> {
+    const START: &str = "\x1b]52;c;";
+    const END: char = '\x07';
+    let encoded = base64(text.as_bytes());
+    let mut out = Zeroizing::new(String::with_capacity(START.len() + encoded.len() + 1));
+    out.push_str(START);
+    out.push_str(&encoded);
+    out.push(END);
+    out
 }
 
-fn base64(bytes: &[u8]) -> String {
+fn base64(bytes: &[u8]) -> Zeroizing<String> {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    let mut out = Zeroizing::new(String::with_capacity(bytes.len().div_ceil(3) * 4));
     for chunk in bytes.chunks(3) {
         let n = chunk.iter().enumerate().fold(0u32, |n, (i, b)| n | (*b as u32) << (16 - 8 * i));
         for i in 0..4 {
@@ -107,12 +117,12 @@ mod tests {
         for (plain, encoded) in
             [("", ""), ("f", "Zg=="), ("fo", "Zm8="), ("foo", "Zm9v"), ("foob", "Zm9vYg=="), ("foobar", "Zm9vYmFy")]
         {
-            assert_eq!(base64(plain.as_bytes()), encoded, "{plain:?}");
+            assert_eq!(base64(plain.as_bytes()).as_str(), encoded, "{plain:?}");
         }
     }
 
     #[test]
     fn osc52_wraps_the_text_for_the_clipboard() {
-        assert_eq!(osc52("corvo:abc"), "\x1b]52;c;Y29ydm86YWJj\x07");
+        assert_eq!(osc52("corvo1abc").as_str(), "\x1b]52;c;Y29ydm8xYWJj\x07");
     }
 }

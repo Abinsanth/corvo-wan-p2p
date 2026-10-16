@@ -7,6 +7,8 @@ use std::path::PathBuf;
 use corvo_wan_p2p_core::identity::{Code, PHRASE_WORDS, Seed, clean_name};
 use corvo_wan_p2p_core::store::StoreError;
 
+use zeroize::Zeroizing;
+
 use super::clip::{MAYBE, NO_COPY};
 use super::state::{Ask, Editor, Line, Secret, Tone};
 use super::update::{Effect, Outcome};
@@ -189,7 +191,8 @@ impl Onboarding {
     pub fn answer(&mut self, text: Secret, editor: &mut Editor) -> Vec<Effect> {
         self.notes.clear();
         let mut effects = Vec::new();
-        let typed = text.expose().trim().to_lowercase();
+        let typed = lowered(&text);
+        let typed = typed.as_str();
         let step = std::mem::replace(&mut self.step, Step::Starting);
         self.step = match step {
             Step::Unlock if text.expose().is_empty() => {
@@ -208,7 +211,7 @@ impl Onboarding {
                 effects.push(Effect::Exit("nothing was deleted.".into()));
                 Step::ConfirmWipe
             }
-            Step::Choose => match typed.as_str() {
+            Step::Choose => match typed {
                 "n" | "new" => Step::Name { seed: Seed::generate(), recovered: false },
                 "r" | "recover" => Step::Words,
                 _ => {
@@ -260,7 +263,7 @@ impl Onboarding {
                     Step::Creating { seed, recovered: false }
                 }
             }
-            Step::Replace { seed, path } => match typed.as_str() {
+            Step::Replace { seed, path } => match typed {
                 "y" | "yes" => {
                     effects.push(Effect::WriteRecovery { seed: seed.clone(), overwrite: true });
                     Step::Creating { seed, recovered: false }
@@ -355,6 +358,12 @@ impl Onboarding {
         };
         effects
     }
+}
+
+/// An answer trimmed and in lower case, for comparing; wiped after use,
+/// since it may be a passphrase.
+pub fn lowered(text: &Secret) -> Zeroizing<String> {
+    Zeroizing::new(text.expose().trim().to_lowercase())
 }
 
 /// The code step, which copies the code as it opens.

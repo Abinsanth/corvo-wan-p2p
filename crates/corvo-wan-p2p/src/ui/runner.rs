@@ -246,8 +246,8 @@ impl<W: Write> Runner<W> {
     }
 
     fn copy(&mut self, text: &str) -> std::io::Result<()> {
-        let sequence = Secret::new(osc52(text));
-        self.out.write_all(sequence.expose().as_bytes())?;
+        let sequence = osc52(text);
+        self.out.write_all(sequence.as_bytes())?;
         self.out.flush()
     }
 
@@ -464,7 +464,7 @@ mod tests {
             assert!(file.contains(&format!("{:>2}. {word}", i + 1)));
         }
         assert!(file.contains(&seed.code().to_string()));
-        assert!(app.written().contains(&osc52(&seed.code().to_string())), "the code is copied");
+        assert!(app.written().contains(osc52(&seed.code().to_string()).as_str()), "the code is copied");
         assert_eq!(app.send("").await, None);
         assert!(matches!(app.state.screen, Screen::Main));
         assert_eq!(app.state.code, Some(seed.code()));
@@ -522,7 +522,7 @@ mod tests {
 
         app.send("/phrase copy").await;
         app.send("pw").await;
-        assert!(app.written().contains(&osc52(&seed.phrase())));
+        assert!(app.written().contains(osc52(&seed.phrase()).as_str()));
 
         recovery::remove(home.path()).unwrap();
         app.send("/phrase save").await;

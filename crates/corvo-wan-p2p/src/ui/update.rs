@@ -11,6 +11,7 @@ use ratatui::crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use ratatui::layout::Position;
+use zeroize::Zeroizing;
 
 use super::account::{self, PhraseDone, PhraseUse};
 use super::chat::{self, Loaded};
@@ -262,16 +263,20 @@ pub fn update(state: &mut State, msg: Msg) -> Vec<Effect> {
         // A key while the words are up only hides them.
         Msg::Key(key) if state.reveal.is_some() && key.kind != KeyEventKind::Release => state.reveal = None,
         Msg::Key(key) => {
+            if state.ask().is_some() {
+                state.editor.make_room_for_answer();
+            }
             if let Some(action) = action_for(key) {
                 on_action(state, action, &mut effects);
             }
         }
-        Msg::Paste(_) if state.reveal.is_some() => state.reveal = None,
-        // An answer is one line: a passphrase copied with its line break still
-        // works, and words pasted one per line become one line.
+        Msg::Paste(text) if state.reveal.is_some() => {
+            drop(Zeroizing::new(text));
+            state.reveal = None;
+        }
         Msg::Paste(text) if state.ask().is_some() => {
-            let text = text.trim_end_matches(['\r', '\n']).replace("\r\n", " ").replace(['\r', '\n'], " ");
-            state.editor.insert_str(&text);
+            state.editor.make_room_for_answer();
+            state.editor.insert_str(&one_line_answer(text));
         }
         Msg::Paste(text) => {
             state.popup = None;
@@ -324,6 +329,26 @@ pub fn update(state: &mut State, msg: Msg) -> Vec<Effect> {
         effects.push(Effect::SetTitle(title));
     }
     effects
+}
+
+/// A pasted answer as one line: a passphrase copied with its line break still
+/// works, and words pasted one per line become one line. Wiped after use.
+pub fn one_line_answer(text: String) -> Zeroizing<String> {
+    let text = Zeroizing::new(text);
+    let trimmed = text.trim_end_matches(['\r', '\n']);
+    let mut line = Zeroizing::new(String::with_capacity(trimmed.len()));
+    let mut chars = trimmed.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\r' => {
+                chars.next_if_eq(&'\n');
+                line.push(' ');
+            }
+            '\n' => line.push(' '),
+            c => line.push(c),
+        }
+    }
+    line
 }
 
 /// A left click: on a tab selects it, on a name in the sidebar opens the chat.
@@ -802,6 +827,32 @@ mod tests {
         update(&mut s, Msg::Core(Event::Problem("the store is full".into())));
         assert_eq!(last_corvo(&s).text, "the store is full");
         assert_eq!(last_corvo(&s).tone, Tone::Bad);
+    }
+
+    #[test]
+    fn editor_does_not_reallocate_while_typing_an_answer() {
+        let mut s = state();
+        send(&mut s, "/passphrase");
+        for question in 0..3 {
+            press(&mut s, KeyCode::Char('x'));
+            let (at, room) = (s.editor.text().as_ptr(), s.editor.capacity());
+            type_text(&mut s, &"y".repeat(300));
+            update(&mut s, Msg::Paste("pasted-part ".repeat(20)));
+            assert_eq!(s.editor.text().as_ptr(), at, "question {question}: the buffer never moved");
+            assert_eq!(s.editor.capacity(), room);
+            press(&mut s, KeyCode::Enter);
+        }
+    }
+
+    #[test]
+    fn secret_text_is_wiped_after_use() {
+        use zeroize::Zeroizing;
+        let pasted: Zeroizing<String> = one_line_answer("my pass\r\nphrase\n".into());
+        assert_eq!(pasted.as_str(), "my pass phrase");
+        let _: Zeroizing<String> = crate::ui::clip::osc52("words");
+        let _: Vec<Zeroizing<String>> = crate::ui::view::word_grid(&["abandon", "ability"], 80);
+        let _: Zeroizing<String> = crate::ui::onboarding::lowered(&Secret::new(" Pass ".into()));
+        assert_eq!(crate::ui::onboarding::lowered(&Secret::new(" Pass ".into())).as_str(), "pass");
     }
 
     #[test]

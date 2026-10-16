@@ -74,10 +74,15 @@ pub enum Screen {
     Main,
 }
 
+/// Room the input box makes before an answer is typed, so it never moves
+/// while a passphrase is in it (a move would leave a copy behind).
+pub const ANSWER_ROOM: usize = 1024;
+
 /// The multi-line input box. `cursor` is a byte index on a char boundary.
+/// What's typed is wiped from memory when it's replaced or dropped.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Editor {
-    text: String,
+    text: Zeroizing<String>,
     cursor: usize,
 }
 
@@ -90,18 +95,34 @@ impl Editor {
         self.text.is_empty()
     }
 
+    /// Bytes the buffer holds before it has to move.
+    pub fn capacity(&self) -> usize {
+        self.text.capacity()
+    }
+
     pub fn set(&mut self, text: String) {
         self.cursor = text.len();
-        self.text = text;
+        self.text = Zeroizing::new(text);
+    }
+
+    /// Makes [`ANSWER_ROOM`] before an answer is typed. The text moves to the
+    /// new buffer and the old one is wiped.
+    pub fn make_room_for_answer(&mut self) {
+        if self.text.capacity() < ANSWER_ROOM {
+            let mut roomy = Zeroizing::new(String::with_capacity(ANSWER_ROOM.max(self.text.len())));
+            roomy.push_str(&self.text);
+            self.text = roomy;
+        }
     }
 
     pub fn clear(&mut self) {
         self.set(String::new());
     }
 
+    /// The text, moved out (not copied); the box is left empty.
     pub fn take(&mut self) -> String {
         self.cursor = 0;
-        std::mem::take(&mut self.text)
+        std::mem::take(&mut *self.text)
     }
 
     pub fn before_cursor(&self) -> &str {
@@ -121,9 +142,20 @@ impl Editor {
 
     /// Pasted text: CRLF and lone CR become newlines, tabs become spaces.
     pub fn insert_str(&mut self, s: &str) {
-        let s = s.replace("\r\n", "\n").replace('\r', "\n").replace('\t', "    ");
-        self.text.insert_str(self.cursor, &s);
-        self.cursor += s.len();
+        let mut pasted = Zeroizing::new(String::with_capacity(s.len() * 4));
+        let mut chars = s.chars().peekable();
+        while let Some(c) = chars.next() {
+            match c {
+                '\r' => {
+                    chars.next_if_eq(&'\n');
+                    pasted.push('\n');
+                }
+                '\t' => pasted.push_str("    "),
+                c => pasted.push(c),
+            }
+        }
+        self.text.insert_str(self.cursor, &pasted);
+        self.cursor += pasted.len();
     }
 
     pub fn newline(&mut self) {

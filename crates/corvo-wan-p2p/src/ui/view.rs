@@ -13,6 +13,7 @@
 //!  ana · abcdefgh · online                  status line
 //! ```
 
+use std::borrow::Cow;
 use std::iter::Peekable;
 use std::str::Chars;
 use std::sync::Arc;
@@ -27,6 +28,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line as TextLine, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use zeroize::Zeroizing;
 
 use super::chat::local;
 use super::onboarding::Onboarding;
@@ -287,15 +289,21 @@ pub fn wrap(text: &str, width: usize) -> Vec<String> {
 }
 
 /// The 12 words in numbered columns, as many as fit in `width` (2 to 4),
-/// numbered down each column.
-pub fn word_grid(words: &[&str], width: u16) -> Vec<String> {
+/// numbered down each column. Each row is wiped after use.
+pub fn word_grid(words: &[&str], width: u16) -> Vec<Zeroizing<String>> {
+    use std::fmt::Write;
     let cols = (usize::from(width) / WORD_CELL).clamp(2, 4);
     let rows = words.len().div_ceil(cols);
     (0..rows)
         .map(|r| {
-            let cells = (0..cols).filter_map(|c| words.get(c * rows + r).map(|w| (c * rows + r + 1, w)));
-            let row: String = cells.map(|(n, w)| format!("{n:>2}. {w:<width$}", width = WORD_CELL - 4)).collect();
-            row.trim_end().to_string()
+            // Written straight into a buffer that's big enough, so no copy is left behind.
+            let mut row = Zeroizing::new(String::with_capacity(cols * WORD_CELL));
+            for (n, w) in (0..cols).filter_map(|c| words.get(c * rows + r).map(|w| (c * rows + r + 1, w))) {
+                let _ = write!(row, "{n:>2}. {w:<width$}", width = WORD_CELL - 4);
+            }
+            let end = row.trim_end().len();
+            row.truncate(end);
+            row
         })
         .collect()
 }
@@ -352,33 +360,33 @@ fn draw_onboarding(frame: &mut Frame, state: &State, onboarding: &Onboarding, ar
     let title = format!(" {APP} {VERSION}");
     frame.render_widget(Paragraph::new(title).style(Style::new().add_modifier(Modifier::BOLD)), Rect::new(0, 0, w, 1));
     let body = Rect::new(1, 2, w - 2, h - 5);
-    let plain = |text: &String| (text.clone(), Style::new());
-    let guidance: Vec<(String, Style)> = onboarding.guidance(state.can_copy).iter().map(plain).collect();
-    let mut notes: Vec<(String, Style)> = onboarding.notes.iter().map(|n| (n.text.clone(), tone(n.tone))).collect();
+    let guidance_text = onboarding.guidance(state.can_copy);
+    let guidance: Vec<(Cow<str>, Style)> = guidance_text.iter().map(|t| plain(t)).collect();
+    let mut notes: Vec<(Cow<str>, Style)> =
+        onboarding.notes.iter().map(|n| (Cow::Borrowed(n.text.as_str()), tone(n.tone))).collect();
     if !notes.is_empty() {
-        notes.insert(0, (String::new(), Style::new()));
+        notes.insert(0, plain(""));
     }
-    let lines = match onboarding.words() {
+    // Borrowed from here on, so the words aren't copied.
+    let grid_rows = onboarding.words().map(|words| word_grid(&words, body.width));
+    let lines = match &grid_rows {
         None => [guidance, notes].concat(),
-        Some(words) => {
-            let grid: Vec<(String, Style)> = word_grid(&words, body.width).iter().map(plain).collect();
-            let blank = vec![(String::new(), Style::new())];
-            let all = [guidance.clone(), blank, grid.clone(), notes.clone()].concat();
+        Some(grid_rows) => {
+            let grid: Vec<(Cow<str>, Style)> = grid_rows.iter().map(|r| plain(r)).collect();
+            let all = [guidance.clone(), vec![plain("")], grid.clone(), notes.clone()].concat();
             if text_rows(&all, body.width) <= body.height.into() {
                 all
             } else if grid.len() <= body.height.into() {
                 // The words matter most: they go first, and the rest as fits.
                 [grid, notes, guidance].concat()
             } else {
-                [vec![(BIGGER_FOR_WORDS.to_string(), tone(Tone::Warn))], notes, guidance].concat()
+                [vec![(Cow::Borrowed(BIGGER_FOR_WORDS), tone(Tone::Warn))], notes, guidance].concat()
             }
         }
     };
     let rows: Vec<TextLine> = lines
         .iter()
-        .flat_map(|(text, style)| {
-            wrap(&one_line(text), body.width.into()).into_iter().map(|r| TextLine::styled(r, *style))
-        })
+        .flat_map(|(text, style)| rows_of(text, body.width).into_iter().map(|r| TextLine::styled(r, *style)))
         .collect();
     frame.render_widget(Paragraph::new(rows), body);
     draw_flash(frame, state, Rect::new(0, h - 3, w, 1));
@@ -386,9 +394,25 @@ fn draw_onboarding(frame: &mut Frame, state: &State, onboarding: &Onboarding, ar
     draw_input(frame, state, Rect::new(0, h - 1, w, 1));
 }
 
+/// A line without a style.
+fn plain(text: &str) -> (Cow<'_, str>, Style) {
+    (Cow::Borrowed(text), Style::new())
+}
+
 /// How many rows `lines` take at `width`, wrapped.
-fn text_rows(lines: &[(String, Style)], width: u16) -> usize {
-    lines.iter().map(|(text, _)| wrap(&one_line(text), width.into()).len()).sum()
+fn text_rows(lines: &[(Cow<str>, Style)], width: u16) -> usize {
+    lines.iter().map(|(text, _)| rows_of(text, width).len()).sum()
+}
+
+/// `text` as rows at `width`: itself, not a copy, when it's safe to draw and
+/// fits (like a row of the 12 words); otherwise cleaned and wrapped.
+fn rows_of(text: &str, width: u16) -> Vec<Cow<'_, str>> {
+    let safe = !text.chars().any(|c| c.is_control() || is_invisible(c));
+    if safe && text.width() <= width.into() {
+        vec![Cow::Borrowed(text)]
+    } else {
+        wrap(&one_line(text), width.into()).into_iter().map(Cow::Owned).collect()
+    }
 }
 
 /// Your 12 words over the chat, from `/phrase`.
@@ -396,7 +420,8 @@ fn draw_reveal(frame: &mut Frame, words: &Secret, area: Rect) {
     let words: Vec<&str> = words.expose().split_whitespace().collect();
     let block = Block::bordered().title(" your recovery words ");
     let inner = block.inner(area);
-    let grid: Vec<TextLine> = word_grid(&words, inner.width).into_iter().map(TextLine::from).collect();
+    let grid_rows = word_grid(&words, inner.width);
+    let grid: Vec<TextLine> = grid_rows.iter().map(|r| TextLine::from(r.as_str())).collect();
     let hint = TextLine::styled("press any key to hide them", dim());
     let fits = |rows: usize| rows <= inner.height.into();
     let lines = if fits(grid.len() + 4) {

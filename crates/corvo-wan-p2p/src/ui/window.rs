@@ -11,8 +11,11 @@ pub enum Overlay {
     Welcome { scroll: u16 },
 }
 
-/// The widest a window gets: its text, a space each side and the border.
+/// The widest a window gets: its text, the margins and the border.
 pub const WIDTH: u16 = 56;
+/// Columns a window's text leaves for its border and margins: two at the
+/// left, at least two at the right.
+const FRAME: u16 = 6;
 
 const WELCOME: &[&str] = &[
     "Chat with friends directly, computer to computer.",
@@ -28,13 +31,13 @@ const WELCOME: &[&str] = &[
     "• Encrypted end to end, and no server keeps your",
     "  chats. Friends you connect with can see your IP.",
     "",
-    "          /help any time · Enter to start",
+    "            /help any time · Enter to start",
 ];
 
 impl Overlay {
     pub fn title(&self) -> &'static str {
         match self {
-            Overlay::Welcome { .. } => " Welcome to corvo ",
+            Overlay::Welcome { .. } => "─ Welcome to corvo ",
         }
     }
 
@@ -60,7 +63,7 @@ impl Overlay {
 /// The window's text as drawn on a terminal of `size`: wrapped to fit
 /// when the terminal is narrower than [`WIDTH`].
 pub fn rows(overlay: &Overlay, size: (u16, u16)) -> Vec<String> {
-    let inner = usize::from(size.0.min(WIDTH).saturating_sub(4));
+    let inner = usize::from(size.0.min(WIDTH).saturating_sub(FRAME));
     overlay.text().iter().flat_map(|line| wrap(line, inner)).collect()
 }
 

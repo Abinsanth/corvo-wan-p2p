@@ -343,7 +343,7 @@ fn draw_overlay(frame: &mut Frame, overlay: &Overlay, area: Rect) {
     let width = window::WIDTH.min(area.width);
     let at =
         Rect::new(area.x + (area.width - width) / 2, area.y + (area.height.saturating_sub(height)) / 2, width, height);
-    let lines: Vec<TextLine> = rows.into_iter().map(|row| TextLine::from(format!(" {row}"))).collect();
+    let lines: Vec<TextLine> = rows.into_iter().map(|row| TextLine::from(format!("  {row}"))).collect();
     frame.render_widget(Clear, at);
     frame.render_widget(
         Paragraph::new(lines).block(Block::bordered().title(overlay.title())).scroll((overlay.scroll(), 0)),
@@ -791,7 +791,13 @@ mod tests {
         state.overlay = Some(Overlay::Welcome { scroll: 0 });
         let all = |buf: &Buffer| (0..buf.area.height).map(|y| row(buf, y)).collect::<Vec<_>>().join("\n");
         let screen = all(&render(&state, 80, 24));
-        for part in ["Welcome to corvo", "Chat with friends directly", "Never share", "/help any time"] {
+        // As approved in #41.
+        for part in [
+            "┌─ Welcome to corvo ───",
+            "│  Chat with friends directly, computer to computer.   │",
+            "│  • Your 12 words are your account. Never share       │",
+            "│              /help any time · Enter to start         │",
+        ] {
             assert!(screen.contains(part), "{part:?} missing:\n{screen}");
         }
         let short = all(&render(&state, 40, 12));

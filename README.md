@@ -105,7 +105,7 @@ A green dot next to a contact means they're online. Next to your own messages:
 | `/clear` | clear the screen (Ctrl-L) |
 | `/update` | check for a newer version and install it |
 | `/welcome` | show the welcome again |
-| `/help` | list commands |
+| `/help` | a window with every command, the keys and the marks |
 | `/quit` | quit (Ctrl-C) |
 
 Start a message with `//` to send text that begins with `/`.

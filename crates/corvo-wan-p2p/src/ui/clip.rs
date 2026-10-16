@@ -74,7 +74,11 @@ mod tests {
 
     #[test]
     fn clipboard_texts_never_claim_success() {
-        let mut texts: Vec<String> = HELP.iter().map(|(usage, what)| format!("{usage} {what}")).collect();
+        let mut texts: Vec<String> = HELP
+            .iter()
+            .flat_map(|(_, commands)| commands.iter())
+            .map(|(usage, what)| format!("{usage} {what}"))
+            .collect();
         let mut s = state(true);
         send(&mut s, "/code");
         update(&mut s, Msg::Done(Outcome::Phrase(Ok(PhraseDone::Copied))));

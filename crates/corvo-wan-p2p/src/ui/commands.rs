@@ -72,35 +72,65 @@ pub const COMMANDS: &[&str] = &[
     "q",
 ];
 
-/// What `/help` lists.
-pub const HELP: &[(&str, &str)] = &[
-    ("/code", "show your code and send it to your clipboard, if your terminal allows it"),
-    ("/add <code>", "add a friend by their code and open a chat"),
-    ("/chat <name>", "open a chat (Tab completes names)"),
-    ("/contacts", "your contacts, who's online, last seen"),
-    ("/requests", "people who messaged you but aren't contacts yet"),
-    ("/accept [name]", "accept a request (the one in this tab if no name)"),
-    ("/block [name]", "block a request or contact (this tab if no name)"),
-    ("/unblock <name>", "unblock someone"),
-    ("/blocked", "list blocked people"),
-    ("/remove <name>", "delete a contact (asks whether to delete the history too)"),
-    ("/info <name>", "their code, name, online / last seen"),
-    ("/name <new name>", "change your display name"),
-    ("/passphrase", "change your history passphrase"),
-    ("/phrase", "show your 12 recovery words again (asks your passphrase first)"),
-    ("/phrase save", "write them to ~/corvo-wan-p2p-recovery.txt again"),
-    ("/phrase copy", "send them to your clipboard, if your terminal allows it"),
-    ("/close", "close this chat tab"),
-    ("/clear", "clear the screen (Ctrl-L)"),
-    ("/update [yes]", "check for and install a newer version"),
-    ("/welcome", "show the welcome again"),
-    ("/help  /h", "list commands"),
-    ("/quit  /q", "quit (Ctrl-C)"),
+/// What `/help` lists, by group: each command and what it does.
+pub const HELP: &[(&str, &[(&str, &str)])] = &[
+    (
+        "Friends",
+        &[
+            ("/code", "show your code and send it to your clipboard, if your terminal allows it"),
+            ("/add <code>", "add a friend by their code and open a chat"),
+            ("/accept [name]", "accept a request (the one in this tab if no name)"),
+            ("/block [name]", "block a request or contact (this tab if no name)"),
+            ("/unblock <name>", "unblock someone"),
+            ("/remove <name>", "delete a contact (asks whether to delete the history too)"),
+            ("/contacts", "your contacts, who's online, last seen"),
+            ("/requests", "people who messaged you but aren't contacts yet"),
+            ("/blocked", "list blocked people"),
+            ("/info <name>", "their code, name, online / last seen"),
+        ],
+    ),
+    (
+        "Chatting",
+        &[
+            ("/chat <name>", "open a chat (Tab completes names)"),
+            ("/close", "close this chat tab"),
+            ("/clear", "clear the screen (Ctrl-L)"),
+        ],
+    ),
+    (
+        "You",
+        &[
+            ("/name <new name>", "change your display name"),
+            ("/passphrase", "change your history passphrase"),
+            ("/phrase", "show your 12 recovery words again (asks your passphrase first)"),
+            ("/phrase save", "write them to ~/corvo-wan-p2p-recovery.txt again"),
+            ("/phrase copy", "send them to your clipboard, if your terminal allows it"),
+        ],
+    ),
+    (
+        "App",
+        &[
+            ("/update [yes]", "check for and install a newer version"),
+            ("/welcome", "show the welcome again"),
+            ("/help  /h", "this list"),
+            ("/quit  /q", "quit (Ctrl-C)"),
+        ],
+    ),
 ];
 
 /// The keys, for `/help`.
-pub const KEYS: &str = "keys: Shift-Tab, Alt-←/→ or Alt-1..9 switch tabs · Alt+Enter new line · \
-                        PgUp/PgDn or the wheel scroll · ↑/↓ earlier lines";
+pub const KEYS: &[(&str, &str)] = &[
+    ("Tab", "complete a command or a name"),
+    ("Shift-Tab, Alt-1..9", "switch tabs (Alt-←/→ too)"),
+    ("Alt+Enter", "a new line in your message"),
+    ("PgUp/PgDn, wheel", "scroll"),
+    ("↑/↓", "what you typed before"),
+    ("Ctrl-L", "clear the screen"),
+    ("Ctrl-C", "quit"),
+];
+
+/// The marks beside your messages, for `/help`.
+pub const MARKS: &[(&str, &str)] = &[("·", "waiting"), ("✓", "delivered"), ("✓✓", "read")];
 
 /// Names that were never commands here but people type anyway, and what they meant.
 const MEANT: &[(&str, &str)] = &[("exit", "quit")];
@@ -276,6 +306,20 @@ mod tests {
             Input::Wrong(why) => why,
             other => panic!("{line:?} parsed as {other:?}"),
         }
+    }
+
+    #[test]
+    fn every_command_is_in_the_help_once() {
+        let usages: Vec<&str> =
+            HELP.iter().flat_map(|(_, commands)| commands.iter().map(|(usage, _)| *usage)).collect();
+        for name in COMMANDS {
+            let slash = format!("/{name}");
+            let found = usages.iter().filter(|u| u.split_whitespace().any(|word| word == slash)).count();
+            // /phrase save and /phrase copy are listed beside /phrase.
+            let want = if *name == "phrase" { 3 } else { 1 };
+            assert_eq!(found, want, "{slash} in the help: {usages:?}");
+        }
+        assert_eq!(HELP.iter().map(|(group, _)| *group).collect::<Vec<_>>(), ["Friends", "Chatting", "You", "App"]);
     }
 
     #[test]

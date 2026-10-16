@@ -340,15 +340,17 @@ pub fn draw(frame: &mut Frame, state: &State) {
 fn draw_overlay(frame: &mut Frame, overlay: &Overlay, area: Rect) {
     let rows = window::rows(overlay, (area.width, area.height));
     let height = window::height((area.width, area.height), rows.len()) + 2;
-    let width = window::WIDTH.min(area.width);
+    let width = overlay.width().min(area.width);
     let at =
         Rect::new(area.x + (area.width - width) / 2, area.y + (area.height.saturating_sub(height)) / 2, width, height);
     let lines: Vec<TextLine> = rows.into_iter().map(|row| TextLine::from(format!("  {row}"))).collect();
+    let mut block = Block::bordered().title(overlay.title());
+    if let Some(hint) = overlay.hint() {
+        block = block.title(TextLine::from(hint).right_aligned());
+    }
     frame.render_widget(Clear, at);
     frame.render_widget(
-        Paragraph::new(lines)
-            .block(Block::bordered().title(overlay.title()))
-            .scroll((window::scroll(overlay, (area.width, area.height)), 0)),
+        Paragraph::new(lines).block(block).scroll((window::scroll(overlay, (area.width, area.height)), 0)),
         at,
     );
 }
@@ -810,6 +812,18 @@ mod tests {
         assert!(all(&render(&state, 40, 12)).contains("/help any time"), "scrolled to the end");
         let bigger = all(&render(&state, 80, 24));
         assert!(bigger.contains("Chat with friends directly"), "a bigger terminal shows it all:\n{bigger}");
+    }
+
+    #[test]
+    fn the_help_window_shows_groups_keys_and_marks() {
+        let mut state = State::new("ana".into(), "abcdefgh".into());
+        state.overlay = Some(Overlay::Help { scroll: 0 });
+        let buf = render(&state, 100, 50);
+        let screen = (0..buf.area.height).map(|y| row(&buf, y)).collect::<Vec<_>>().join("\n");
+        for part in ["┌─ Help ─", " Esc closes ─┐", "│  Friends", "    /add <code>", "│  Keys", "    ✓✓ ", "read"]
+        {
+            assert!(screen.contains(part), "{part:?} missing:\n{screen}");
+        }
     }
 
     fn render(state: &State, w: u16, h: u16) -> Buffer {

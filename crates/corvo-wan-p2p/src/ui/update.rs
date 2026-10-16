@@ -15,7 +15,7 @@ use zeroize::Zeroizing;
 
 use super::account::{self, PhraseDone, PhraseUse};
 use super::chat::{self, Loaded};
-use super::commands::{Cmd, HELP, Input, KEYS, may_hold_a_secret, parse};
+use super::commands::{Cmd, Input, may_hold_a_secret, parse};
 use super::complete;
 use super::people::{self, Act, Show};
 use super::state::{Screen, Secret, State, Tone, WHEEL_STEP};
@@ -517,13 +517,7 @@ fn on_line(state: &mut State, line: &str, effects: &mut Vec<Effect>) {
 
 fn on_command(state: &mut State, cmd: Cmd, effects: &mut Vec<Effect>) {
     match cmd {
-        Cmd::Help => {
-            for (usage, what) in HELP {
-                state.say(Tone::Plain, format!("{usage:<18} {what}"));
-            }
-            state.say(Tone::Plain, KEYS);
-            state.select_tab(0);
-        }
+        Cmd::Help => state.overlay = Some(Overlay::Help { scroll: 0 }),
         Cmd::Clear => state.clear_tab(),
         Cmd::Welcome => state.overlay = Some(Overlay::Welcome { scroll: 0 }),
         cmd @ (Cmd::Passphrase | Cmd::Phrase | Cmd::PhraseSave | Cmd::PhraseCopy) => account::begin(state, cmd),
@@ -661,13 +655,13 @@ mod tests {
     #[test]
     fn up_and_down_browse_sent_lines_after_the_input_rows() {
         let mut s = state();
-        send(&mut s, "/help");
+        send(&mut s, "/blocked");
         send(&mut s, "/clear");
         type_text(&mut s, "draft");
         press(&mut s, KeyCode::Up);
         assert_eq!(s.editor.text(), "/clear");
         press(&mut s, KeyCode::Up);
-        assert_eq!(s.editor.text(), "/help");
+        assert_eq!(s.editor.text(), "/blocked");
         press(&mut s, KeyCode::Down);
         press(&mut s, KeyCode::Down);
         assert_eq!(s.editor.text(), "draft");
@@ -773,19 +767,6 @@ mod tests {
     }
 
     #[test]
-    fn help_lists_every_command_in_the_corvo_tab() {
-        let mut s = state();
-        alt(&mut s, KeyCode::Char('2'));
-        send(&mut s, "/h");
-        assert_eq!(s.current, 0, "help opens the corvo tab");
-        let text: Vec<&str> = s.tabs[0].lines.iter().map(|l| l.text.as_str()).collect();
-        for usage in ["/add <code>", "/accept [name]", "/phrase copy", "/quit  /q"] {
-            assert!(text.iter().any(|l| l.starts_with(usage)), "{usage} is listed");
-        }
-        assert!(text.last().unwrap().contains("Alt+Enter"));
-    }
-
-    #[test]
     fn close_closes_a_chat_but_not_corvo() {
         let mut s = state();
         alt(&mut s, KeyCode::Char('3'));
@@ -848,7 +829,7 @@ mod tests {
     #[test]
     fn a_passphrase_typed_after_the_command_is_not_kept() {
         let mut s = state();
-        send(&mut s, "/help");
+        send(&mut s, "/blocked");
         for line in
             ["/passphrase old-secret new-secret", "/PASSPHRASE old-secret", "  /phrase hunter2", "/phrase  copy now"]
         {
@@ -865,16 +846,16 @@ mod tests {
         while let Some(entry) = s.history.prev("") {
             kept.push(entry);
         }
-        assert_eq!(kept, vec!["/help"], "only the line without a passphrase in it");
+        assert_eq!(kept, vec!["/blocked"], "only the line without a passphrase in it");
     }
 
     #[test]
     fn an_unsent_passphrase_line_is_not_kept_as_a_draft() {
         let mut s = state();
-        send(&mut s, "/help");
+        send(&mut s, "/blocked");
         type_text(&mut s, "/passphrase old-secret new-secret");
         press(&mut s, KeyCode::Up);
-        assert_eq!(s.editor.text(), "/help");
+        assert_eq!(s.editor.text(), "/blocked");
         press(&mut s, KeyCode::Down);
         assert_eq!(s.editor.text(), "", "the line with a passphrase in it wasn't kept");
     }
@@ -922,7 +903,7 @@ mod tests {
                 standing: corvo_wan_p2p_core::store::Standing::Contact,
             },
         ]);
-        send(&mut s, "/help");
+        send(&mut s, "/blocked");
         type_text(&mut s, "/chat r");
         press(&mut s, KeyCode::Tab);
         assert!(s.popup.is_some());
@@ -936,7 +917,7 @@ mod tests {
         s.size = (80, 8);
         press(&mut s, KeyCode::Up);
         assert_eq!(s.popup, None);
-        assert_eq!(s.editor.text(), "/help", "↑ browses the history as if there were no list");
+        assert_eq!(s.editor.text(), "/blocked", "↑ browses the history as if there were no list");
     }
 
     #[test]

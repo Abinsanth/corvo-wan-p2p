@@ -4,7 +4,7 @@
 
 mod common;
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use common::{Fake, Peer, friends, say};
 use corvo_wan_p2p_core::chat::{ChatError, Event, MAX_REQUEST_RENAMES};
@@ -129,4 +129,30 @@ async fn reading_a_request_is_remembered_without_telling_them() {
     a.client.mark_read(b.code).await.unwrap();
     assert_eq!(a.client.read_upto(b.code).await.unwrap(), Some(id));
     b.expect_none(QUIET, |e| matches!(e, Event::Read { .. })).await;
+}
+
+/// While Argon2 works through `/passphrase` or `/phrase` (a fifth of a second
+/// to a second, by machine), the engine still answers everything else.
+#[tokio::test(flavor = "multi_thread")]
+async fn passphrase_work_does_not_hold_up_the_engine() {
+    let lookup = MemoryLookup::new();
+    let a = Peer::start_with_real_kdf(&lookup, "abin").await;
+    let meanwhile = async {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let started = Instant::now();
+        a.client.people().await.unwrap();
+        started.elapsed()
+    };
+    let (changed, waited) = tokio::join!(a.client.change_passphrase("pass", "new pass"), meanwhile);
+    changed.unwrap();
+    assert!(waited < Duration::from_millis(50), "people() waited {waited:?} for the passphrase change");
+    let meanwhile = async {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let started = Instant::now();
+        a.client.people().await.unwrap();
+        started.elapsed()
+    };
+    let (seed, waited) = tokio::join!(a.client.phrase("new pass"), meanwhile);
+    seed.unwrap();
+    assert!(waited < Duration::from_millis(50), "people() waited {waited:?} for /phrase");
 }

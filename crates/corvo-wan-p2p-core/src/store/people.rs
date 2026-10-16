@@ -213,6 +213,21 @@ impl Store {
         Ok(n as usize)
     }
 
+    /// How many requests are waiting for an answer. Only standings are opened,
+    /// since this runs for every stranger who connects.
+    pub fn request_count(&self) -> Result<usize, StoreError> {
+        let mut query = self.db.prepare("SELECT peer, standing FROM contacts")?;
+        let mut rows = query.query([])?;
+        let mut requests = 0;
+        while let Some(row) = rows.next()? {
+            let (peer, standing): (Vec<u8>, Option<Vec<u8>>) = (row.get(0)?, row.get(1)?);
+            if matches!(readable(self.open_standing(&peer, standing.as_deref()))?, Some(Stored::Request { .. })) {
+                requests += 1;
+            }
+        }
+        Ok(requests)
+    }
+
     /// Everyone you know of who can be read, in the order you first knew of them.
     pub fn people(&self) -> Result<Vec<Person>, StoreError> {
         Ok(self.people_checked()?.0)

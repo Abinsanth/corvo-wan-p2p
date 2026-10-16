@@ -407,3 +407,21 @@ fn a_damaged_read_receipt_counts_as_nothing_read() {
     let s = Store::open(dir.path(), "pass").unwrap();
     assert_eq!(s.read_upto(&rahul).unwrap(), None);
 }
+
+#[test]
+fn requests_are_counted_from_their_standing_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let s = store(dir.path());
+        s.add_contact(&someone()).unwrap();
+        s.add_request(&someone(), "one").unwrap();
+        s.add_request(&someone(), "two").unwrap();
+        s.block(&someone()).unwrap();
+        assert_eq!(s.request_count().unwrap(), 2);
+    }
+    // Names and keys aren't opened to count, so damage there doesn't matter.
+    let db = rusqlite::Connection::open(dir.path().join(DB_FILE)).unwrap();
+    db.execute("UPDATE contacts SET name = x'00', key = x'00'", []).unwrap();
+    drop(db);
+    assert_eq!(Store::open(dir.path(), "pass").unwrap().request_count().unwrap(), 2);
+}

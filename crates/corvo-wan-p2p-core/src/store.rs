@@ -16,6 +16,7 @@ mod schema;
 use std::fs::{self, File, TryLockError};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use rusqlite::{Connection, ErrorCode, OptionalExtension, params};
@@ -83,7 +84,39 @@ pub struct Store {
     data_key: Zeroizing<[u8; 32]>,
     field_key: Zeroizing<[u8; 32]>,
     tag_key: Zeroizing<[u8; 32]>,
+    /// Held while `key.json` is being replaced, so two changes don't interleave.
+    key_file: Arc<Mutex<()>>,
     _lock: File,
+}
+
+/// What checking or changing the passphrase needs, apart from the store, so
+/// the slow Argon2 work can run on another thread while the store carries on.
+#[derive(Clone)]
+pub struct Passphrase {
+    key_path: PathBuf,
+    data_key: Zeroizing<[u8; 32]>,
+    key_file: Arc<Mutex<()>>,
+}
+
+impl Passphrase {
+    /// Whether `passphrase` unlocks this account. Another account's `key.json`
+    /// never passes, whatever it's locked with.
+    pub fn check(&self, passphrase: &str) -> Result<bool, StoreError> {
+        match KeyFile::read(&self.key_path)?.unlock(passphrase, &self.key_path) {
+            Ok(key) => Ok(*key == *self.data_key),
+            Err(StoreError::WrongPassphrase) => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Locks the data key with a new passphrase. Only `key.json` changes.
+    pub fn change(&self, new_passphrase: &str, params: KdfParams) -> Result<(), StoreError> {
+        if new_passphrase.is_empty() {
+            return Err(StoreError::EmptyPassphrase);
+        }
+        let _writing = self.key_file.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        KeyFile::lock(&self.data_key, new_passphrase, params)?.write(&self.key_path)
+    }
 }
 
 impl Store {
@@ -138,17 +171,15 @@ impl Store {
         let db_path = dir.join(DB_FILE);
         private_file().create(true).truncate(false).open(&db_path)?;
         let db = Connection::open(&db_path)?;
+        // WAL: a write is one append and, with NORMAL, no sync per commit (a
+        // power cut can lose the last moments, never corrupt the file).
+        let not_ours = |e: StoreError| not_a_store(&db_path, e);
+        db.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA busy_timeout = 1000;")
+            .map_err(|e| not_ours(e.into()))?;
         let field_key = crypt::subkey(&data_key, FIELD_KEY_LABEL);
         let tag_key = crypt::subkey(&data_key, TAG_KEY_LABEL);
-        let store = Store { dir: dir.to_path_buf(), db, data_key, field_key, tag_key, _lock: lock };
-        let not_ours = |e: StoreError| match e {
-            StoreError::Db(e)
-                if matches!(e.sqlite_error_code(), Some(ErrorCode::NotADatabase | ErrorCode::DatabaseCorrupt)) =>
-            {
-                StoreError::Damaged { file: db_path.clone(), why: "it isn't a corvo-wan-p2p database".into() }
-            }
-            e => e,
-        };
+        let key_file = Arc::default();
+        let store = Store { dir: dir.to_path_buf(), db, data_key, field_key, tag_key, key_file, _lock: lock };
         // Data steps seal values with these keys, so first make sure they're
         // this store's: a store.db beside another account's key.json would be
         // spoiled for good otherwise. (The profile has been there since step 1.)
@@ -189,23 +220,24 @@ impl Store {
         Ok(name)
     }
 
+    /// For checking or changing the passphrase away from the store (see [`Passphrase`]).
+    pub fn passphrase(&self) -> Passphrase {
+        Passphrase {
+            key_path: self.dir.join(KEY_FILE),
+            data_key: self.data_key.clone(),
+            key_file: Arc::clone(&self.key_file),
+        }
+    }
+
     /// Locks the data key with a new passphrase. Only `key.json` changes.
     pub fn change_passphrase(&self, new_passphrase: &str, params: KdfParams) -> Result<(), StoreError> {
-        if new_passphrase.is_empty() {
-            return Err(StoreError::EmptyPassphrase);
-        }
-        KeyFile::lock(&self.data_key, new_passphrase, params)?.write(&self.dir.join(KEY_FILE))
+        self.passphrase().change(new_passphrase, params)
     }
 
     /// Whether `passphrase` unlocks this account (for commands that ask for it
     /// again). Another account's `key.json` never passes, whatever it's locked with.
     pub fn check_passphrase(&self, passphrase: &str) -> Result<bool, StoreError> {
-        let key_path = self.dir.join(KEY_FILE);
-        match KeyFile::read(&key_path)?.unlock(passphrase, &key_path) {
-            Ok(key) => Ok(*key == *self.data_key),
-            Err(StoreError::WrongPassphrase) => Ok(false),
-            Err(e) => Err(e),
-        }
+        self.passphrase().check(passphrase)
     }
 
     /// Deletes the account in `dir` (for `--recover` after a forgotten passphrase).
@@ -238,6 +270,18 @@ impl Store {
 
     fn damaged(&self, why: &str) -> StoreError {
         StoreError::Damaged { file: self.dir.join(DB_FILE), why: why.into() }
+    }
+}
+
+/// SQLite's "this isn't a database" as our "damaged"; other errors as they are.
+fn not_a_store(file: &Path, e: StoreError) -> StoreError {
+    match e {
+        StoreError::Db(e)
+            if matches!(e.sqlite_error_code(), Some(ErrorCode::NotADatabase | ErrorCode::DatabaseCorrupt)) =>
+        {
+            StoreError::Damaged { file: file.to_path_buf(), why: "it isn't a corvo-wan-p2p database".into() }
+        }
+        e => e,
     }
 }
 

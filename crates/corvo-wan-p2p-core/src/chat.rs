@@ -28,7 +28,7 @@ use crate::VERSION;
 use crate::identity::{Code, NameError, Seed, clean_name};
 use crate::net::ALPN;
 use crate::proto::{Frame, MAX_FRAME, MAX_TEXT, PROTO_VERSION, encode};
-use crate::store::{KdfParams, Person, Standing, Store, StoreError, StoredMessage};
+use crate::store::{KdfParams, Passphrase, Person, Standing, Store, StoreError, StoredMessage};
 use link::Role;
 
 /// The most requests waiting for an answer. Strangers are refused beyond it.
@@ -479,11 +479,20 @@ impl Core {
             Command::ReadUpto(peer, reply) => {
                 let _ = reply.send(self.store.read_upto(&peer).map_err(ChatError::from));
             }
+            // Argon2 takes a fifth of a second to a second: done on a blocking
+            // thread, so messages keep flowing meanwhile.
             Command::ChangePassphrase { old, new, reply } => {
-                let _ = reply.send(self.change_passphrase(&old, &new));
+                let (passphrase, kdf) = (self.store.passphrase(), self.config.kdf);
+                tokio::task::spawn_blocking(move || {
+                    let _ = reply.send(change_passphrase(&passphrase, &old, &new, kdf));
+                });
             }
-            Command::Phrase(passphrase, reply) => {
-                let _ = reply.send(self.check_passphrase(&passphrase).and_then(|()| Ok(self.store.profile()?.seed)));
+            Command::Phrase(typed, reply) => {
+                let passphrase = self.store.passphrase();
+                let seed = self.store.profile().map(|p| p.seed);
+                tokio::task::spawn_blocking(move || {
+                    let _ = reply.send(check_passphrase(&passphrase, &typed).and_then(|()| Ok(seed?)));
+                });
             }
             Command::Shutdown => {}
         }
@@ -594,18 +603,6 @@ impl Core {
         Ok(())
     }
 
-    fn check_passphrase(&self, passphrase: &str) -> Result<(), ChatError> {
-        if self.store.check_passphrase(passphrase)? { Ok(()) } else { Err(ChatError::WrongPassphrase) }
-    }
-
-    fn change_passphrase(&self, old: &str, new: &str) -> Result<(), ChatError> {
-        if new.is_empty() {
-            return Err(StoreError::EmptyPassphrase.into());
-        }
-        self.check_passphrase(old)?;
-        Ok(self.store.change_passphrase(new, self.config.kdf)?)
-    }
-
     fn set_name(&mut self, name: &str) -> Result<String, ChatError> {
         let name = self.store.set_name(name)?;
         self.name = name.clone();
@@ -714,7 +711,7 @@ impl Core {
     }
 
     fn requests(&self) -> Result<usize, StoreError> {
-        Ok(self.store.people()?.iter().filter(|p| p.standing == Standing::Request).count())
+        self.store.request_count()
     }
 
     fn spawn_link(&mut self, conn: Connection, role: Role, peer: Code) -> u64 {
@@ -1060,6 +1057,18 @@ async fn sleep_until(at: Option<Instant>) {
 
 fn now_ms() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64)
+}
+
+fn check_passphrase(passphrase: &Passphrase, typed: &str) -> Result<(), ChatError> {
+    if passphrase.check(typed)? { Ok(()) } else { Err(ChatError::WrongPassphrase) }
+}
+
+fn change_passphrase(passphrase: &Passphrase, old: &str, new: &str, kdf: KdfParams) -> Result<(), ChatError> {
+    if new.is_empty() {
+        return Err(StoreError::EmptyPassphrase.into());
+    }
+    check_passphrase(passphrase, old)?;
+    Ok(passphrase.change(new, kdf)?)
 }
 
 #[cfg(test)]

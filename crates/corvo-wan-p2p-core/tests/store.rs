@@ -277,3 +277,32 @@ fn a_garbage_store_db_is_reported_as_damaged() {
     assert!(file.ends_with(DB_FILE));
     assert!(why.contains("isn't a corvo-wan-p2p database"), "{why}");
 }
+
+#[test]
+fn the_store_uses_wal() {
+    let dir = tempfile::tempdir().unwrap();
+    drop(new_account(dir.path()));
+    let db = rusqlite::Connection::open(dir.path().join(DB_FILE)).unwrap();
+    let mode: String = db.pragma_query_value(None, "journal_mode", |r| r.get(0)).unwrap();
+    assert_eq!(mode, "wal");
+}
+
+#[test]
+fn wal_files_stay_private_and_go_with_recover() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, _) = new_account(dir.path());
+    store.set_name("abin p").unwrap();
+    let wal = dir.path().join(format!("{DB_FILE}-wal"));
+    assert!(wal.exists(), "written through the WAL");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(fs::metadata(&wal).unwrap().permissions().mode() & 0o777, 0o600);
+    }
+    assert!(matches!(Store::open(dir.path(), "first pass"), Err(StoreError::AlreadyRunning)));
+    drop(store);
+    Store::wipe(dir.path()).unwrap();
+    for leftover in [DB_FILE.to_string(), format!("{DB_FILE}-wal"), format!("{DB_FILE}-shm")] {
+        assert!(!dir.path().join(&leftover).exists(), "{leftover} is gone");
+    }
+}

@@ -62,6 +62,12 @@ struct Body {
     text: String,
 }
 
+#[cfg(test)]
+thread_local! {
+    /// How many marks and bodies were opened, so tests can see what a call reads.
+    static OPENED: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+}
+
 impl Store {
     fn msg_tag(&self, id: &str) -> [u8; 32] {
         crypt::tag(&self.tag_key, b"msg", id.as_bytes())
@@ -184,13 +190,21 @@ impl Store {
     }
 
     fn message_from_row(&self, peer: &[u8], msg: &[u8], body: &[u8], mark: &[u8]) -> Result<StoredMessage, StoreError> {
-        let body = self.open_at(b"messages.body", &[peer, msg], body)?;
-        let body: Body = serde_json::from_slice(&body).map_err(|_| self.damaged("a message isn't readable"))?;
+        let body = self.open_body(peer, msg, body)?;
         let mark = self.open_mark(peer, msg, mark)?;
         Ok(StoredMessage { id: body.id, sent_at: body.sent_at, text: body.text, mark })
     }
 
+    fn open_body(&self, peer: &[u8], msg: &[u8], sealed: &[u8]) -> Result<Body, StoreError> {
+        #[cfg(test)]
+        OPENED.with(|o| o.set((o.get().0, o.get().1 + 1)));
+        let body = self.open_at(b"messages.body", &[peer, msg], sealed)?;
+        serde_json::from_slice(&body).map_err(|_| self.damaged("a message isn't readable"))
+    }
+
     fn open_mark(&self, peer: &[u8], msg: &[u8], sealed: &[u8]) -> Result<Mark, StoreError> {
+        #[cfg(test)]
+        OPENED.with(|o| o.set((o.get().0 + 1, o.get().1)));
         let byte = self.open_at(b"messages.mark", &[peer, msg], sealed)?;
         match byte.as_slice() {
             [b] => Mark::from_byte(*b).ok_or_else(|| self.damaged("unknown message mark")),
@@ -237,21 +251,91 @@ impl Store {
             )
             .optional()?;
         let Some(target) = target else { return Ok(false) };
-        let mut query = self.db.prepare("SELECT msg, mark FROM messages WHERE peer = ?1 AND seq <= ?2 ORDER BY seq")?;
-        let rows: Vec<(Vec<u8>, Vec<u8>)> =
-            query.query_map(params![peer, target], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?;
-        let mut changed = false;
-        for (msg, mark) in rows {
-            if matches!(readable(self.open_mark(&peer, &msg, &mark))?, Some(Mark::Waiting | Mark::Delivered)) {
-                self.set_mark(&peer, &msg, Mark::Read)?;
-                changed = true;
+        // Marks only move forward, so everything before a read message is read
+        // too: walk back from `up_to` and stop at the first one.
+        let mut newly_read = Vec::new();
+        {
+            let mut query =
+                self.db.prepare("SELECT msg, mark FROM messages WHERE peer = ?1 AND seq <= ?2 ORDER BY seq DESC")?;
+            let mut rows = query.query(params![peer, target])?;
+            while let Some(row) = rows.next()? {
+                let (msg, mark): (Vec<u8>, Vec<u8>) = (row.get(0)?, row.get(1)?);
+                match readable(self.open_mark(&peer, &msg, &mark))? {
+                    Some(Mark::Read) => break,
+                    Some(Mark::Waiting | Mark::Delivered) => newly_read.push(msg),
+                    Some(Mark::Received) | None => {}
+                }
             }
         }
-        Ok(changed)
+        let tx = self.db.unchecked_transaction()?;
+        for msg in &newly_read {
+            self.set_mark(&peer, msg, Mark::Read)?;
+        }
+        tx.commit()?;
+        Ok(!newly_read.is_empty())
     }
 
-    /// The id of the newest message `from` sent you.
+    /// The id of the newest message `from` sent you, found from the end of the chat.
     pub fn last_received(&self, from: &Code) -> Result<Option<String>, StoreError> {
-        Ok(self.history(from)?.into_iter().rev().find(|m| m.mark == Mark::Received).map(|m| m.id))
+        let peer = self.peer_tag(from);
+        let mut query = self.db.prepare("SELECT msg, body, mark FROM messages WHERE peer = ?1 ORDER BY seq DESC")?;
+        let mut rows = query.query([&peer])?;
+        while let Some(row) = rows.next()? {
+            let (msg, body, mark): (Vec<u8>, Vec<u8>, Vec<u8>) = (row.get(0)?, row.get(1)?, row.get(2)?);
+            if readable(self.open_mark(&peer, &msg, &mark))? == Some(Mark::Received)
+                && let Some(body) = readable(self.open_body(&peer, &msg, &body))?
+            {
+                return Ok(Some(body.id));
+            }
+        }
+        Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::identity::Seed;
+    use crate::store::KdfParams;
+
+    fn store(dir: &std::path::Path) -> Store {
+        Store::create(dir, "pass", KdfParams::FAST_INSECURE, &Seed::generate(), "abin").unwrap()
+    }
+
+    fn opened() -> (usize, usize) {
+        OPENED.with(|o| o.get())
+    }
+
+    #[test]
+    fn a_read_receipt_only_opens_the_marks_not_yet_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        let rahul = Seed::generate().code();
+        for i in 0..100 {
+            s.add_outgoing(&rahul, &format!("m{i:03}"), i, "x").unwrap();
+            s.mark_delivered(&rahul, &format!("m{i:03}")).unwrap();
+        }
+        assert!(s.mark_read(&rahul, "m097").unwrap());
+        OPENED.with(|o| o.set((0, 0)));
+        assert!(s.mark_read(&rahul, "m099").unwrap());
+        assert!(opened().0 <= 3, "opened {} marks", opened().0);
+        let marks: Vec<Mark> = s.history(&rahul).unwrap().iter().map(|m| m.mark).collect();
+        assert!(marks.iter().all(|&m| m == Mark::Read));
+        assert!(!s.mark_read(&rahul, "m099").unwrap(), "nothing new");
+    }
+
+    #[test]
+    fn the_last_received_message_is_found_from_the_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        let rahul = Seed::generate().code();
+        for i in 0..100 {
+            s.add_incoming(&rahul, &format!("in{i:03}"), i, "x").unwrap();
+        }
+        s.add_outgoing(&rahul, "out", 100, "x").unwrap();
+        OPENED.with(|o| o.set((0, 0)));
+        assert_eq!(s.last_received(&rahul).unwrap().as_deref(), Some("in099"));
+        assert!(opened().0 <= 2 && opened().1 <= 1, "opened {:?} (marks, bodies)", opened());
+        assert_eq!(s.last_received(&Seed::generate().code()).unwrap(), None);
     }
 }

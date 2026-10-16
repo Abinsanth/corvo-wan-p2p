@@ -261,20 +261,35 @@ fn the_outbox_can_be_read_a_few_at_a_time() {
     assert_eq!(first, ["m1", "m2"]);
 }
 
+/// Contacts saved before requests existed get their standing sealed when the
+/// store upgrades (see tests/upgrade.rs). After that, a missing standing is
+/// damage: clearing a blocked person's standing mustn't make them a contact.
 #[test]
-fn a_contact_saved_before_requests_existed_is_still_a_contact() {
+fn clearing_a_blocked_standing_does_not_unblock() {
     let dir = tempfile::tempdir().unwrap();
-    let rahul = someone();
-    drop(store(dir.path()));
-    {
-        let s = Store::open(dir.path(), "pass").unwrap();
-        s.add_contact(&rahul).unwrap();
-    }
+    let pest = someone();
+    store(dir.path()).block(&pest).unwrap();
     let db = rusqlite::Connection::open(dir.path().join(DB_FILE)).unwrap();
     db.execute("UPDATE contacts SET standing = NULL", []).unwrap();
     drop(db);
     let s = Store::open(dir.path(), "pass").unwrap();
-    assert_eq!(s.standing(&rahul).unwrap(), Some(Standing::Contact));
+    assert!(matches!(s.standing(&pest), Err(StoreError::Damaged { .. })));
+    assert!(!s.contacts().unwrap_or_default().iter().any(|p| p.code == pest));
+}
+
+#[test]
+fn messages_removed_with_history_are_still_known_by_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = store(dir.path());
+    let rahul = someone();
+    s.add_contact(&rahul).unwrap();
+    s.add_incoming(&rahul, "x1", 1, "hi").unwrap();
+    s.add_outgoing(&rahul, "y1", 2, "hey").unwrap();
+    s.remove(&rahul, true).unwrap();
+    assert!(s.history(&rahul).unwrap().is_empty());
+    assert!(s.has_message(&rahul, "x1").unwrap(), "a resend of x1 is recognised");
+    assert!(!s.has_message(&someone(), "x1").unwrap(), "only for that person");
+    assert!(!s.add_incoming(&rahul, "x1", 1, "hi").unwrap() || s.has_message(&rahul, "x1").unwrap());
 }
 
 #[test]

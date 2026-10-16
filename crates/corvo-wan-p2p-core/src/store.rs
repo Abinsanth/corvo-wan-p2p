@@ -138,19 +138,28 @@ impl Store {
     fn assemble(dir: &Path, data_key: Zeroizing<[u8; 32]>, lock: File) -> Result<Store, StoreError> {
         let db_path = dir.join(DB_FILE);
         private_file().create(true).truncate(false).open(&db_path)?;
-        let mut db = Connection::open(&db_path)?;
-        let upgraded = schema::upgrade(&mut db).map_err(|e| match e.sqlite_error_code() {
-            Some(ErrorCode::NotADatabase | ErrorCode::DatabaseCorrupt) => {
+        let db = Connection::open(&db_path)?;
+        let field_key = crypt::subkey(&data_key, FIELD_KEY_LABEL);
+        let tag_key = crypt::subkey(&data_key, TAG_KEY_LABEL);
+        let store = Store { dir: dir.to_path_buf(), db, data_key, field_key, tag_key, _lock: lock };
+        let upgraded = schema::upgrade(&store.db, &mut |step| store.data_step(step)).map_err(|e| match e {
+            StoreError::Db(e)
+                if matches!(e.sqlite_error_code(), Some(ErrorCode::NotADatabase | ErrorCode::DatabaseCorrupt)) =>
+            {
                 StoreError::Damaged { file: db_path.clone(), why: "it isn't a corvo-wan-p2p database".into() }
             }
-            _ => e.into(),
+            e => e,
         })?;
         if upgraded == schema::Upgrade::TooNew {
             return Err(StoreError::TooNew(db_path));
         }
-        let field_key = crypt::subkey(&data_key, FIELD_KEY_LABEL);
-        let tag_key = crypt::subkey(&data_key, TAG_KEY_LABEL);
-        Ok(Store { dir: dir.to_path_buf(), db, data_key, field_key, tag_key, _lock: lock })
+        Ok(store)
+    }
+
+    fn data_step(&self, step: schema::DataStep) -> Result<(), StoreError> {
+        match step {
+            schema::DataStep::SealMissingStandings => self.seal_missing_standings(),
+        }
     }
 
     /// Your seed and name.

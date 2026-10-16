@@ -123,8 +123,19 @@ impl Store {
         sealed.map(|sealed| self.open_standing(peer, sealed.as_deref())).transpose()
     }
 
+    /// Schema step 4: rows from before requests have no standing; they're contacts.
+    pub(super) fn seal_missing_standings(&self) -> Result<(), StoreError> {
+        let mut query = self.db.prepare("SELECT peer FROM contacts WHERE standing IS NULL")?;
+        let peers: Vec<Vec<u8>> = query.query_map([], |r| r.get(0))?.collect::<Result<_, _>>()?;
+        for peer in peers {
+            self.set_stored(&peer, Stored::Contact)?;
+        }
+        Ok(())
+    }
+
     fn open_standing(&self, peer: &[u8], sealed: Option<&[u8]>) -> Result<Stored, StoreError> {
-        let Some(sealed) = sealed else { return Ok(Stored::Contact) }; // a row from before requests
+        // Schema step 4 sealed every standing, so a missing one was removed since.
+        let sealed = sealed.ok_or_else(|| self.damaged("a standing is missing"))?;
         let bytes = self.open_at(b"contacts.standing", &[peer], sealed)?;
         Stored::from_bytes(&bytes).ok_or_else(|| self.damaged("unknown standing"))
     }

@@ -111,12 +111,14 @@ impl Store {
         self.select(peer, "", "")
     }
 
-    /// Whether a message with this id from or to `peer` is saved.
+    /// Whether a message with this id from or to `peer` is saved, or was
+    /// until its history was deleted.
     pub fn has_message(&self, peer: &Code, id: &str) -> Result<bool, StoreError> {
         let found = self
             .db
             .query_row(
-                "SELECT 1 FROM messages WHERE peer = ?1 AND msg = ?2",
+                "SELECT 1 FROM messages WHERE peer = ?1 AND msg = ?2
+                 UNION ALL SELECT 1 FROM forgotten WHERE peer = ?1 AND msg = ?2 LIMIT 1",
                 params![self.peer_tag(peer), self.msg_tag(id)],
                 |_| Ok(()),
             )
@@ -135,9 +137,14 @@ impl Store {
         Ok(())
     }
 
-    /// Deletes every message between you and `peer`.
+    /// Deletes every message between you and `peer`, keeping only their ids'
+    /// tags (see [`Store::has_message`]). Call it inside a transaction.
     pub(super) fn delete_history(&self, peer: &Code) -> Result<(), StoreError> {
-        self.db.execute("DELETE FROM messages WHERE peer = ?1", [self.peer_tag(peer)])?;
+        let peer = self.peer_tag(peer);
+        self.db.execute("INSERT OR IGNORE INTO forgotten (peer, msg) SELECT peer, msg FROM messages WHERE peer = ?1", [
+            peer,
+        ])?;
+        self.db.execute("DELETE FROM messages WHERE peer = ?1", [peer])?;
         Ok(())
     }
 

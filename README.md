@@ -5,7 +5,7 @@ app to app, end-to-end encrypted, with no server holding their messages. Share
 your code with a friend, they add it, and you chat. Messages wait on your
 machine until you're both online.
 
-**Status:** `v0.1.0`, the first release.
+**Status:** `v0.1.1`.
 
 ## Install
 
@@ -80,6 +80,11 @@ A green dot next to a contact means they're online. Next to your own messages:
 | `·` | waiting: not delivered yet |
 | `✓` | delivered to their computer |
 | `✓✓` | read |
+
+The bar at the bottom shows your name and code, whether you're online, how
+the open chat's connection goes (**direct** between the two computers, or
+**via relay**, and how long a round trip takes), how many contacts are
+online, and how many of your messages are still waiting.
 
 ## Commands
 

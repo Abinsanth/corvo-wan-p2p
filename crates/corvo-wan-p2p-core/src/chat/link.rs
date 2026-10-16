@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use iroh::endpoint::{Connection, ConnectionError, RecvStream, SendStream};
 use tokio::sync::{mpsc, oneshot};
+use tracing::{debug, warn};
 
 use super::{Internal, OUT_QUEUE, close};
 use crate::identity::Code;
@@ -54,6 +55,7 @@ pub(super) async fn run(start: Start) {
             // An app on another protocol version may have turned us down
             // without a hello; it names its version as the close reason.
             let refused = if role == Role::Dialer { refused_version(&conn) } else { None };
+            debug!(peer = %peer.short(), ?role, "the hello exchange failed");
             conn.close(close::HANDSHAKE.into(), b"handshake failed");
             let failed = match refused {
                 Some(theirs) => Internal::VersionRefused { peer, id, theirs },
@@ -80,15 +82,29 @@ pub(super) async fn run(start: Start) {
         Err(_) => return, // the core turned it down and has closed it
     }
     tokio::spawn(write_loop(send, out_rx));
-    while let Ok(frame) = read_frame(&mut recv).await {
-        if matches!(frame, Frame::Hello { .. }) {
-            conn.close(close::BAD_HELLO.into(), b"unexpected hello");
-            break;
-        }
-        // Waits while the core is busy, so a peer sending faster than we can
-        // save just stops being read (and QUIC slows them down).
-        if internal.send(Internal::Frame { peer, frame }).await.is_err() {
-            break;
+    loop {
+        match read_frame(&mut recv).await {
+            Ok(Frame::Hello { .. }) => {
+                warn!(peer = %peer.short(), "a second hello; closing the link");
+                conn.close(close::BAD_HELLO.into(), b"unexpected hello");
+                break;
+            }
+            Ok(frame) => {
+                // Waits while the core is busy, so a peer sending faster than
+                // we can save just stops being read (and QUIC slows them down).
+                if internal.send(Internal::Frame { peer, frame }).await.is_err() {
+                    break;
+                }
+            }
+            Err(e @ (FrameError::TooBig(_) | FrameError::Invalid(_))) => {
+                warn!(peer = %peer.short(), error = %e, "a bad frame; closing the link");
+                conn.close(close::BAD_FRAME.into(), b"bad frame");
+                break;
+            }
+            Err(FrameError::Connection(e)) => {
+                debug!(peer = %peer.short(), error = %e, "the link ended");
+                break;
+            }
         }
     }
     // Closed by them as the losing half of a double dial, not because they left.

@@ -22,6 +22,7 @@ use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
+use tracing::{debug, info, warn};
 use zeroize::Zeroizing;
 
 use crate::VERSION;
@@ -51,8 +52,8 @@ pub(crate) const OUT_QUEUE: usize = 128;
 /// Frames and news from all connections waiting for the core.
 const INTERNAL_QUEUE: usize = 64;
 
-/// Why a connection was closed, as its QUIC close code. Only `DUPLICATE` means
-/// anything to the other app.
+/// Why a connection was closed, as its QUIC close code. `DUPLICATE` and
+/// `VERSION` mean something to the other app; the rest help reading logs.
 mod close {
     pub const BYE: u32 = 0;
     pub const HANDSHAKE: u32 = 1;
@@ -66,6 +67,8 @@ mod close {
     pub const FLOOD: u32 = 7;
     /// A guest that said nothing for too long.
     pub const IDLE: u32 = 8;
+    /// A frame too big or not one we know.
+    pub const BAD_FRAME: u32 = 9;
 }
 
 /// Timings and passphrase settings. [`Config::DEFAULT`] is what the app uses;
@@ -407,6 +410,7 @@ impl Link {
         match self.out.try_send(frame) {
             Ok(()) => true,
             Err(TrySendError::Full(_)) => {
+                warn!(link = self.id, "they aren't reading what we send; closing the link");
                 self.conn.close(close::FLOOD.into(), b"not reading");
                 false
             }
@@ -751,13 +755,19 @@ impl Core {
                 self.spawn_link(conn, Role::Acceptor, peer);
             }
             // Before any hello, so to them you look offline.
-            Some(Standing::Blocked) => conn.close(close::REFUSED.into(), b""),
+            Some(Standing::Blocked) => {
+                debug!(peer = %peer.short(), "refused: blocked");
+                conn.close(close::REFUSED.into(), b"")
+            }
             Some(Standing::Request) | None => match self.room_for_guest(standing.is_none()) {
                 Ok(true) => {
                     let id = self.spawn_link(conn, Role::Acceptor, peer);
                     self.guests.insert(id);
                 }
-                Ok(false) => conn.close(close::REFUSED.into(), b""),
+                Ok(false) => {
+                    info!(peer = %peer.short(), "refused a stranger: no room for more");
+                    conn.close(close::REFUSED.into(), b"")
+                }
                 Err(e) => {
                     conn.close(close::ERROR.into(), b"error");
                     self.problem(e);
@@ -868,6 +878,7 @@ impl Core {
             self.quiet.remove(&peer)
         };
         let _ = verdict.send(Verdict::Accept);
+        debug!(peer = %peer.short(), ?role, contact, "link up");
         if !contact {
             self.guests.insert(link.id);
             self.links.insert(peer, link);
@@ -1008,6 +1019,7 @@ impl Core {
         }
         let Some(link) = self.links.remove(&peer) else { return };
         let lasted = link.opened.elapsed() >= self.config.stable_link;
+        debug!(peer = %peer.short(), lasted, "link closed");
         match self.store.is_contact(&peer) {
             Ok(true) => {}
             Ok(false) => return, // guests and requests are never dialed back
@@ -1031,7 +1043,9 @@ impl Core {
     /// so strangers who stay silent can't hold every guest slot.
     fn sweep_guests(&mut self) {
         let idle = self.config.guest_idle;
-        for link in self.links.values().filter(|l| self.guests.contains(&l.id) && l.heard.elapsed() >= idle) {
+        for (peer, link) in self.links.iter().filter(|(_, l)| self.guests.contains(&l.id) && l.heard.elapsed() >= idle)
+        {
+            debug!(peer = %peer.short(), "a guest said nothing for too long");
             link.conn.close(close::IDLE.into(), b"idle");
         }
     }
@@ -1039,6 +1053,7 @@ impl Core {
     /// A contact's app speaks protocol `theirs`: said once, and again only if it changes.
     fn mismatch(&mut self, peer: Code, theirs: u32) {
         if self.mismatched.insert(peer, theirs) != Some(theirs) {
+            warn!(peer = %peer.short(), theirs, ours = PROTO_VERSION, "another protocol version");
             self.emit(Event::VersionMismatch { peer, theirs });
         }
     }
@@ -1125,6 +1140,7 @@ impl Core {
     }
 
     fn problem(&self, error: impl std::fmt::Display) {
+        warn!(%error, "a problem");
         self.emit(Event::Problem(error.to_string()));
     }
 }

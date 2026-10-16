@@ -142,6 +142,11 @@ requests; accept them again.
   how many people you know, how many messages each conversation has and how
   long they are, which ones are still waiting to be sent, and when the files
   last changed.
+- **The log file**, `corvo-wan-p2p.log` in the same folder (readable only by
+  you), notes connection trouble: which code (its first 8 characters) and
+  what went wrong, never what was said or anyone's name. Warnings only; set
+  `CORVO_WAN_P2P_LOG=debug` for more while looking into a problem. Past 1 MB
+  it starts over, keeping one old file.
 - **The recovery file** holds your 12 words in plain text. Delete it once
   you've copied them. `/phrase copy` puts the words on your clipboard, where
   clipboard history apps may keep them.

@@ -348,3 +348,19 @@ async fn the_network_is_said_offline_only_after_a_moment_to_connect() {
     a.expect_none(Duration::from_millis(150), |e| matches!(e, Event::Network { .. })).await;
     a.expect(|e| *e == Event::Network { online: false }).await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_bad_frame_closes_the_link_with_its_own_code() {
+    let lookup = MemoryLookup::new();
+    let a = Peer::start(&lookup, "abin").await;
+    let fake = Fake::new(&lookup).await;
+    a.client.add_contact(fake.code).await.unwrap();
+    let conn = fake.connect(a.code).await.unwrap();
+    let (mut send, _recv, _) = fake.hello_on(&conn, PROTO_VERSION).await.unwrap();
+    let junk = b"{\"t\":\"selfdestruct\"}";
+    send.write_all(&(junk.len() as u32).to_be_bytes()).await.unwrap();
+    send.write_all(junk).await.unwrap();
+    let closed = tokio::time::timeout(Duration::from_secs(5), conn.closed()).await.expect("closed");
+    let iroh::endpoint::ConnectionError::ApplicationClosed(reason) = closed else { panic!("{closed:?}") };
+    assert_eq!(reason.error_code, iroh::endpoint::VarInt::from_u32(9), "BAD_FRAME, not a plain goodbye");
+}

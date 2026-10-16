@@ -608,6 +608,8 @@ dependencies = [
  "sha2 0.11.1",
  "tempfile",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
  "unicode-width",
  "zeroize",
 ]
@@ -633,6 +635,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
+ "tracing",
  "ulid",
  "unicode-normalization",
  "zeroize",

@@ -10,6 +10,7 @@ use self::ui::onboarding::Onboarding;
 use self::ui::runner::{Net, Runner};
 use self::ui::state::State;
 
+mod logging;
 mod selfupdate;
 mod ui;
 
@@ -28,6 +29,7 @@ fn main() -> anyhow::Result<()> {
     let runtime = tokio::runtime::Runtime::new()?;
     ui::install_panic_hook();
     let dir = data_dir().context("couldn't tell where your home folder is; set HOME (APPDATA on Windows)")?;
+    logging::start(&dir);
     let state = State::onboarding(Onboarding::start(Store::exists(&dir), args.recover));
     let runner = Runner::new(dir, home_dir(), Config::DEFAULT, Net::Internet, stdout());
     if let Some(why) = runtime.block_on(ui::run(state, runner))? {

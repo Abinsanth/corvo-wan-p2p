@@ -298,6 +298,9 @@ impl<W: Write> Runner<W> {
                 self.copy(words.expose()).map_err(|e| format!("couldn't copy them: {e}"))?;
                 Ok(PhraseDone::Copied)
             }
+            PhraseUse::Save { overwrite: false } if let Some(path) = self.recovery_file() => {
+                Ok(PhraseDone::Exists(path))
+            }
             PhraseUse::Save { overwrite } => self.write_recovery(&seed, overwrite).map(PhraseDone::Saved),
         }
     }
@@ -530,6 +533,26 @@ mod tests {
         assert_eq!(app.state.ask().unwrap().label, "replace it? y/n: ");
         app.send("y").await;
         assert!(app.said().last().unwrap().starts_with("your words are saved in"));
+        app.runner.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn phrase_save_checks_the_passphrase_before_asking_to_replace() {
+        let (data, home) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        let mut app = App::open(&data, &home, false);
+        app.make_account().await;
+        app.send("").await;
+        let file = recovery::path(home.path());
+        let before = std::fs::read_to_string(&file).unwrap();
+        app.send("/phrase save").await;
+        app.send("nope").await;
+        assert_eq!(app.state.ask(), None, "no question after a wrong passphrase");
+        assert_eq!(app.said().last().unwrap(), "wrong passphrase");
+        app.send("/phrase save").await;
+        app.send("pw").await;
+        assert_eq!(app.state.ask().unwrap().label, "replace it? y/n: ");
+        app.send("n").await;
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), before, "kept");
         app.runner.shutdown().await;
     }
 

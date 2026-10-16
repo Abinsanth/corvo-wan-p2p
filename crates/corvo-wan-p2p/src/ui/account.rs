@@ -27,6 +27,9 @@ pub enum PhraseUse {
 pub enum PhraseDone {
     Shown(Secret),
     Saved(PathBuf),
+    /// The passphrase was right, but the recovery file is there and wasn't
+    /// to be replaced; nothing was written.
+    Exists(PathBuf),
     Copied,
 }
 
@@ -41,7 +44,7 @@ pub enum Pending {
     Repeat { old: Secret, new: Secret },
     /// `/phrase`: your passphrase, then `PhraseUse`.
     Passphrase(PhraseUse),
-    /// `/phrase save`: finding out whether the recovery file is there.
+    /// `/phrase save`: checking the passphrase, then whether the recovery file is there.
     Checking { passphrase: Secret },
     /// `/phrase save`: it's there; replace it?
     Replace { passphrase: Secret },
@@ -57,7 +60,9 @@ impl Pending {
             Pending::Current => ("current passphrase: ", true),
             Pending::New { .. } => ("new passphrase: ", true),
             Pending::Repeat { .. } => ("again: ", true),
-            Pending::Passphrase(_) | Pending::Checking { .. } => ("your passphrase: ", true),
+            Pending::Passphrase(_) => ("your passphrase: ", true),
+            // Nothing is asked while it's checked.
+            Pending::Checking { .. } => ("", true),
             Pending::Replace { .. } => ("replace it? y/n: ", false),
             Pending::Remove { .. } => ("delete your history too? y/n: ", false),
             Pending::Update => ("update now? y/n: ", false),
@@ -113,8 +118,9 @@ pub fn answer(state: &mut State, text: Secret) -> Vec<Effect> {
             state.say(Tone::Bad, "type your passphrase, or Esc to cancel");
             Some(Pending::Passphrase(then))
         }
-        Pending::Passphrase(PhraseUse::Save { .. }) => {
-            effects.push(Effect::CheckRecovery);
+        // Kept for a "replace it?" if the file is there.
+        Pending::Passphrase(then @ PhraseUse::Save { .. }) => {
+            effects.push(Effect::Phrase { passphrase: text.clone(), then });
             Some(Pending::Checking { passphrase: text })
         }
         Pending::Passphrase(then) => {
@@ -179,6 +185,13 @@ pub fn cancel(state: &mut State) {
 /// What came of an effect these commands asked for.
 pub fn done(state: &mut State, outcome: Outcome) -> Vec<Effect> {
     let mut effects = Vec::new();
+    let checking = match state.pending.take() {
+        Some(Pending::Checking { passphrase }) if matches!(outcome, Outcome::Phrase(_)) => Some(passphrase),
+        other => {
+            state.pending = other;
+            None
+        }
+    };
     match outcome {
         Outcome::PassphraseChanged(Ok(())) => state.say(Tone::Good, "passphrase changed: use the new one from now on"),
         Outcome::PassphraseChanged(Err(why)) => state.say(Tone::Bad, format!("{why}; nothing changed")),
@@ -194,18 +207,13 @@ pub fn done(state: &mut State, outcome: Outcome) -> Vec<Effect> {
                 path.display()
             ),
         ),
-        Outcome::Phrase(Err(why)) => state.say(Tone::Bad, why),
-        Outcome::RecoveryFile(found) => {
-            if let Some(Pending::Checking { passphrase }) = state.pending.take() {
-                match found {
-                    Some(path) => {
-                        state.say(Tone::Plain, format!("there's already a recovery file at {}", path.display()));
-                        state.pending = Some(Pending::Replace { passphrase });
-                    }
-                    None => effects.push(Effect::Phrase { passphrase, then: PhraseUse::Save { overwrite: false } }),
-                }
+        Outcome::Phrase(Ok(PhraseDone::Exists(path))) => {
+            state.say(Tone::Plain, format!("there's already a recovery file at {}", path.display()));
+            if let Some(passphrase) = checking {
+                state.pending = Some(Pending::Replace { passphrase });
             }
         }
+        Outcome::Phrase(Err(why)) => state.say(Tone::Bad, why),
         Outcome::UpdateChecked { result: Ok(None), .. } => {
             state.say(Tone::Plain, format!("you're up to date ({})", selfupdate::current()))
         }
@@ -377,25 +385,29 @@ mod tests {
     fn phrase_save_writes_the_file_when_there_is_none() {
         let mut s = state();
         send(&mut s, "/phrase save");
-        assert_eq!(send(&mut s, "pw"), vec![Effect::CheckRecovery]);
-        let effects = done(&mut s, Outcome::RecoveryFile(None));
-        assert_eq!(
-            effects,
-            vec![Effect::Phrase { passphrase: secret("pw"), then: PhraseUse::Save { overwrite: false } }]
-        );
-        assert_eq!(s.ask(), None);
+        let save = |overwrite| Effect::Phrase { passphrase: secret("pw"), then: PhraseUse::Save { overwrite } };
+        assert_eq!(send(&mut s, "pw"), vec![save(false)]);
+        assert_eq!(label(&s), "", "nothing is asked while it's checked");
         done(&mut s, Outcome::Phrase(Ok(PhraseDone::Saved(PathBuf::from("/h/corvo-wan-p2p-recovery.txt")))));
+        assert_eq!(s.ask(), None);
         assert_eq!(last(&s).tone, Tone::Good);
         assert!(last(&s).text.contains("/h/corvo-wan-p2p-recovery.txt"));
     }
 
     #[test]
-    fn phrase_save_asks_before_replacing_the_file() {
+    fn phrase_save_checks_the_passphrase_before_asking_to_replace() {
         let mut s = state();
         let path = PathBuf::from("/h/corvo-wan-p2p-recovery.txt");
+        let save = |overwrite| Effect::Phrase { passphrase: secret("pw"), then: PhraseUse::Save { overwrite } };
+        send(&mut s, "/phrase save");
+        assert_eq!(send(&mut s, "pw"), vec![save(false)], "the passphrase is checked first");
+        done(&mut s, Outcome::Phrase(Err("wrong passphrase".into())));
+        assert_eq!(s.ask(), None, "a wrong passphrase never gets to the question");
+        assert_eq!(*last(&s), Line { text: "wrong passphrase".into(), tone: Tone::Bad });
+
         send(&mut s, "/phrase save");
         send(&mut s, "pw");
-        assert!(done(&mut s, Outcome::RecoveryFile(Some(path.clone()))).is_empty());
+        assert!(done(&mut s, Outcome::Phrase(Ok(PhraseDone::Exists(path.clone())))).is_empty());
         assert_eq!(label(&s), "replace it? y/n: ");
         assert!(last(&s).text.contains("/h/corvo-wan-p2p-recovery.txt"));
         assert!(send(&mut s, "maybe").is_empty());
@@ -406,12 +418,8 @@ mod tests {
 
         send(&mut s, "/phrase save");
         send(&mut s, "pw");
-        done(&mut s, Outcome::RecoveryFile(Some(path)));
-        let effects = send(&mut s, "y");
-        assert_eq!(
-            effects,
-            vec![Effect::Phrase { passphrase: secret("pw"), then: PhraseUse::Save { overwrite: true } }]
-        );
+        done(&mut s, Outcome::Phrase(Ok(PhraseDone::Exists(path))));
+        assert_eq!(send(&mut s, "y"), vec![save(true)]);
     }
 
     #[test]

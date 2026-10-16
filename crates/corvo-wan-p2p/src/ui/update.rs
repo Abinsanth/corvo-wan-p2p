@@ -4,7 +4,7 @@
 
 use std::path::PathBuf;
 
-use corvo_wan_p2p_core::chat::Event;
+use corvo_wan_p2p_core::chat::{Event, PathInfo};
 use corvo_wan_p2p_core::identity::{Code, Seed};
 use corvo_wan_p2p_core::store::{Person, StoreError, StoredMessage};
 use ratatui::crossterm::event::{
@@ -18,7 +18,7 @@ use super::chat::{self, Loaded};
 use super::commands::{Cmd, Input, may_hold_a_secret, parse};
 use super::complete;
 use super::people::{self, Act, Show};
-use super::state::{Screen, Secret, State, Tone, WHEEL_STEP};
+use super::state::{PATH_TICKS, Screen, Secret, State, Tone, WHEEL_STEP};
 use super::view::{areas, chat_page, input_rows, popup_area, sidebar_rows, sidebar_scrolled, sidebar_showing, tab_at};
 use super::window::{self, Overlay};
 
@@ -82,6 +82,8 @@ pub enum Effect {
     },
     /// You've seen everything they sent.
     MarkRead(Code),
+    /// How the connection to them goes now, for the status bar.
+    AskPath(Code),
     /// Read the `n` messages with `peer` from before the one with id `before`.
     LoadOlder {
         peer: Code,
@@ -150,6 +152,11 @@ pub enum Outcome {
         to: Code,
         text: String,
         result: Result<StoredMessage, String>,
+    },
+    /// How the connection to `peer` went, if there was one.
+    Path {
+        peer: Code,
+        info: Option<PathInfo>,
     },
     /// Something went wrong that the user should hear about.
     Failed(String),
@@ -312,6 +319,13 @@ pub fn update(state: &mut State, msg: Msg) -> Vec<Effect> {
         }
         Msg::Focus(focused) => state.focused = focused,
         Msg::Tick => {
+            state.ticks = state.ticks.wrapping_add(1);
+            if state.ticks % PATH_TICKS == 0
+                && matches!(state.screen, Screen::Main)
+                && let Some(peer) = state.open_peer()
+            {
+                effects.push(Effect::AskPath(peer));
+            }
             if let Some(flash) = &mut state.flash {
                 flash.ticks_left = flash.ticks_left.saturating_sub(1);
                 if flash.ticks_left == 0 {
@@ -560,6 +574,7 @@ fn on_done(state: &mut State, outcome: Outcome, effects: &mut Vec<Effect>) {
             }
         }
         Outcome::Fatal(why) => effects.push(Effect::Exit(why)),
+        Outcome::Path { peer, info } => state.path = info.map(|info| (peer, info)),
         Outcome::Failed(why) => state.say(Tone::Bad, why),
         Outcome::Loaded(result) => chat::loaded(state, result),
         Outcome::LoadedOlder { peer, result } => chat::loaded_older(state, peer, result),
@@ -584,6 +599,21 @@ mod tests {
     use crate::ui::state::{APP, FLASH_TICKS, Line, Tab};
     use corvo_wan_p2p_core::identity::Seed;
     use ratatui::crossterm::event::KeyEventState;
+
+    #[test]
+    fn the_open_chats_path_is_asked_every_two_seconds() {
+        let mut s = state();
+        let asked = |s: &mut State| {
+            (0..8).flat_map(|_| update(s, Msg::Tick)).filter(|e| matches!(e, Effect::AskPath(_))).collect::<Vec<_>>()
+        };
+        assert!(asked(&mut s).is_empty(), "nothing on the corvo tab");
+        s.select_tab(1);
+        let rahul = s.tabs[1].peer.unwrap();
+        assert_eq!(asked(&mut s), [Effect::AskPath(rahul)]);
+        let info = Some(PathInfo { direct: true, rtt: std::time::Duration::from_millis(5) });
+        update(&mut s, Msg::Done(Outcome::Path { peer: rahul, info }));
+        assert_eq!(s.path, info.map(|i| (rahul, i)));
+    }
 
     fn state() -> State {
         let mut state = State::new("ana".into(), "abcdefgh".into());

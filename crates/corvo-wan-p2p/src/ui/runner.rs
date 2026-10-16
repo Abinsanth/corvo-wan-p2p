@@ -183,6 +183,11 @@ impl<W: Write> Runner<W> {
                     Err(e) => Err(e),
                 },
             },
+            // Quietly: it's asked every couple of seconds.
+            Effect::AskPath(peer) => match self.client() {
+                Ok(client) => Outcome::Path { peer, info: client.path(peer).await.ok().flatten() },
+                Err(_) => return Ok(Flow::Next(None)),
+            },
             Effect::MarkRead(peer) => match self.client() {
                 Ok(client) => match client.mark_read(peer).await {
                     Ok(()) => return Ok(Flow::Next(None)),

@@ -726,17 +726,52 @@ fn draw_input(frame: &mut Frame, state: &State, area: Rect) {
     frame.render_widget(Paragraph::new(lines), area);
 }
 
+/// Your name, code and network, then as much as fits of: how the open chat's
+/// connection goes, how many contacts are online, and what's waiting to go.
 fn draw_status(frame: &mut Frame, state: &State, area: Rect) {
     let (word, color) = match state.online {
         None => ("connecting", Color::Yellow),
         Some(true) => ("online", Color::Green),
         Some(false) => ("offline", Color::Red),
     };
-    let line = TextLine::from(vec![
-        Span::raw(format!(" {} · {} · ", one_line(&state.name), state.short_code)),
-        Span::styled(word, Style::new().fg(color)),
-    ]);
+    let lead = format!(" {} · {} · ", one_line(&state.name), state.short_code);
+    let network = format!("● {word}");
+    let mut used = lead.width() + network.width();
+    let mut spans = vec![Span::raw(lead), Span::styled(network, Style::new().fg(color))];
+    for part in status_parts(state) {
+        let part = format!(" · {part}");
+        if used + part.width() > usize::from(area.width) {
+            break;
+        }
+        used += part.width();
+        spans.push(Span::raw(part));
+    }
+    let line = TextLine::from(spans);
     frame.render_widget(Paragraph::new(line).style(Style::new().add_modifier(Modifier::REVERSED)), area);
+}
+
+/// The status bar's parts after the network, most useful first.
+fn status_parts(state: &State) -> Vec<String> {
+    let mut parts = Vec::new();
+    if let Some(peer) = state.open_peer()
+        && let Some((of, info)) = state.path
+        && of == peer
+        && state.connected.contains(&peer)
+    {
+        let how = if info.direct { "direct" } else { "via relay" };
+        parts.push(format!("{}: {how}, {} ms", one_line(&state.label(&peer)), info.rtt.as_millis()));
+    }
+    let contacts: Vec<&Code> =
+        state.known.iter().filter(|p| p.standing == Standing::Contact).map(|p| &p.code).collect();
+    if !contacts.is_empty() {
+        let online = contacts.iter().filter(|c| state.connected.contains(c)).count();
+        parts.push(format!("{online} of {} online", contacts.len()));
+    }
+    let waiting = state.chats.values().flat_map(|c| &c.messages).filter(|m| m.mark == Mark::Waiting).count();
+    if waiting > 0 {
+        parts.push(format!("{waiting} waiting"));
+    }
+    parts
 }
 
 #[cfg(test)]
@@ -745,12 +780,14 @@ mod tests {
     use crate::ui::onboarding::Onboarding;
     use crate::ui::state::{Screen, Secret};
     use crate::ui::update::{Msg, update};
+    use corvo_wan_p2p_core::chat::PathInfo;
     use corvo_wan_p2p_core::identity::Seed;
     use corvo_wan_p2p_core::store::{Person, StoredMessage};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::buffer::Buffer;
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use std::time::Duration;
 
     #[test]
     fn clean_removes_escapes_controls_and_direction_marks() {
@@ -891,6 +928,56 @@ mod tests {
         state
     }
 
+    fn status(state: &State, w: u16) -> String {
+        let buf = render(state, w, 30);
+        row(&buf, 29).trim_end().to_string()
+    }
+
+    #[test]
+    fn the_status_bar_shows_the_open_chats_path() {
+        let mut state = busy_state();
+        state.online = Some(true);
+        let rahul = rahul(&state);
+        state.open_chat(rahul, true);
+        state.path = Some((rahul, PathInfo { direct: true, rtt: Duration::from_millis(24) }));
+        assert_eq!(status(&state, 120), " ana · abcdefgh · ● online · rahul: direct, 24 ms · 1 of 2 online");
+        state.path = Some((rahul, PathInfo { direct: false, rtt: Duration::from_micros(180_400) }));
+        assert!(status(&state, 120).contains("rahul: via relay, 180 ms"));
+        state.path = Some((Seed::generate().code(), PathInfo { direct: true, rtt: Duration::ZERO }));
+        assert!(!status(&state, 120).contains("direct"), "another chat's path isn't shown");
+        state.path = Some((rahul, PathInfo { direct: true, rtt: Duration::ZERO }));
+        state.connected.clear();
+        assert!(!status(&state, 120).contains("direct"), "not while they're offline");
+    }
+
+    #[test]
+    fn the_status_bar_counts_contacts_online_and_messages_waiting() {
+        let mut state = busy_state();
+        assert!(status(&state, 120).ends_with("1 of 2 online"), "{}", status(&state, 120));
+        let rahul = rahul(&state);
+        let chat = state.chats.get_mut(&rahul).unwrap();
+        for i in 0..3 {
+            chat.messages.push(StoredMessage { mark: Mark::Waiting, ..received(100 + i, "out") });
+        }
+        assert!(status(&state, 120).ends_with("1 of 2 online · 3 waiting"), "{}", status(&state, 120));
+    }
+
+    #[test]
+    fn a_narrow_status_bar_drops_the_newest_parts_first() {
+        let mut state = busy_state();
+        let rahul = rahul(&state);
+        state.open_chat(rahul, true);
+        state.path = Some((rahul, PathInfo { direct: true, rtt: Duration::from_millis(24) }));
+        state.chats.get_mut(&rahul).unwrap().messages.push(StoredMessage { mark: Mark::Waiting, ..received(99, "x") });
+        let wide = status(&state, 120);
+        assert!(wide.contains("waiting"));
+        let at_80 = status(&state, 80);
+        assert!(at_80.chars().count() <= 80 && at_80.contains("1 of 2 online"), "{at_80}");
+        let at_40 = status(&state, 40);
+        assert!(at_40.starts_with(" ana · abcdefgh · ● connecting"), "{at_40}");
+        assert!(!at_40.contains("waiting") && !at_40.contains("direct"), "{at_40}");
+    }
+
     fn rahul(state: &State) -> Code {
         state.tabs[1].peer.unwrap()
     }
@@ -911,7 +998,7 @@ mod tests {
         assert!(row(&buf, 20).starts_with("something went wrong"), "the flash");
         assert!(row(&buf, 21).starts_with("────"));
         assert!(row(&buf, 22).starts_with("> hello"));
-        assert!(row(&buf, 23).starts_with(" ana · abcdefgh · online"));
+        assert!(row(&buf, 23).starts_with(" ana · abcdefgh · ● online"));
     }
 
     #[test]

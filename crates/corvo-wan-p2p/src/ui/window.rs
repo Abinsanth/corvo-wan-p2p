@@ -127,22 +127,32 @@ fn last(size: (u16, u16), total: usize) -> u16 {
     u16::try_from(total).unwrap_or(u16::MAX).saturating_sub(height(size, total))
 }
 
+/// Whether the window has rows below what it shows at `size`.
+pub fn more_below(overlay: &Overlay, size: (u16, u16)) -> bool {
+    scroll(overlay, size) < last(size, rows(overlay, size).len())
+}
+
 /// A key while a window is open: Enter or Esc closes it, the arrows and
 /// PgUp/PgDn scroll it, and anything else does nothing.
 pub fn key(state: &mut State, key: KeyEvent) {
     let Some(overlay) = state.overlay else { return };
-    let total = rows(&overlay, state.size).len();
-    let page = height(state.size, total);
-    let last = last(state.size, total);
-    let scroll = scroll(&overlay, state.size);
-    state.overlay = match key.code {
-        KeyCode::Enter | KeyCode::Esc => None,
-        KeyCode::Up => Some(overlay.scrolled_to(scroll.saturating_sub(1))),
-        KeyCode::Down => Some(overlay.scrolled_to(scroll.saturating_add(1).min(last))),
-        KeyCode::PageUp => Some(overlay.scrolled_to(scroll.saturating_sub(page))),
-        KeyCode::PageDown => Some(overlay.scrolled_to(scroll.saturating_add(page).min(last))),
-        _ => Some(overlay),
-    };
+    let page = height(state.size, rows(&overlay, state.size).len()) as isize;
+    match key.code {
+        KeyCode::Enter | KeyCode::Esc => state.overlay = None,
+        KeyCode::Up => scroll_by(state, -1),
+        KeyCode::Down => scroll_by(state, 1),
+        KeyCode::PageUp => scroll_by(state, -page),
+        KeyCode::PageDown => scroll_by(state, page),
+        _ => {}
+    }
+}
+
+/// Scrolls the open window by `delta` rows, within its text.
+pub fn scroll_by(state: &mut State, delta: isize) {
+    let Some(overlay) = state.overlay else { return };
+    let last = last(state.size, rows(&overlay, state.size).len());
+    let to = (scroll(&overlay, state.size) as isize).saturating_add(delta).clamp(0, last as isize);
+    state.overlay = Some(overlay.scrolled_to(u16::try_from(to).unwrap_or(last)));
 }
 
 #[cfg(test)]
@@ -266,6 +276,23 @@ mod tests {
         let at = help.iter().position(|r| r.contains("/code")).expect("listed");
         let indent = help[at].find("show").expect("described");
         assert!(help[at + 1].starts_with(&" ".repeat(indent)), "{:?}", &help[at..at + 2]);
+    }
+
+    #[test]
+    fn the_wheel_scrolls_a_window_and_clicks_do_nothing() {
+        use crate::ui::state::WHEEL_STEP;
+        use ratatui::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let mouse = |kind| Msg::Mouse(MouseEvent { kind, column: 30, row: 10, modifiers: KeyModifiers::NONE });
+        let mut s = main_screen();
+        s.overlay = Some(Overlay::Help { scroll: 0 });
+        update(&mut s, mouse(MouseEventKind::ScrollDown));
+        assert_eq!(s.overlay, Some(Overlay::Help { scroll: WHEEL_STEP as u16 }));
+        update(&mut s, mouse(MouseEventKind::ScrollUp));
+        assert_eq!(s.overlay, Some(Overlay::Help { scroll: 0 }));
+        let tab = s.current;
+        update(&mut s, mouse(MouseEventKind::Down(MouseButton::Left)));
+        assert_eq!(s.overlay, Some(Overlay::Help { scroll: 0 }));
+        assert_eq!(s.current, tab);
     }
 
     #[test]

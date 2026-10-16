@@ -271,7 +271,12 @@ pub fn update(state: &mut State, msg: Msg) -> Vec<Effect> {
             _ if key.kind != KeyEventKind::Release => window::key(state, key),
             _ => {}
         },
-        Msg::Paste(_) | Msg::Mouse(_) if state.overlay.is_some() => {}
+        Msg::Mouse(mouse) if state.overlay.is_some() => match mouse.kind {
+            MouseEventKind::ScrollUp => window::scroll_by(state, -(WHEEL_STEP as isize)),
+            MouseEventKind::ScrollDown => window::scroll_by(state, WHEEL_STEP as isize),
+            _ => {}
+        },
+        Msg::Paste(_) if state.overlay.is_some() => {}
         Msg::Key(key) => {
             if state.ask().is_some() {
                 state.editor.make_room_for_answer();

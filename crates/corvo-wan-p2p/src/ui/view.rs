@@ -348,6 +348,9 @@ fn draw_overlay(frame: &mut Frame, overlay: &Overlay, area: Rect) {
     if let Some(hint) = overlay.hint() {
         block = block.title(TextLine::from(hint).right_aligned());
     }
+    if window::more_below(overlay, (area.width, area.height)) {
+        block = block.title_bottom(TextLine::from(" ↓ more ─").right_aligned());
+    }
     frame.render_widget(Clear, at);
     frame.render_widget(
         Paragraph::new(lines).block(block).scroll((window::scroll(overlay, (area.width, area.height)), 0)),
@@ -824,6 +827,25 @@ mod tests {
         {
             assert!(screen.contains(part), "{part:?} missing:\n{screen}");
         }
+    }
+
+    #[test]
+    fn a_window_that_does_not_fit_says_there_is_more() {
+        let mut state = State::new("ana".into(), "abcdefgh".into());
+        state.size = (80, 24);
+        state.overlay = Some(Overlay::Help { scroll: 0 });
+        let screen = |state: &State| {
+            let buf = render(state, 80, 24);
+            (0..buf.area.height).map(|y| row(&buf, y)).collect::<Vec<_>>().join("\n")
+        };
+        let top = screen(&state);
+        assert!(top.contains("↓ more"), "{top}");
+        assert!(!top.contains("Marks"), "the end is out of sight on 80×24");
+        state.overlay = Some(Overlay::Help { scroll: u16::MAX });
+        let end = screen(&state);
+        assert!(end.contains("Marks") && !end.contains("↓ more"), "{end}");
+        state.overlay = Some(Overlay::Welcome { scroll: 0 });
+        assert!(!screen(&state).contains("↓ more"), "the welcome fits");
     }
 
     fn render(state: &State, w: u16, h: u16) -> Buffer {

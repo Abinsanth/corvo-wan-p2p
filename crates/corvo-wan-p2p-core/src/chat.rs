@@ -269,7 +269,7 @@ impl Client {
             next_link: 0,
             online: None,
             renames: HashMap::new(),
-            session: rand::random(),
+            run: Run { session: rand::random(), started: now_ms().max(1) as u64 },
             mismatched: HashMap::new(),
         };
         let task = tokio::spawn(core.run(commands_rx, internal_rx));
@@ -399,6 +399,21 @@ impl Client {
     }
 }
 
+/// One run of an app: random `session`, and when it `started` (Unix
+/// milliseconds). Zeros from apps that didn't send them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Run {
+    session: u64,
+    started: u64,
+}
+
+/// Whether a link from run `new` should replace the live one from run
+/// `existing`: only if it's another run, and not an older one. Runs from
+/// apps before 0.1.1 have no start time, so any other run replaces them.
+fn replaces(existing: Run, new: Run) -> bool {
+    existing.session != new.session && (existing.started == 0 || new.started == 0 || new.started >= existing.started)
+}
+
 struct Link {
     id: u64,
     out: mpsc::Sender<Frame>,
@@ -409,8 +424,8 @@ struct Link {
     in_flight: HashSet<String>,
     /// The name a guest's app sent, kept in case they become a request.
     heard_name: Option<String>,
-    /// Their app's run, from its hello (0 from apps before sessions).
-    session: u64,
+    /// Their app's run, from its hello.
+    run: Run,
     /// When the link came up, and when they last sent anything.
     opened: Instant,
     heard: Instant,
@@ -462,7 +477,7 @@ struct Core {
     /// person, not per connection, so reconnecting doesn't earn more.
     renames: HashMap<Code, usize>,
     /// This run of the app, sent in every hello.
-    session: u64,
+    run: Run,
     /// Contacts on another protocol version, and theirs, as last reported:
     /// each is said once, not on every attempt.
     mismatched: HashMap<Code, u32>,
@@ -719,7 +734,7 @@ impl Core {
                     initiator: peer,
                     in_flight: HashSet::new(),
                     heard_name: None,
-                    session: 0,
+                    run: Run { session: 0, started: 0 },
                     opened: now,
                     heard: now,
                 };
@@ -839,7 +854,12 @@ impl Core {
     }
 
     fn hello(&self) -> Frame {
-        Frame::Hello { proto: PROTO_VERSION, app_version: VERSION.into(), session: self.session }
+        Frame::Hello {
+            proto: PROTO_VERSION,
+            app_version: VERSION.into(),
+            session: self.run.session,
+            started: self.run.started,
+        }
     }
 
     /// A link has exchanged hellos. Decides whether to keep it; a link turned
@@ -864,7 +884,7 @@ impl Core {
         if standing == Some(Standing::Blocked) || (role == Role::Dialer && !contact) {
             return refuse(self, link, close::REFUSED);
         }
-        let Frame::Hello { proto, session, .. } = hello else {
+        let Frame::Hello { proto, session, started, .. } = hello else {
             refuse(self, link, close::BAD_HELLO);
             return self.back_off(peer, None);
         };
@@ -895,12 +915,16 @@ impl Core {
                 }
             }
         }
-        link.session = session;
+        link.run = Run { session, started };
         link.initiator = if role == Role::Dialer { self.me } else { peer };
         let was_online = if let Some(existing) = self.links.get(&peer) {
             // A link from another run of their app: the old one is dead (they
             // restarted without closing it), so the new one wins.
-            let restarted = existing.session != link.session;
+            let restarted = existing.run.session != link.run.session;
+            if restarted && !replaces(existing.run, link.run) {
+                // A late hello from an older run of their app: the newer link stays.
+                return refuse(self, link, close::DUPLICATE);
+            }
             // Both sides dialed at once. Both keep the connection opened by the
             // smaller key, so they agree; a newer connection from the same
             // side replaces a stale one.
@@ -1254,6 +1278,16 @@ fn change_passphrase(passphrase: &Passphrase, old: &str, new: &str, kdf: KdfPara
 mod tests {
     use super::*;
     use crate::identity::Seed;
+
+    #[test]
+    fn an_older_run_never_replaces_a_newer_one() {
+        let run = |session, started| Run { session, started };
+        assert!(!replaces(run(1, 200), run(2, 100)), "a late hello from an older run");
+        assert!(replaces(run(1, 100), run(2, 200)), "a restart");
+        assert!(replaces(run(1, 0), run(2, 100)), "the old link is from an app before 0.1.1");
+        assert!(replaces(run(1, 100), run(2, 0)), "the new link is from an app before 0.1.1");
+        assert!(!replaces(run(1, 100), run(1, 100)), "the same run: the both-dialed rule decides");
+    }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn the_network_watcher_ends_when_the_core_stops() {

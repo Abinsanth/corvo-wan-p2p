@@ -19,11 +19,16 @@ pub enum Frame {
     /// Sent first, by both sides. Names follow in a [`Frame::Name`].
     /// `session` is random for each run of the app, so a link from a restarted
     /// app can be told from a stale one. Apps before 0.1.0-rc.3 send none (0).
+    /// `started` is when this run began, in Unix milliseconds, so a late
+    /// hello from an older run can't replace a newer one. Apps before 0.1.1
+    /// send none (0).
     Hello {
         proto: u32,
         app_version: String,
         #[serde(default)]
         session: u64,
+        #[serde(default)]
+        started: u64,
     },
     /// A message. `id` is a ULID chosen by the sender; `sent_at` is Unix milliseconds.
     Msg { id: String, sent_at: i64, text: String },
@@ -95,7 +100,7 @@ mod tests {
 
     fn all_kinds() -> Vec<Frame> {
         vec![
-            Frame::Hello { proto: PROTO_VERSION, app_version: "0.1.0".into(), session: 7 },
+            Frame::Hello { proto: PROTO_VERSION, app_version: "0.1.0".into(), session: 7, started: 1_760_000_000_000 },
             Frame::Msg { id: "01J9ZQ4V6X3K8Y2M5N7P0R1S2T".into(), sent_at: 1_760_000_000_000, text: "hi 👋".into() },
             Frame::Ack { id: "01J9ZQ4V6X3K8Y2M5N7P0R1S2T".into() },
             Frame::Read { up_to: "01J9ZQ4V6X3K8Y2M5N7P0R1S2T".into() },
@@ -123,7 +128,20 @@ mod tests {
     fn a_hello_from_before_sessions_is_still_read() {
         // As 0.1.0-rc.2 sends it.
         let old = br#"{"t":"hello","proto":1,"app_version":"0.1.0-rc.2"}"#;
-        assert_eq!(decode(old).unwrap(), Frame::Hello { proto: 1, app_version: "0.1.0-rc.2".into(), session: 0 });
+        assert_eq!(
+            decode(old).unwrap(),
+            Frame::Hello { proto: 1, app_version: "0.1.0-rc.2".into(), session: 0, started: 0 }
+        );
+    }
+
+    #[test]
+    fn a_hello_without_started_reads_as_zero() {
+        // As 0.1.0 sends it.
+        let old = br#"{"t":"hello","proto":1,"app_version":"0.1.0","session":42}"#;
+        assert_eq!(
+            decode(old).unwrap(),
+            Frame::Hello { proto: 1, app_version: "0.1.0".into(), session: 42, started: 0 }
+        );
     }
 
     #[test]

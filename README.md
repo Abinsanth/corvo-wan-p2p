@@ -34,8 +34,8 @@ picks a release, like `v0.1.0`, pre-releases included; leave it out for the
 latest full release.
 
 Then open a new terminal and run `corvo-wan-p2p`. Inside the app, `/update`
-installs newer versions (a copy built from source updates with `git pull`
-and `cargo build` instead).
+installs newer versions, pre-releases only if you're on one (a copy built
+from source updates with `git pull` and `cargo build` instead).
 
 Or build from source with Rust ([rustup.rs](https://rustup.rs)):
 

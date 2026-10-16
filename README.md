@@ -121,7 +121,7 @@ computers at once, messages go to one or the other unpredictably.
 **New computer, or forgot your passphrase?** On a new computer, choose
 *recover* at the first start and type your 12 words. On a computer that
 already has the account, run `corvo-wan-p2p --recover`: after you type `yes`,
-it deletes the account on that computer and brings it back from your words.
+it deletes the account (and its log) on that computer and brings it back from your words.
 Either way you get the **same code**, but no contacts or history. Friends who write to you show up as
 requests; accept them again.
 

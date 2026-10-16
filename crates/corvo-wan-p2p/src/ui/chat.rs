@@ -1,6 +1,8 @@
 //! Chatting: what the engine says (messages, marks, people coming and going,
 //! the network), sending, and unread counts.
 
+use std::collections::HashSet;
+
 use chrono::{DateTime, Local};
 use corvo_wan_p2p_core::chat::Event;
 use corvo_wan_p2p_core::identity::Code;
@@ -53,9 +55,10 @@ pub fn on_event(state: &mut State, event: Event) {
             );
         }
         Event::Received { from, id, sent_at, text } => {
-            // Only `Request` brings someone new. Someone unknown here was just
-            // removed or blocked, and this was sent before that took effect.
-            if state.standing(&from).is_none() {
+            // Only `Request` brings someone new. Someone unknown or blocked here
+            // was just removed or blocked, and this was sent before that took
+            // effect; the store keeps it in case you unblock them.
+            if !matches!(state.standing(&from), Some(Standing::Contact | Standing::Request)) {
                 return;
             }
             let chat = state.chats.entry(from).or_default();
@@ -191,8 +194,14 @@ pub fn loaded_older(state: &mut State, peer: Code, result: Result<(Vec<StoredMes
             return state.say(Tone::Bad, format!("couldn't read older messages: {why}"));
         }
     };
-    chat.older = !page.is_empty() && page.len() + unreadable >= OLDER_PAGE;
+    let full = page.len() + unreadable >= OLDER_PAGE;
+    // Trimming goes by position and paging by id, so a page can overlap
+    // what's kept: each message goes in once.
+    let have: HashSet<&str> = chat.messages.iter().map(|m| m.id.as_str()).collect();
+    let page: Vec<StoredMessage> = page.into_iter().filter(|m| !have.contains(m.id.as_str())).collect();
     let added = page.len();
+    // A page with nothing new would be asked for again at once, forever.
+    chat.older = added > 0 && full;
     let open = state.open_peer() == Some(peer);
     let before = if open { chat_page(state).0 } else { 0 };
     let chat = state.chats.get_mut(&peer).expect("checked above");
@@ -339,6 +348,18 @@ mod tests {
 
     fn marks(state: &State, who: Code) -> Vec<Mark> {
         state.chats[&who].messages.iter().map(|m| m.mark).collect()
+    }
+
+    #[test]
+    fn a_message_from_someone_just_blocked_is_not_shown() {
+        let (mut s, rahul, _) = state();
+        update(&mut s, received(rahul, "m1"));
+        s.set_people(vec![Person { code: rahul, ..person("rahul", Standing::Blocked) }]);
+        let (unread, tabs) = (s.chats[&rahul].unread, s.tabs.len());
+        update(&mut s, received(rahul, "m2"));
+        assert_eq!(s.chats[&rahul].messages.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), ["m1"]);
+        assert_eq!(s.chats[&rahul].unread, unread);
+        assert_eq!(s.tabs.len(), tabs);
     }
 
     fn last_corvo(state: &State) -> String {
@@ -645,6 +666,42 @@ mod tests {
         key(&mut s, KeyCode::Esc, KeyModifiers::NONE);
         assert_eq!(ids(&s).len(), CHAT_LEN, "back at the end, the oldest go again");
         assert_eq!(ids(&s).last().unwrap(), "n9");
+    }
+
+    #[test]
+    fn an_older_page_that_overlaps_adds_each_message_once() {
+        let (mut s, rahul, _) = state();
+        let people = s.known.clone();
+        let messages: Vec<_> = (10..=20).map(|i| message(&format!("m{i:04}"), "x", Mark::Read)).collect();
+        let chats = vec![History { code: rahul, messages, read_upto: None, unreadable: 0 }];
+        update(&mut s, Msg::Done(Outcome::Loaded(Ok(Loaded { people, chats, unreadable_people: 0 }))));
+        let page: Vec<_> = (5..=12).map(|i| message(&format!("m{i:04}"), "x", Mark::Read)).collect();
+        update(&mut s, Msg::Done(Outcome::LoadedOlder { peer: rahul, result: Ok((page, 0)) }));
+        let ids: Vec<String> = s.chats[&rahul].messages.iter().map(|m| m.id.clone()).collect();
+        let expected: Vec<String> = (5..=20).map(|i| format!("m{i:04}")).collect();
+        assert_eq!(ids, expected);
+    }
+
+    #[test]
+    fn an_older_page_with_nothing_new_is_not_asked_for_again() {
+        let (mut s, rahul, _) = state();
+        s.size = (80, 24);
+        let people = s.known.clone();
+        let messages: Vec<_> = (0..CHAT_LEN).map(|i| message(&format!("m{i:04}"), "x", Mark::Read)).collect();
+        let chats = vec![History { code: rahul, messages: messages.clone(), read_upto: None, unreadable: 0 }];
+        update(&mut s, Msg::Done(Outcome::Loaded(Ok(Loaded { people, chats, unreadable_people: 0 }))));
+        s.open_chat(rahul, true);
+        let asks = |effects: &[Effect]| effects.iter().any(|e| matches!(e, Effect::LoadOlder { .. }));
+        let mut asked = false;
+        for _ in 0..CHAT_LEN {
+            asked |= asks(&key(&mut s, KeyCode::PageUp, KeyModifiers::NONE));
+        }
+        assert!(asked);
+        // A full page, every message of it already shown.
+        let page: Vec<_> = messages.iter().cycle().take(OLDER_PAGE).cloned().collect();
+        let effects = update(&mut s, Msg::Done(Outcome::LoadedOlder { peer: rahul, result: Ok((page, 0)) }));
+        assert!(!asks(&effects), "the same page again, forever");
+        assert!(!asks(&key(&mut s, KeyCode::PageUp, KeyModifiers::NONE)));
     }
 
     #[test]

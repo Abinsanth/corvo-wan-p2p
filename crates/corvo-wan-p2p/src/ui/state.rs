@@ -566,10 +566,23 @@ impl State {
         self.known.iter().find(|p| p.code == *code).map(|p| p.standing)
     }
 
-    /// Replaces everyone known, then relabels.
+    /// Replaces everyone known, then relabels, and says who's called
+    /// something new: whichever brings a rename first, a refresh or the
+    /// engine's event, says it.
     pub fn set_people(&mut self, people: Vec<Person>) {
+        let renamed: Vec<(String, Code)> = people
+            .iter()
+            .filter(|p| self.known.iter().any(|k| k.code == p.code && k.name != p.name))
+            .map(|p| (self.label(&p.code), p.code))
+            .collect();
         self.known = people;
         self.relabel();
+        for (before, code) in renamed {
+            let after = self.label(&code);
+            if after != before {
+                self.say(Tone::Plain, format!("{before} is now called {after}"));
+            }
+        }
     }
 
     /// Recomputes the labels after a change to `known`, and with them the

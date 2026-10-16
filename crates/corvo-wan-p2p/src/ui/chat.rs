@@ -58,7 +58,11 @@ pub fn on_event(state: &mut State, event: Event) {
             );
         }
         Event::Received { from, id, sent_at, text } => {
-            know(state, from, "");
+            // Only `Request` brings someone new. Someone unknown here was just
+            // removed or blocked, and this was sent before that took effect.
+            if state.standing(&from).is_none() {
+                return;
+            }
             let chat = state.chats.entry(from).or_default();
             // Already read from the store at start (it arrived while loading).
             if chat.messages.iter().any(|m| m.id == id) {
@@ -87,15 +91,12 @@ pub fn on_event(state: &mut State, event: Event) {
                 }
             }
         }
+        // `set_people` says so, unless a refresh already did.
         Event::Name { of, name } => {
-            let before = state.label(&of);
-            if let Some(person) = state.known.iter_mut().find(|p| p.code == of) {
+            let mut people = state.known.clone();
+            if let Some(person) = people.iter_mut().find(|p| p.code == of) {
                 person.name = name;
-                state.relabel();
-                let after = state.label(&of);
-                if after != before {
-                    state.say(Tone::Plain, format!("{before} is now called {after}"));
-                }
+                state.set_people(people);
             }
         }
         Event::VersionMismatch { peer, theirs } => {
@@ -479,6 +480,35 @@ mod tests {
         update(&mut s, Msg::Core(Event::VersionMismatch { peer: rahul, theirs: 2 }));
         assert!(last_corvo(&s).contains("rahul k"));
         assert!(last_corvo(&s).contains("/update"));
+    }
+
+    #[test]
+    fn a_message_queued_behind_a_removal_does_not_bring_them_back() {
+        let (mut s, rahul, _) = state();
+        send_line(&mut s, "/remove rahul");
+        send_line(&mut s, "n");
+        let people: Vec<Person> = s.known.iter().filter(|p| p.code != rahul).cloned().collect();
+        let act = crate::ui::people::Act::Remove { history: false };
+        update(&mut s, Msg::Done(Outcome::Acted { code: rahul, act, result: Ok(()), people: Some(people) }));
+        // Sent by the engine before it removed them, handled after.
+        update(&mut s, received(rahul, "late"));
+        assert_eq!(s.standing(&rahul), None, "not back as a request");
+        assert!(!s.people.iter().any(|p| p.code == rahul));
+        assert!(!s.tabs.iter().any(|t| t.peer == Some(rahul)));
+        assert!(s.chats.get(&rahul).is_none_or(|c| c.unread == 0 && c.messages.iter().all(|m| m.id != "late")));
+    }
+
+    #[test]
+    fn a_rename_first_seen_in_a_refresh_is_still_said() {
+        let (mut s, rahul, _) = state();
+        let mut people = s.known.clone();
+        people.iter_mut().find(|p| p.code == rahul).unwrap().name = "rahul k".into();
+        let show = crate::ui::people::Show::Contacts;
+        update(&mut s, Msg::Done(Outcome::Refreshed { show, result: Ok(people) }));
+        update(&mut s, Msg::Core(Event::Name { of: rahul, name: "rahul k".into() }));
+        let said: Vec<String> = s.tabs[0].lines.iter().map(|l| l.text.clone()).collect();
+        let renames = said.iter().filter(|l| *l == "rahul is now called rahul k").count();
+        assert_eq!(renames, 1, "said once, whichever came first: {said:#?}");
     }
 
     #[test]

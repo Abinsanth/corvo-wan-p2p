@@ -63,8 +63,8 @@ pub fn current() -> Version {
     Version::parse(env!("CARGO_PKG_VERSION")).expect("the crate version is a semver version")
 }
 
-/// Published releases with a version tag, newest first. Pre-releases count:
-/// the people using this are on them.
+/// Published releases with a version tag, newest first, pre-releases
+/// included (see `newest_above` for who is offered them).
 pub fn parse_releases(json: &str) -> Result<Vec<Release>, String> {
     let api: Vec<ApiRelease> = serde_json::from_str(json).map_err(|_| "unexpected reply from GitHub".to_string())?;
     let mut releases: Vec<Release> = api
@@ -80,10 +80,13 @@ pub fn parse_releases(json: &str) -> Result<Vec<Release>, String> {
 }
 
 /// The newest of `releases` above `current` that has `asset`, this system's build.
+/// Pre-releases are offered only to someone already on one.
 pub fn newest_above(current: &Version, releases: Vec<Release>, asset: &str) -> Option<Release> {
+    let testing = !current.pre.is_empty();
     releases
         .into_iter()
-        .filter(|r| r.version > *current && r.assets.iter().any(|a| a.name == asset))
+        .filter(|r| r.version > *current && (testing || r.version.pre.is_empty()))
+        .filter(|r| r.assets.iter().any(|a| a.name == asset))
         .max_by(|a, b| a.version.cmp(&b.version))
 }
 
@@ -493,6 +496,18 @@ mod tests {
         assert_eq!(newest_above(&v("0.1.0-rc.1"), releases.clone(), mac).map(|r| r.version), Some(v("0.1.0-rc.2")));
         assert_eq!(newest_above(&v("0.1.0-rc.2"), releases.clone(), mac), None);
         assert_eq!(newest_above(&v("0.1.0"), releases, mac), None, "a full release is newer than its candidates");
+    }
+
+    #[test]
+    fn pre_releases_are_offered_only_to_a_pre_release() {
+        let json = r#"[
+            {"tag_name": "v0.2.0-rc.1", "prerelease": true, "assets": [{"name": "mac.tar.gz", "size": 1}]},
+            {"tag_name": "v0.1.1", "assets": [{"name": "mac.tar.gz", "size": 1}]}
+        ]"#;
+        let releases = parse_releases(json).unwrap();
+        assert_eq!(newest_above(&v("0.1.0"), releases.clone(), "mac.tar.gz").map(|r| r.version), Some(v("0.1.1")));
+        assert_eq!(newest_above(&v("0.1.1"), releases.clone(), "mac.tar.gz"), None);
+        assert_eq!(newest_above(&v("0.1.0-rc.3"), releases, "mac.tar.gz").map(|r| r.version), Some(v("0.2.0-rc.1")));
     }
 
     #[test]

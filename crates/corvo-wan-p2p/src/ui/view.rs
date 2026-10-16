@@ -467,13 +467,77 @@ fn sidebar(state: &State) -> Vec<(TextLine<'static>, Option<Code>)> {
     lines
 }
 
-/// Who each sidebar row opens, top to bottom, for clicks.
+/// The first sidebar row shown when it's scrolled to `top`, kept in range.
+fn sidebar_first(total: usize, height: usize, top: usize) -> usize {
+    top.min(total.saturating_sub(height))
+}
+
+/// Whether row `i` of `total` is drawn in `height` rows from `first`: the
+/// top and bottom rows give way to "↑ N more" and "↓ N more" when there is.
+fn sidebar_shows(i: usize, total: usize, height: usize, first: usize) -> bool {
+    let above = first > 0;
+    let below = first + height < total;
+    i >= first + usize::from(above) && i + usize::from(below) < first + height
+}
+
+/// The sidebar's rows from the top it's scrolled to, as drawn in `height`
+/// rows, each with the person a click on it opens.
+fn sidebar_page(state: &State, height: usize) -> Vec<(TextLine<'static>, Option<Code>)> {
+    let lines = sidebar(state);
+    let total = lines.len();
+    let first = sidebar_first(total, height, state.sidebar_top);
+    let more = |hidden: &[(TextLine<'static>, Option<Code>)], arrow: &str| {
+        let people: Vec<Code> = hidden.iter().filter_map(|(_, code)| *code).collect();
+        let requests = people.iter().filter(|c| state.people.iter().any(|p| p.code == **c && p.request)).count();
+        // Too narrow to say more: hidden requests make it stand out instead.
+        let style = if requests > 0 { tone(Tone::Warn) } else { dim() };
+        (TextLine::styled(format!("{arrow} {} more", people.len()), style), None)
+    };
+    let mut page = Vec::new();
+    for (i, line) in lines.iter().enumerate().skip(first).take(height) {
+        if sidebar_shows(i, total, height, first) {
+            page.push(line.clone());
+        } else if i == first {
+            page.push(more(&lines[..=first], "↑"));
+        } else {
+            page.push(more(&lines[i..], "↓"));
+        }
+    }
+    page
+}
+
+/// Rows in the sidebar: (all of them, how many fit).
+fn sidebar_size(state: &State) -> (usize, usize) {
+    let height = areas(state.size, input_rows(state)).map_or(0, |a| usize::from(a.sidebar.height));
+    (sidebar(state).len(), height)
+}
+
+/// Where the sidebar is scrolled after the wheel moves it by `delta` rows.
+pub fn sidebar_scrolled(state: &State, delta: isize) -> usize {
+    let (total, height) = sidebar_size(state);
+    let first = sidebar_first(total, height, state.sidebar_top) as isize;
+    sidebar_first(total, height, (first + delta).max(0) as usize)
+}
+
+/// Where the sidebar is scrolled so `code`'s row is in view; where it is if it already is.
+pub fn sidebar_showing(state: &State, code: Code) -> usize {
+    let (total, height) = sidebar_size(state);
+    let mut first = sidebar_first(total, height, state.sidebar_top);
+    let Some(i) = sidebar(state).iter().position(|(_, c)| *c == Some(code)) else { return first };
+    while height > 2 && !sidebar_shows(i, total, height, first) {
+        if i < first + 1 { first -= 1 } else { first += 1 }
+    }
+    first
+}
+
+/// Who each sidebar row on screen opens, top to bottom, for clicks.
 pub fn sidebar_rows(state: &State) -> Vec<Option<Code>> {
-    sidebar(state).into_iter().map(|(_, code)| code).collect()
+    let (_, height) = sidebar_size(state);
+    sidebar_page(state, height).into_iter().map(|(_, code)| code).collect()
 }
 
 fn draw_sidebar(frame: &mut Frame, state: &State, area: Rect) {
-    let lines: Vec<TextLine> = sidebar(state).into_iter().map(|(line, _)| line).collect();
+    let lines: Vec<TextLine> = sidebar_page(state, area.height.into()).into_iter().map(|(line, _)| line).collect();
     frame.render_widget(Paragraph::new(lines).block(Block::new().borders(Borders::RIGHT).border_style(dim())), area);
 }
 
@@ -1102,6 +1166,58 @@ mod tests {
         update(&mut state, click(3, 4));
         update(&mut state, click(40, 10));
         assert_eq!(state.open_peer(), Some(rahul(&state)), "clicking elsewhere changes nothing");
+    }
+
+    #[test]
+    fn the_sidebar_scrolls_to_the_open_chat_and_shows_requests() {
+        use ratatui::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let mut state = State::new("ana".into(), "abcdefgh".into());
+        state.size = (80, 24);
+        let mut people: Vec<Person> =
+            (0..30).map(|i| person(Seed::generate().code(), &format!("p{i:02}"), Standing::Contact)).collect();
+        people.push(person(Seed::generate().code(), "zed", Standing::Request));
+        state.set_people(people.clone());
+        let mouse = |kind, column, row| Msg::Mouse(MouseEvent { kind, column, row, modifiers: KeyModifiers::NONE });
+        let sidebar = areas((80, 24), 1).unwrap().sidebar;
+        let shown = |state: &State| {
+            let buf = render(state, 80, 24);
+            (sidebar.y..sidebar.bottom())
+                .map(|y| row(&buf, y).chars().take(sidebar.width as usize - 1).collect::<String>())
+                .collect::<Vec<_>>()
+        };
+
+        let rows = shown(&state);
+        assert!(rows.last().unwrap().contains("↓ 13 more"), "{rows:#?}");
+        let more = render(&state, 80, 24)[(2, sidebar.bottom() - 1)].fg;
+        assert_eq!(more, Color::Yellow, "hidden requests make it stand out");
+
+        send(&mut state, "/chat p29");
+        let rows = shown(&state);
+        assert!(rows.iter().any(|r| r.contains("p29")), "the open chat is in view: {rows:#?}");
+        assert!(rows[0].contains("↑"), "{rows:#?}");
+
+        for _ in 0..10 {
+            update(&mut state, mouse(MouseEventKind::ScrollDown, 3, 5));
+        }
+        let rows = shown(&state);
+        let y = rows.iter().position(|r| r.contains("zed")).expect("the request is reachable") as u16;
+        assert!(rows.iter().any(|r| r.starts_with("Requests (1)")));
+        update(&mut state, mouse(MouseEventKind::Down(MouseButton::Left), 4, sidebar.y + y));
+        assert_eq!(state.open_peer(), Some(people[30].code), "the click lands on the request");
+        assert!(shown(&state).iter().any(|r| r.contains("zed")), "opening it doesn't move it out of view");
+
+        for _ in 0..20 {
+            update(&mut state, mouse(MouseEventKind::ScrollUp, 3, 5));
+        }
+        let rows = shown(&state);
+        assert!(rows[0].starts_with("○ p00"), "back at the top: {rows:#?}");
+        let y = rows.iter().position(|r| r.contains("p05")).unwrap() as u16;
+        update(&mut state, mouse(MouseEventKind::Down(MouseButton::Left), 3, sidebar.y + y));
+        assert_eq!(state.open_peer(), Some(people[5].code));
+        assert!(!state.scroll.is_scrolled(), "the wheel over the sidebar doesn't scroll the chat");
+        let last = sidebar.bottom() - 1;
+        update(&mut state, mouse(MouseEventKind::Down(MouseButton::Left), 3, last));
+        assert_eq!(state.open_peer(), Some(people[5].code), "the ↓ row opens no one");
     }
 
     #[test]

@@ -417,6 +417,10 @@ pub struct State {
     pub since_start: u32,
     /// The completion list, while open.
     pub popup: Option<Popup>,
+    /// The sidebar's first row shown, when it has more than fit.
+    pub sidebar_top: usize,
+    /// The chat the sidebar was last scrolled to show.
+    pub sidebar_for: Option<Code>,
 }
 
 impl State {
@@ -446,6 +450,8 @@ impl State {
             focused: true,
             since_start: 0,
             popup: None,
+            sidebar_top: 0,
+            sidebar_for: None,
         }
     }
 

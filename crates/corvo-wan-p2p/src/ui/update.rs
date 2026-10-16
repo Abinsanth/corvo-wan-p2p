@@ -18,7 +18,7 @@ use super::commands::{Cmd, HELP, Input, KEYS, parse};
 use super::complete;
 use super::people::{self, Act, Show};
 use super::state::{Screen, Secret, State, Tone, WHEEL_STEP};
-use super::view::{areas, chat_page, input_rows, popup_area, sidebar_rows, tab_at};
+use super::view::{areas, chat_page, input_rows, popup_area, sidebar_rows, sidebar_scrolled, sidebar_showing, tab_at};
 
 #[derive(Debug)]
 pub enum Msg {
@@ -239,6 +239,7 @@ fn action_for(key: KeyEvent) -> Option<Action> {
 
 pub fn update(state: &mut State, msg: Msg) -> Vec<Effect> {
     let mut effects = Vec::new();
+    let resized = matches!(msg, Msg::Resize(..));
     // Typing means the window has focus, even where the terminal doesn't say.
     if matches!(msg, Msg::Key(_) | Msg::Paste(_)) {
         state.focused = true;
@@ -263,8 +264,8 @@ pub fn update(state: &mut State, msg: Msg) -> Vec<Effect> {
             state.editor.insert_str(&text);
         }
         Msg::Mouse(mouse) => match mouse.kind {
-            MouseEventKind::ScrollUp => scroll_by(state, -(WHEEL_STEP as isize)),
-            MouseEventKind::ScrollDown => scroll_by(state, WHEEL_STEP as isize),
+            MouseEventKind::ScrollUp => wheel(state, mouse, -(WHEEL_STEP as isize)),
+            MouseEventKind::ScrollDown => wheel(state, mouse, WHEEL_STEP as isize),
             MouseEventKind::Down(MouseButton::Left) => {
                 state.focused = true;
                 click(state, mouse.column, mouse.row);
@@ -295,6 +296,12 @@ pub fn update(state: &mut State, msg: Msg) -> Vec<Effect> {
         state.busy = Some(busy);
     }
     chat::read_open_chat(state, &mut effects);
+    if state.open_peer() != state.sidebar_for || resized {
+        state.sidebar_for = state.open_peer();
+        if let Some(code) = state.sidebar_for {
+            state.sidebar_top = sidebar_showing(state, code);
+        }
+    }
     let title = chat::title(state);
     if state.title != title {
         state.title = title.clone();
@@ -329,6 +336,17 @@ fn click(state: &mut State, x: u16, y: u16) {
         && let Some(Some(code)) = sidebar_rows(state).get(usize::from(y - areas.sidebar.y))
     {
         state.open_chat(*code, true);
+    }
+}
+
+/// The wheel scrolls the sidebar when it's over it, and the chat otherwise.
+fn wheel(state: &mut State, mouse: MouseEvent, delta: isize) {
+    let over_sidebar = areas(state.size, input_rows(state))
+        .is_some_and(|a| a.sidebar.contains(Position::new(mouse.column, mouse.row)));
+    if over_sidebar && matches!(state.screen, Screen::Main) {
+        state.sidebar_top = sidebar_scrolled(state, delta);
+    } else {
+        scroll_by(state, delta);
     }
 }
 

@@ -15,6 +15,7 @@
 
 use std::iter::Peekable;
 use std::str::Chars;
+use std::sync::Arc;
 
 use corvo_wan_p2p_core::VERSION;
 use corvo_wan_p2p_core::identity::{Code, is_invisible};
@@ -29,7 +30,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::chat::local;
 use super::onboarding::Onboarding;
-use super::state::{APP, Line, MAX_INPUT_ROWS, Screen, Secret, State, Tab, Tone};
+use super::state::{APP, Line, MAX_INPUT_ROWS, RowKey, Rows, Screen, Secret, State, Tab, Tone};
 
 /// Smaller than this, only [`TOO_SMALL`] is drawn.
 pub const MIN_WIDTH: u16 = 40;
@@ -134,8 +135,28 @@ pub fn tab_lines(state: &State, tab: &Tab) -> (Vec<Shown>, usize) {
     (lines, clear_line)
 }
 
-/// A tab's rows at `width`, and the row its last `/clear` was at.
-pub fn chat_rows(state: &State, tab: &Tab, width: u16) -> (Vec<(String, Tone)>, usize) {
+#[cfg(test)]
+thread_local! {
+    /// How many times a tab's rows were built, for tests.
+    static BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The open tab's rows at `width`, and the row its last `/clear` was at.
+/// Built once per change and width, then reused.
+pub fn chat_rows(state: &State, width: u16) -> (Arc<Rows>, usize) {
+    let key = RowKey { tab: state.current, peer: state.tab().peer, width, changes: state.changes };
+    if let Some(hit) = state.rows.get(&key) {
+        return hit;
+    }
+    let (rows, clear_row) = build_rows(state, state.tab(), width);
+    let rows = Arc::new(rows);
+    state.rows.put(key, rows.clone(), clear_row);
+    (rows, clear_row)
+}
+
+fn build_rows(state: &State, tab: &Tab, width: u16) -> (Rows, usize) {
+    #[cfg(test)]
+    BUILDS.with(|b| b.set(b.get() + 1));
     let (lines, cleared) = tab_lines(state, tab);
     let mut rows = Vec::new();
     let mut clear_row = None;
@@ -173,9 +194,14 @@ pub fn chat_page(state: &State) -> (usize, usize) {
     let Some(areas) = areas(state.size, input_rows(state)) else {
         return (0, 0);
     };
-    let (rows, clear_row) = chat_rows(state, state.tab(), areas.chat.width);
+    let (rows, clear_row) = chat_rows(state, areas.chat.width);
     let height = areas.chat.height as usize;
-    (rows.len().max(clear_row + height), height)
+    (scroll_total(rows.len(), clear_row, height), height)
+}
+
+/// Rows to scroll through: after a `/clear`, enough below its mark to fill the area.
+fn scroll_total(rows: usize, clear_row: usize, height: usize) -> usize {
+    rows.max(clear_row + height)
 }
 
 /// Text from someone else, made safe to draw: escape sequences, control
@@ -581,11 +607,12 @@ fn draw_popup(frame: &mut Frame, state: &State, input: Rect) {
 }
 
 fn draw_chat(frame: &mut Frame, state: &State, area: Rect) {
-    let (rows, _) = chat_rows(state, state.tab(), area.width);
-    let (total, height) = chat_page(state);
+    let (rows, clear_row) = chat_rows(state, area.width);
+    let height = usize::from(area.height);
+    let total = scroll_total(rows.len(), clear_row, height);
     let top = state.scroll.top(total, height);
     let shown: Vec<TextLine> =
-        rows.into_iter().skip(top).take(height).map(|(text, t)| TextLine::styled(text, tone(t))).collect();
+        rows.iter().skip(top).take(height).map(|(text, t)| TextLine::styled(text.as_str(), tone(*t))).collect();
     frame.render_widget(Paragraph::new(shown), area);
     if state.scroll.is_scrolled() && area.height > 0 {
         let more = " ↓ more ";
@@ -1043,6 +1070,27 @@ mod tests {
         let (mine, theirs) = (buf[(chat_x, y_of("you: mine"))].style(), buf[(chat_x, y_of("theirs"))].style());
         assert_eq!(mine.fg, tone(Tone::Own).fg, "your own lines have their own style");
         assert_ne!(theirs.fg, mine.fg);
+    }
+
+    #[test]
+    fn rows_are_built_once_per_change() {
+        let mut state = busy_state();
+        state.size = (80, 24);
+        state.select_tab(1);
+        let start = BUILDS.with(|b| b.get());
+        let built = || BUILDS.with(|b| b.get()) - start;
+        render(&state, 80, 24);
+        render(&state, 80, 24);
+        update(&mut state, Msg::Tick);
+        render(&state, 80, 24);
+        assert_eq!(built(), 1, "a frame that changes nothing reuses the rows");
+        let rahul = rahul(&state);
+        update(&mut state, Msg::Core(corvo_wan_p2p_core::chat::Event::Online(rahul)));
+        update(&mut state, Msg::Key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE)));
+        render(&state, 80, 24);
+        assert_eq!(built(), 2, "once after a change, scrolling included");
+        render(&state, 100, 30);
+        assert_eq!(built(), 3, "and again at a new width");
     }
 
     #[test]

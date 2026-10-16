@@ -4,6 +4,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::sync::{Arc, Mutex};
 
 use corvo_wan_p2p_core::identity::Code;
 use corvo_wan_p2p_core::names;
@@ -348,6 +349,39 @@ impl Tab {
     }
 }
 
+/// A tab's rows on screen, wrapped, each with its tone.
+pub type Rows = Vec<(String, Tone)>;
+
+/// What a tab's rows were built for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RowKey {
+    pub tab: usize,
+    pub peer: Option<Code>,
+    pub width: u16,
+    /// [`State::changes`] when they were built.
+    pub changes: u64,
+}
+
+/// The open tab's rows as last built, so a frame that changes nothing
+/// doesn't build them again. Kept by `view`, which can't change anything
+/// else: a memo, not state.
+#[derive(Debug, Default)]
+pub struct RowCache(Mutex<Option<(RowKey, Arc<Rows>, usize)>>);
+
+impl RowCache {
+    /// The rows and the `/clear` row, if they were built for `key`.
+    pub fn get(&self, key: &RowKey) -> Option<(Arc<Rows>, usize)> {
+        let cached = self.0.lock().ok()?;
+        cached.as_ref().filter(|(k, ..)| k == key).map(|(_, rows, clear)| (rows.clone(), *clear))
+    }
+
+    pub fn put(&self, key: RowKey, rows: Arc<Rows>, clear_row: usize) {
+        if let Ok(mut cached) = self.0.lock() {
+            *cached = Some((key, rows, clear_row));
+        }
+    }
+}
+
 /// Someone in the sidebar.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Peer {
@@ -421,6 +455,10 @@ pub struct State {
     pub sidebar_top: usize,
     /// The chat the sidebar was last scrolled to show.
     pub sidebar_for: Option<Code>,
+    /// Counts the changes that can change what a tab shows; `update` adds one
+    /// for every message but the tick.
+    pub changes: u64,
+    pub rows: RowCache,
 }
 
 impl State {
@@ -452,6 +490,8 @@ impl State {
             popup: None,
             sidebar_top: 0,
             sidebar_for: None,
+            changes: 0,
+            rows: RowCache::default(),
         }
     }
 
@@ -486,6 +526,7 @@ impl State {
     /// Recomputes the labels after a change to `known`, and with them the
     /// sidebar and the chat tabs' titles.
     pub fn relabel(&mut self) {
+        self.changes += 1;
         self.labels = names::labels(&self.known);
         for i in 1..self.tabs.len() {
             if let Some(code) = self.tabs[i].peer {
@@ -571,6 +612,7 @@ impl State {
 
     /// Adds a line to the `corvo` tab, and flashes it if it's a warning or an error.
     pub fn say(&mut self, tone: Tone, text: impl Into<String>) {
+        self.changes += 1;
         let line = Line { text: text.into(), tone };
         if matches!(tone, Tone::Warn | Tone::Bad) {
             self.flash = Some(Flash { line: line.clone(), ticks_left: FLASH_TICKS });
@@ -586,6 +628,7 @@ impl State {
     /// Like a terminal's `clear`: the open tab shows empty, and scrolling up
     /// shows what came before.
     pub fn clear_tab(&mut self) {
+        self.changes += 1;
         let tab = &self.tabs[self.current];
         // A chat tab's mark counts its messages; the corvo tab's, its lines.
         let len = match tab.peer {

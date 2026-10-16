@@ -240,6 +240,9 @@ fn action_for(key: KeyEvent) -> Option<Action> {
 pub fn update(state: &mut State, msg: Msg) -> Vec<Effect> {
     let mut effects = Vec::new();
     let resized = matches!(msg, Msg::Resize(..));
+    if !matches!(msg, Msg::Tick) {
+        state.changes += 1;
+    }
     // Typing means the window has focus, even where the terminal doesn't say.
     if matches!(msg, Msg::Key(_) | Msg::Paste(_)) {
         state.focused = true;

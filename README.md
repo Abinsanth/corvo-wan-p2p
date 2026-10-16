@@ -23,16 +23,19 @@ $env:CORVO_WAN_P2P_VERSION = 'v0.1.0-rc.2'; irm https://raw.githubusercontent.co
 
 The installer downloads the build for your system, checks its SHA-256 and
 installs it without sudo or admin rights. On macOS and Linux it goes to
-`~/.local/bin`, which it adds to your PATH in `~/.zshrc` (zsh) or
-`~/.bash_profile` / `~/.bashrc` (bash), once, marked with a comment; set
-`CORVO_WAN_P2P_NO_MODIFY_PATH=1` to leave your profile alone. On Windows it
-goes to `%LOCALAPPDATA%\Programs\corvo-wan-p2p`, added to your user PATH. Set
+`~/.local/bin`, which it adds to your PATH in `~/.zshrc` (zsh, in `$ZDOTDIR`
+if you set one) or `~/.bash_profile` / `~/.bashrc` (bash), once, marked with
+a comment. For fish and other shells it prints what to run instead. On
+Windows it goes to `%LOCALAPPDATA%\Programs\corvo-wan-p2p`, added to your
+user PATH. Set `CORVO_WAN_P2P_NO_MODIFY_PATH=1` to leave your profile (or
+PATH) alone. Set
 `CORVO_WAN_P2P_INSTALL_DIR` to install somewhere else. `CORVO_WAN_P2P_VERSION`
 picks a release; leave it out for the latest full release (there isn't one
 yet, only the pre-release).
 
 Then open a new terminal and run `corvo-wan-p2p`. Inside the app, `/update`
-installs newer versions.
+installs newer versions (a copy built from source updates with `git pull`
+and `cargo build` instead).
 
 Or build from source with Rust ([rustup.rs](https://rustup.rs)):
 

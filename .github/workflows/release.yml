@@ -8,7 +8,7 @@ on:
   push:
     branches: [release]
   pull_request:
-    paths: [.github/workflows/release.yml, Cargo.toml, Cargo.lock, crates/*/Cargo.toml, install.sh, install.ps1]
+    paths: [.github/workflows/release.yml, .github/scripts/**, Cargo.toml, Cargo.lock, crates/*/Cargo.toml, install.sh, install.ps1]
   workflow_dispatch:
 
 permissions:
@@ -25,7 +25,7 @@ jobs:
     outputs:
       version: ${{ steps.read.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - id: read
         run: echo "version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)" >> "$GITHUB_OUTPUT"
       - name: Refuse to overwrite a published version
@@ -51,12 +51,13 @@ jobs:
           - { target: x86_64-pc-windows-msvc, os: windows-latest }
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
       - if: contains(matrix.target, 'musl')
-        run: sudo apt-get update && sudo apt-get install -y musl-tools
+        # zsh too, for install.sh's ZDOTDIR case.
+        run: sudo apt-get update && sudo apt-get install -y musl-tools zsh
       - run: cargo build --release --locked -p corvo-wan-p2p --target ${{ matrix.target }}
       # The Intel macOS build is cross-compiled and can't run on this runner.
       - if: matrix.target != 'x86_64-apple-darwin'
@@ -83,9 +84,8 @@ jobs:
           # Lowercase, like sha256sum.
           $hash = (Get-FileHash -Algorithm SHA256 "$env:NAME.zip").Hash.ToLower()
           Set-Content -NoNewline -Path "$env:NAME.zip.sha256" -Value "$hash  $env:NAME.zip`n"
-      # install.sh end to end against this build, served locally: a fresh
-      # install into a path with a space, then a reinstall over it, adding
-      # the folder to the shell profile once.
+      # install.sh end to end against this build, served locally, in every
+      # case it handles (see the script).
       - name: Try install.sh
         if: runner.os != 'Windows' && matrix.target != 'x86_64-apple-darwin'
         env:
@@ -98,21 +98,11 @@ jobs:
           server=$!
           trap 'kill $server' EXIT
           for _ in $(seq 30); do curl -fs "http://127.0.0.1:8765/$NAME.tar.gz.sha256" > /dev/null && break; sleep 0.5; done
-          export CORVO_WAN_P2P_BASE_URL=http://127.0.0.1:8765
-          export CORVO_WAN_P2P_INSTALL_DIR="$RUNNER_TEMP/corvo wan bin"
-          # A throwaway home, so the profile it edits is this test's.
-          export HOME="$RUNNER_TEMP/home" SHELL=/bin/bash
-          mkdir -p "$HOME"
-          sh install.sh
-          "$CORVO_WAN_P2P_INSTALL_DIR/corvo-wan-p2p" --version
-          sh install.sh
-          "$CORVO_WAN_P2P_INSTALL_DIR/corvo-wan-p2p" --version
-          if [ "$RUNNER_OS" = macOS ]; then profile="$HOME/.bash_profile"; else profile="$HOME/.bashrc"; fi
-          test "$(grep -c "export PATH=\"$CORVO_WAN_P2P_INSTALL_DIR:" "$profile")" = 1
-          test "$(bash -c ". '$profile'; command -v corvo-wan-p2p")" = "$CORVO_WAN_P2P_INSTALL_DIR/corvo-wan-p2p"
+          CORVO_WAN_P2P_BASE_URL=http://127.0.0.1:8765 sh .github/scripts/test-install.sh
       # install.ps1 end to end against this build, served locally: a fresh
-      # install into a path with a space, then a reinstall while the exe is
-      # held open the way a running corvo-wan-p2p holds it.
+      # install into a path with a space that adds it to the user PATH, a
+      # reinstall while the exe is held open the way a running corvo-wan-p2p
+      # holds it, and an install that's told to leave PATH alone.
       - name: Try install.ps1
         if: runner.os == 'Windows'
         shell: pwsh
@@ -132,14 +122,24 @@ jobs:
             $env:CORVO_WAN_P2P_BASE_URL = 'http://127.0.0.1:8765'
             $env:CORVO_WAN_P2P_INSTALL_DIR = Join-Path $env:RUNNER_TEMP 'corvo wan bin'
             $exe = Join-Path $env:CORVO_WAN_P2P_INSTALL_DIR 'corvo-wan-p2p.exe'
+            $userPath = { @((Get-Item 'HKCU:\Environment').GetValue('Path', '', 'DoNotExpandEnvironmentNames') -split ';') }
             Get-Content -Raw install.ps1 | Invoke-Expression
             & $exe --version
             if ($LASTEXITCODE -ne 0) { throw 'corvo-wan-p2p --version failed' }
+            if ((& $userPath) -notcontains $env:CORVO_WAN_P2P_INSTALL_DIR) { throw 'the folder was not added to the user PATH' }
             $held = [IO.File]::Open($exe, 'Open', 'Read', 'Read, Delete')
-            try { Get-Content -Raw install.ps1 | Invoke-Expression } finally { $held.Close() }
+            try { $said = Get-Content -Raw install.ps1 | Invoke-Expression | Out-String } finally { $held.Close() }
+            Write-Output $said
             if (-not (Test-Path (Join-Path $env:CORVO_WAN_P2P_INSTALL_DIR 'corvo-wan-p2p.old.exe'))) { throw 'the held exe was not moved aside' }
+            if ($said -notmatch 'run: corvo-wan-p2p') { throw 'a reinstall did not say: run: corvo-wan-p2p' }
             & $exe --version
             if ($LASTEXITCODE -ne 0) { throw 'corvo-wan-p2p --version failed' }
+            $env:CORVO_WAN_P2P_INSTALL_DIR = Join-Path $env:RUNNER_TEMP 'corvo left alone'
+            $env:CORVO_WAN_P2P_NO_MODIFY_PATH = '1'
+            $said = Get-Content -Raw install.ps1 | Invoke-Expression | Out-String
+            Write-Output $said
+            if ((& $userPath) -contains $env:CORVO_WAN_P2P_INSTALL_DIR) { throw 'CORVO_WAN_P2P_NO_MODIFY_PATH was ignored' }
+            if ($said -notmatch "isn't on your PATH") { throw 'the opt-out did not say what to do' }
           } finally {
             Stop-Process -Id $server.Id -ErrorAction SilentlyContinue
           }

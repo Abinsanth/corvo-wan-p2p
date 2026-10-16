@@ -7,14 +7,17 @@ use corvo_wan_p2p_core::identity::Code;
 use corvo_wan_p2p_core::proto::PROTO_VERSION;
 use corvo_wan_p2p_core::store::{Mark, Person, Standing, StoredMessage};
 
-use super::state::{APP, Chat, Screen, State, Tone};
+use super::state::{APP, CHAT_LEN, Chat, Screen, State, Tone};
 use super::update::Effect;
-use super::view::{areas, input_rows};
+use super::view::{areas, chat_page, input_rows};
 
 /// Wait this long (10 seconds of ticks) for the first connection before
 /// saying "offline": the engine reports offline at start, before its relay
 /// has had a chance to answer.
 pub const CONNECTING_TICKS: u32 = 40;
+
+/// How many older messages to load at a time.
+pub const OLDER_PAGE: usize = 100;
 
 /// Everything the chat screens need at start.
 #[derive(Debug)]
@@ -25,7 +28,8 @@ pub struct Loaded {
     pub unreadable_people: usize,
 }
 
-/// One conversation as stored, and the newest of their messages you've read.
+/// One conversation's newest messages (up to [`CHAT_LEN`]), and the newest
+/// of their messages you've read.
 #[derive(Debug)]
 pub struct History {
     pub code: Code,
@@ -153,7 +157,8 @@ pub fn loaded(state: &mut State, result: Result<Loaded, String>) {
             let mut damaged = Vec::new();
             for History { code, messages, read_upto, unreadable } in chats {
                 let unread = unread_after(&messages, read_upto.as_deref());
-                state.chats.insert(code, Chat { messages, unread });
+                let older = messages.len() + unreadable >= CHAT_LEN;
+                state.chats.insert(code, Chat { messages, unread, older, loading: false });
                 if unreadable > 0 {
                     damaged.push((unreadable, code));
                 }
@@ -172,6 +177,74 @@ pub fn loaded(state: &mut State, result: Result<Loaded, String>) {
             }
         }
         Err(why) => state.say(Tone::Bad, format!("couldn't read your chats: {why}")),
+    }
+}
+
+/// What came of [`Effect::LoadOlder`]: `page` goes before what's there,
+/// without moving what's on screen.
+pub fn loaded_older(state: &mut State, peer: Code, result: Result<(Vec<StoredMessage>, usize), String>) {
+    let Some(chat) = state.chats.get_mut(&peer) else { return };
+    chat.loading = false;
+    let (page, unreadable) = match result {
+        Ok(page) => page,
+        Err(why) => return state.say(Tone::Bad, format!("couldn't read older messages: {why}")),
+    };
+    chat.older = page.len() + unreadable >= OLDER_PAGE;
+    let added = page.len();
+    let open = state.open_peer() == Some(peer);
+    let before = if open { chat_page(state).0 } else { 0 };
+    let chat = state.chats.get_mut(&peer).expect("checked above");
+    chat.messages.splice(0..0, page);
+    if let Some(tab) = state.tabs.iter_mut().find(|t| t.peer == Some(peer))
+        && tab.cleared > 0
+    {
+        tab.cleared += added;
+    }
+    state.changes += 1;
+    if open {
+        let after = chat_page(state).0;
+        state.scroll.shift(after.saturating_sub(before));
+    }
+    if unreadable > 0 {
+        let label = state.label(&peer);
+        let messages = if unreadable == 1 { "message" } else { "messages" };
+        state.say(Tone::Warn, format!("{unreadable} older {messages} with {label} couldn't be read"));
+    }
+}
+
+/// Asks for older messages when the open chat is scrolled to its top and
+/// there may be some.
+pub fn load_older(state: &mut State, effects: &mut Vec<Effect>) {
+    let Some(peer) = state.open_peer() else { return };
+    if !state.scroll.is_scrolled() || state.chats.get(&peer).is_none_or(|c| !c.older || c.loading) {
+        return;
+    }
+    let (total, height) = chat_page(state);
+    if state.scroll.top(total, height) > 0 {
+        return;
+    }
+    let chat = state.chats.get_mut(&peer).expect("checked above");
+    let Some(first) = chat.messages.first() else { return };
+    chat.loading = true;
+    effects.push(Effect::LoadOlder { peer, before: first.id.clone(), n: OLDER_PAGE });
+}
+
+/// Drops all but the newest [`CHAT_LEN`] messages of each chat, except the
+/// open one while it's scrolled up.
+pub fn trim(state: &mut State) {
+    let keep = if state.scroll.is_scrolled() { state.open_peer() } else { None };
+    for (code, chat) in &mut state.chats {
+        if chat.messages.len() <= CHAT_LEN || keep == Some(*code) {
+            continue;
+        }
+        let gone = chat.messages.len() - CHAT_LEN;
+        chat.messages.drain(..gone);
+        chat.older = true;
+        if let Some(tab) = state.tabs.iter_mut().find(|t| t.peer == Some(*code)) {
+            // 0 once everything before the mark is gone: all of it shows.
+            tab.cleared = tab.cleared.saturating_sub(gone);
+        }
+        state.changes += 1;
     }
 }
 
@@ -232,6 +305,7 @@ pub fn title(state: &State) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ui::state::CHAT_LEN;
     use crate::ui::update::{Msg, Outcome, update};
     use corvo_wan_p2p_core::identity::Seed;
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -482,6 +556,60 @@ mod tests {
         update(&mut s, received(rahul, "01"));
         assert_eq!(s.chats[&rahul].messages.len(), 1);
         assert_eq!(s.chats[&rahul].unread, 1);
+    }
+
+    /// The rows on screen.
+    fn on_screen(state: &State) -> Vec<String> {
+        let width = crate::ui::view::areas(state.size, 1).unwrap().chat.width;
+        let (rows, _) = crate::ui::view::chat_rows(state, width);
+        let (total, height) = crate::ui::view::chat_page(state);
+        rows.iter().skip(state.scroll.top(total, height)).take(height).map(|r| r.0.clone()).collect()
+    }
+
+    #[test]
+    fn a_chat_keeps_its_last_500_and_loads_older_at_the_top() {
+        let (mut s, rahul, _) = state();
+        s.size = (80, 24);
+        let people = s.known.clone();
+        let messages: Vec<_> =
+            (0..CHAT_LEN).map(|i| message(&format!("m{i:04}"), &format!("m{i:04}"), Mark::Read)).collect();
+        let chats = vec![History { code: rahul, messages, read_upto: None, unreadable: 0 }];
+        update(&mut s, Msg::Done(Outcome::Loaded(Ok(Loaded { people, chats, unreadable_people: 0 }))));
+        for i in 0..10 {
+            update(&mut s, received(rahul, &format!("n{i}")));
+        }
+        let ids = |s: &State| s.chats[&rahul].messages.iter().map(|m| m.id.clone()).collect::<Vec<_>>();
+        assert_eq!(ids(&s).len(), CHAT_LEN, "only the newest are kept");
+        assert_eq!(ids(&s)[0], "m0010");
+        assert_eq!(ids(&s).last().unwrap(), "n9");
+
+        s.open_chat(rahul, true);
+        let older = |effects: &[Effect]| effects.iter().find(|e| matches!(e, Effect::LoadOlder { .. })).cloned();
+        let mut asked = None;
+        for _ in 0..CHAT_LEN {
+            asked = older(&key(&mut s, KeyCode::PageUp, KeyModifiers::NONE));
+            if asked.is_some() {
+                break;
+            }
+        }
+        assert_eq!(asked, Some(Effect::LoadOlder { peer: rahul, before: "m0010".into(), n: OLDER_PAGE }));
+        assert_eq!(older(&key(&mut s, KeyCode::PageUp, KeyModifiers::NONE)), None, "asked once");
+        let shown: Vec<String> = on_screen(&s).into_iter().filter(|r| !r.starts_with("──")).collect();
+
+        let page: Vec<_> = (0..10).map(|i| message(&format!("m{i:04}"), &format!("m{i:04}"), Mark::Read)).collect();
+        update(&mut s, Msg::Done(Outcome::LoadedOlder { peer: rahul, result: Ok((page, 0)) }));
+        assert_eq!(ids(&s).len(), CHAT_LEN + 10);
+        assert_eq!(ids(&s)[0], "m0000");
+        let now = on_screen(&s);
+        assert!(shown.iter().all(|r| now.contains(r)), "what was on screen stays:\n{shown:#?}\n{now:#?}");
+        for _ in 0..10 {
+            assert_eq!(older(&key(&mut s, KeyCode::PageUp, KeyModifiers::NONE)), None, "that was all of them");
+        }
+        assert!(on_screen(&s).iter().any(|r| r.contains("m0000")));
+
+        key(&mut s, KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(ids(&s).len(), CHAT_LEN, "back at the end, the oldest go again");
+        assert_eq!(ids(&s).last().unwrap(), "n9");
     }
 
     #[test]

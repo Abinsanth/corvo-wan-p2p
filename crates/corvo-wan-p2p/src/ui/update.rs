@@ -80,6 +80,12 @@ pub enum Effect {
     },
     /// You've seen everything they sent.
     MarkRead(Code),
+    /// Read the `n` messages with `peer` from before the one with id `before`.
+    LoadOlder {
+        peer: Code,
+        before: String,
+        n: usize,
+    },
     Act {
         code: Code,
         act: Act,
@@ -132,6 +138,11 @@ pub enum Outcome {
     PassphraseChanged(Result<(), String>),
     Phrase(Result<PhraseDone, String>),
     Loaded(Result<Loaded, String>),
+    /// Older messages, and how many of them couldn't be read.
+    LoadedOlder {
+        peer: Code,
+        result: Result<(Vec<StoredMessage>, usize), String>,
+    },
     /// The message as saved, waiting to be sent; `text` is what was typed.
     Sent {
         to: Code,
@@ -298,6 +309,8 @@ pub fn update(state: &mut State, msg: Msg) -> Vec<Effect> {
     if let Some(busy) = effects.iter().find_map(Effect::busy) {
         state.busy = Some(busy);
     }
+    chat::trim(state);
+    chat::load_older(state, &mut effects);
     chat::read_open_chat(state, &mut effects);
     if state.open_peer() != state.sidebar_for || resized {
         state.sidebar_for = state.open_peer();
@@ -509,6 +522,7 @@ fn on_done(state: &mut State, outcome: Outcome, effects: &mut Vec<Effect>) {
         Outcome::Fatal(why) => effects.push(Effect::Exit(why)),
         Outcome::Failed(why) => state.say(Tone::Bad, why),
         Outcome::Loaded(result) => chat::loaded(state, result),
+        Outcome::LoadedOlder { peer, result } => chat::loaded_older(state, peer, result),
         Outcome::Sent { to, text, result } => chat::sent(state, to, text, result),
         Outcome::Acted { code, act, result, people } => people::acted(state, code, act, result, people),
         Outcome::Named(result) => people::named(state, result),

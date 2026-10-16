@@ -133,6 +133,38 @@ impl Store {
         Ok((messages, damaged.len()))
     }
 
+    /// The newest `n` messages with `peer` from before the one with id
+    /// `before` (or the newest of all with `None`), oldest first, and how many
+    /// of them couldn't be read. Only those `n` are opened. An id that isn't
+    /// saved gives nothing.
+    pub fn history_before(
+        &self,
+        peer: &Code,
+        before: Option<&str>,
+        n: usize,
+    ) -> Result<(Vec<StoredMessage>, usize), StoreError> {
+        let below: i64 = match before {
+            None => i64::MAX,
+            Some(id) => {
+                let seq = self
+                    .db
+                    .query_row(
+                        "SELECT seq FROM messages WHERE peer = ?1 AND msg = ?2",
+                        params![self.peer_tag(peer), self.msg_tag(id)],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                match seq {
+                    Some(seq) => seq,
+                    None => return Ok((Vec::new(), 0)),
+                }
+            }
+        };
+        let (mut messages, damaged) = self.select(peer, &format!("AND seq < {below}"), &format!("DESC LIMIT {n}"))?;
+        messages.reverse();
+        Ok((messages, damaged.len()))
+    }
+
     /// Whether a message with this id from or to `peer` is saved, or was
     /// until its history was deleted.
     pub fn has_message(&self, peer: &Code, id: &str) -> Result<bool, StoreError> {
@@ -172,9 +204,10 @@ impl Store {
     }
 
     /// The messages that open, and the `msg` tags of those that don't.
-    fn select(&self, peer: &Code, filter: &str, limit: &str) -> Result<(Vec<StoredMessage>, Vec<Vec<u8>>), StoreError> {
+    /// `order` follows `ORDER BY seq`: a direction and a limit, or nothing.
+    fn select(&self, peer: &Code, filter: &str, order: &str) -> Result<(Vec<StoredMessage>, Vec<Vec<u8>>), StoreError> {
         let peer = self.peer_tag(peer);
-        let sql = format!("SELECT msg, body, mark FROM messages WHERE peer = ?1 {filter} ORDER BY seq {limit}");
+        let sql = format!("SELECT msg, body, mark FROM messages WHERE peer = ?1 {filter} ORDER BY seq {order}");
         let mut query = self.db.prepare(&sql)?;
         let rows = query
             .query_map([peer], |r| Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, Vec<u8>>(1)?, r.get::<_, Vec<u8>>(2)?)))?;
@@ -322,6 +355,29 @@ mod tests {
         let marks: Vec<Mark> = s.history(&rahul).unwrap().iter().map(|m| m.mark).collect();
         assert!(marks.iter().all(|&m| m == Mark::Read));
         assert!(!s.mark_read(&rahul, "m099").unwrap(), "nothing new");
+    }
+
+    #[test]
+    fn history_before_pages_back_from_the_newest() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        let (rahul, maria) = (Seed::generate().code(), Seed::generate().code());
+        for i in 0..25 {
+            s.add_incoming(&rahul, &format!("m{i:02}"), i, "x").unwrap();
+            s.add_outgoing(&maria, &format!("other{i:02}"), i, "x").unwrap();
+        }
+        let ids = |page: &(Vec<StoredMessage>, usize)| page.0.iter().map(|m| m.id.clone()).collect::<Vec<_>>();
+        let newest = s.history_before(&rahul, None, 10).unwrap();
+        assert_eq!(ids(&newest), (15..25).map(|i| format!("m{i:02}")).collect::<Vec<_>>(), "the newest, oldest first");
+        assert_eq!(newest.1, 0);
+        OPENED.with(|o| o.set((0, 0)));
+        let older = s.history_before(&rahul, Some("m15"), 10).unwrap();
+        assert_eq!(ids(&older), (5..15).map(|i| format!("m{i:02}")).collect::<Vec<_>>());
+        assert!(opened().1 <= 10, "opened {} bodies", opened().1);
+        let oldest = s.history_before(&rahul, Some("m05"), 10).unwrap();
+        assert_eq!(ids(&oldest), (0..5).map(|i| format!("m{i:02}")).collect::<Vec<_>>(), "fewer at the start");
+        assert!(s.history_before(&rahul, Some("m00"), 10).unwrap().0.is_empty());
+        assert!(s.history_before(&rahul, Some("not-here"), 10).unwrap().0.is_empty());
     }
 
     #[test]

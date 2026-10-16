@@ -20,6 +20,9 @@ pub const MAX_INPUT_ROWS: usize = 5;
 pub const HISTORY_LEN: usize = 100;
 /// Lines kept in the `corvo` tab; older ones are dropped.
 pub const CORVO_LEN: usize = 500;
+/// Messages a chat keeps in memory, the newest; older ones load when it's
+/// scrolled to the top, and go again once it's back at the end.
+pub const CHAT_LEN: usize = 500;
 /// How long a flash stays, in ticks (5 seconds).
 pub const FLASH_TICKS: u32 = 20;
 /// Rows the mouse wheel scrolls per notch.
@@ -306,6 +309,13 @@ impl Scroll {
     pub fn follow_end(&mut self) {
         self.top = None;
     }
+
+    /// Keeps the same rows in view after `rows` more are added above them.
+    pub fn shift(&mut self, rows: usize) {
+        if let Some(top) = &mut self.top {
+            *top += rows;
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -395,12 +405,16 @@ pub struct Peer {
     pub unread: usize,
 }
 
-/// One conversation: its messages, oldest first, and how many of theirs you
-/// haven't seen.
+/// One conversation: its newest messages, oldest first, and how many of
+/// theirs you haven't seen.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Chat {
     pub messages: Vec<StoredMessage>,
     pub unread: usize,
+    /// There may be older messages in the store than these.
+    pub older: bool,
+    /// Older ones have been asked for.
+    pub loading: bool,
 }
 
 /// A short message under the chat area that goes away by itself.

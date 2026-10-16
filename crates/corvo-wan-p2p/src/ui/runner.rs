@@ -18,7 +18,7 @@ use super::account::{PhraseDone, PhraseUse};
 use super::chat::{History, Loaded};
 use super::clip::osc52;
 use super::people::Act;
-use super::state::Secret;
+use super::state::{CHAT_LEN, Secret};
 use super::update::{Effect, Msg, Outcome};
 use crate::selfupdate::{self, Release, Urls};
 
@@ -149,6 +149,13 @@ impl<W: Write> Runner<W> {
                     result.map(|id| StoredMessage { id, sent_at: now_ms(), text: text.clone(), mark: Mark::Waiting });
                 Outcome::Sent { to, text, result }
             }
+            Effect::LoadOlder { peer, before, n } => Outcome::LoadedOlder {
+                peer,
+                result: match self.client() {
+                    Ok(client) => client.history_before(peer, Some(before), n).await.map_err(|e| e.to_string()),
+                    Err(e) => Err(e),
+                },
+            },
             Effect::MarkRead(peer) => match self.client() {
                 Ok(client) => match client.mark_read(peer).await {
                     Ok(()) => return Ok(Flow::Next(None)),
@@ -219,7 +226,7 @@ impl<W: Write> Runner<W> {
         let (people, unreadable_people) = client.people_checked().await?;
         let mut chats = Vec::new();
         for p in people.iter().filter(|p| p.standing != Standing::Blocked) {
-            let (messages, unreadable) = client.history_checked(p.code).await?;
+            let (messages, unreadable) = client.history_before(p.code, None, CHAT_LEN).await?;
             let read_upto = client.read_upto(p.code).await?;
             chats.push(History { code: p.code, messages, read_upto, unreadable });
         }

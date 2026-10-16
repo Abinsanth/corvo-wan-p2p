@@ -181,6 +181,7 @@ enum Command {
     People(Reply<(Vec<Person>, usize)>),
     Contacts(Reply<Vec<Person>>),
     History(Code, Reply<(Vec<StoredMessage>, usize)>),
+    HistoryBefore { peer: Code, before: Option<String>, n: usize, reply: Reply<(Vec<StoredMessage>, usize)> },
     ReadUpto(Code, Reply<Option<String>>),
     ChangePassphrase { old: Zeroizing<String>, new: Zeroizing<String>, reply: Reply<()> },
     Phrase(Zeroizing<String>, Reply<Seed>),
@@ -355,6 +356,18 @@ impl Client {
         self.ask(|r| Command::History(peer, r)).await
     }
 
+    /// The newest `n` messages with `peer` from before the one with id
+    /// `before` (the newest of all with `None`), oldest first, and how many of
+    /// them couldn't be read (a damaged store).
+    pub async fn history_before(
+        &self,
+        peer: Code,
+        before: Option<String>,
+        n: usize,
+    ) -> Result<(Vec<StoredMessage>, usize), ChatError> {
+        self.ask(|reply| Command::HistoryBefore { peer, before, n, reply }).await
+    }
+
     /// The newest message of `peer`'s that you've read, if any: everything
     /// they sent after it is unread.
     pub async fn read_upto(&self, peer: Code) -> Result<Option<String>, ChatError> {
@@ -521,6 +534,10 @@ impl Core {
             }
             Command::History(peer, reply) => {
                 let _ = reply.send(self.store.history_checked(&peer).map_err(ChatError::from));
+            }
+            Command::HistoryBefore { peer, before, n, reply } => {
+                let page = self.store.history_before(&peer, before.as_deref(), n);
+                let _ = reply.send(page.map_err(ChatError::from));
             }
             Command::ReadUpto(peer, reply) => {
                 let _ = reply.send(self.store.read_upto(&peer).map_err(ChatError::from));

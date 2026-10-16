@@ -51,12 +51,14 @@ impl Peer {
         Peer::open(lookup, dir, seed).await
     }
 
-    /// A new account locked with the real Argon2 settings, which take about a
-    /// second, for tests about slow passphrase work.
-    pub async fn start_with_real_kdf(lookup: &MemoryLookup, name: &str) -> Peer {
+    /// A new account locked with slow Argon2 settings (the app's memory, more
+    /// passes: about half a second a run, more on slow machines), for tests
+    /// about what happens while passphrase work goes on.
+    pub async fn start_with_slow_kdf(lookup: &MemoryLookup, name: &str) -> Peer {
+        let slow = KdfParams { t: 8, ..KdfParams::DEFAULT };
         let (dir, seed) = (tempfile::tempdir().unwrap(), Seed::generate());
-        Store::create(dir.path(), "pass", KdfParams::DEFAULT, &seed, name).unwrap();
-        Peer::open_with(lookup, dir, seed, Config { kdf: KdfParams::DEFAULT, ..FAST }).await
+        Store::create(dir.path(), "pass", slow, &seed, name).unwrap();
+        Peer::open_with(lookup, dir, seed, Config { kdf: slow, ..FAST }).await
     }
 
     async fn open(lookup: &MemoryLookup, dir: TempDir, seed: Seed) -> Peer {

@@ -230,3 +230,34 @@ fn another_accounts_key_json_does_not_pass_the_check() {
     fs::copy(theirs.path().join(KEY_FILE), mine.path().join(KEY_FILE)).unwrap();
     assert!(!store.check_passphrase("first pass").unwrap());
 }
+
+#[test]
+fn weak_or_huge_settings_are_refused_when_locking() {
+    for params in [
+        KdfParams { m_kib: 8, t: 2, p: 1 },
+        KdfParams { m_kib: KdfParams::MIN.m_kib, t: 1, p: 1 },
+        KdfParams { m_kib: KdfParams::MAX.m_kib + 1, ..KdfParams::DEFAULT },
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let made = Store::create(dir.path(), "pass", params, &Seed::generate(), "abin");
+        assert!(matches!(made, Err(StoreError::BadKdfParams)), "{params:?}");
+        assert!(!Store::exists(dir.path()));
+    }
+}
+
+#[test]
+fn absurd_settings_in_key_json_are_refused_quickly() {
+    for params in ["{\"m_kib\":4294967295,\"t\":4294967295,\"p\":1}", "{\"m_kib\":1048577,\"t\":3,\"p\":1}"] {
+        let dir = tempfile::tempdir().unwrap();
+        drop(new_account(dir.path()));
+        let path = dir.path().join(KEY_FILE);
+        let mut json: serde_json::Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        json["params"] = serde_json::from_str(params).unwrap();
+        fs::write(&path, json.to_string()).unwrap();
+        let started = std::time::Instant::now();
+        let opened = Store::open(dir.path(), "first pass");
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        let Err(StoreError::Damaged { why, .. }) = opened else { panic!("expected damaged for {params}") };
+        assert!(why.contains("out of range"), "{why}");
+    }
+}

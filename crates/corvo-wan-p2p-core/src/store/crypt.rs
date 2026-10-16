@@ -1,6 +1,6 @@
 //! The store's encryption: passphrase stretching, and sealing single values.
 
-use argon2::{Algorithm, Argon2, Params, Version};
+use argon2::{Algorithm, Argon2, Block, Params, Version};
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use hkdf::Hkdf;
@@ -27,8 +27,32 @@ pub struct KdfParams {
 impl KdfParams {
     /// 64 MiB, 3 passes: about half a second on a laptop, which is fine once per start.
     pub const DEFAULT: KdfParams = KdfParams { m_kib: 64 * 1024, t: 3, p: 1 };
-    /// The smallest Argon2 allows. Only for tests, which would crawl otherwise.
+    /// The weakest settings a passphrase is locked with (OWASP's floor for Argon2id).
+    pub const MIN: KdfParams = KdfParams { m_kib: 19 * 1024, t: 2, p: 1 };
+    /// The most a `key.json` may ask for, so a crafted one can't make opening
+    /// use gigabytes of memory or run for hours.
+    pub const MAX: KdfParams = KdfParams { m_kib: 1024 * 1024, t: 16, p: 8 };
+    /// The smallest Argon2 allows. Only for tests, which would crawl otherwise;
+    /// release builds don't have it.
+    #[cfg(any(test, feature = "insecure-test-kdf"))]
     pub const FAST_INSECURE: KdfParams = KdfParams { m_kib: 8, t: 1, p: 1 };
+
+    /// Whether each setting is between [`KdfParams::MIN`] and [`KdfParams::MAX`].
+    pub fn within_limits(self) -> bool {
+        let (min, max) = (KdfParams::MIN, KdfParams::MAX);
+        (min.m_kib..=max.m_kib).contains(&self.m_kib)
+            && (min.t..=max.t).contains(&self.t)
+            && (min.p..=max.p).contains(&self.p)
+    }
+
+    /// Whether a passphrase may be locked or unlocked with these settings.
+    pub(crate) fn usable(self) -> bool {
+        #[cfg(any(test, feature = "insecure-test-kdf"))]
+        if self == KdfParams::FAST_INSECURE {
+            return true;
+        }
+        self.within_limits()
+    }
 }
 
 /// Stretches a passphrase into a 32-byte key. `None` if `params` are outside
@@ -41,8 +65,10 @@ pub(crate) fn passphrase_key(passphrase: &str, salt: &[u8], params: KdfParams) -
     let params = Params::new(params.m_kib, params.t, params.p, Some(32)).ok()?;
     let normalized = Zeroizing::new(passphrase.nfc().collect::<String>());
     let mut key = Zeroizing::new([0u8; 32]);
+    // Argon2's working memory holds what the key is made from: ours, so it's wiped.
+    let mut memory = Zeroizing::new(vec![Block::default(); params.block_count()]);
     Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
-        .hash_password_into(normalized.as_bytes(), salt, key.as_mut())
+        .hash_password_into_with_memory(normalized.as_bytes(), salt, key.as_mut(), memory.as_mut_slice())
         .ok()?;
     Some(key)
 }
@@ -132,6 +158,30 @@ mod tests {
     #[test]
     fn impossible_kdf_params_are_refused_not_a_panic() {
         assert!(passphrase_key("x", &[1; 16], KdfParams { m_kib: 0, t: 0, p: 0 }).is_none());
+    }
+
+    #[test]
+    fn ciphers_and_argon2_memory_wipe_themselves() {
+        fn wiped_on_drop<T: zeroize::ZeroizeOnDrop>() {}
+        fn wipeable<T: zeroize::Zeroize>() {}
+        wiped_on_drop::<XChaCha20Poly1305>();
+        wipeable::<argon2::Block>();
+    }
+
+    #[test]
+    fn the_default_settings_are_within_limits_and_the_test_ones_are_not() {
+        assert!(KdfParams::DEFAULT.within_limits());
+        assert!(KdfParams::MIN.within_limits() && KdfParams::MAX.within_limits());
+        assert!(!KdfParams::FAST_INSECURE.within_limits());
+        for over in [
+            KdfParams { m_kib: KdfParams::MAX.m_kib + 1, ..KdfParams::DEFAULT },
+            KdfParams { t: KdfParams::MAX.t + 1, ..KdfParams::DEFAULT },
+            KdfParams { p: KdfParams::MAX.p + 1, ..KdfParams::DEFAULT },
+            KdfParams { m_kib: KdfParams::MIN.m_kib - 1, ..KdfParams::DEFAULT },
+            KdfParams { t: KdfParams::MIN.t - 1, ..KdfParams::DEFAULT },
+        ] {
+            assert!(!over.within_limits(), "{over:?}");
+        }
     }
 
     #[test]

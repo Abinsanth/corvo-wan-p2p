@@ -36,6 +36,14 @@ jobs:
             echo "corvo-wan-p2p-core depends on ratatui or crossterm; only the binary may"
             exit 1
           fi
+      # The weak passphrase settings are for tests; the app itself must never have them.
+      - name: The app doesn't have the test-only passphrase settings
+        run: |
+          tree=$(cargo tree --locked -p corvo-wan-p2p -e normal,features)
+          if grep insecure-test-kdf <<< "$tree"; then
+            echo "corvo-wan-p2p builds with insecure-test-kdf; only tests may"
+            exit 1
+          fi
 
   # Linux clippy never sees cfg(windows) code.
   clippy-windows:

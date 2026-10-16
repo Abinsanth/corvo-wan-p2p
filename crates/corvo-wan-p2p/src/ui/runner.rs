@@ -580,6 +580,36 @@ mod tests {
         app.state.chats.get(&with).map(|c| c.messages.iter().map(|m| m.mark).collect()).unwrap_or_default()
     }
 
+    /// What the app logs says who and what happened, never what was said or
+    /// who people are. (Logging at its most detailed here.)
+    #[tokio::test]
+    async fn the_log_holds_no_message_text_names_or_codes() {
+        let log = crate::logging::start_for_tests();
+        let lookup = MemoryLookup::new();
+        let (zorba_data, quixote_data, home) =
+            (TempDir::new().unwrap(), TempDir::new().unwrap(), TempDir::new().unwrap());
+        let mut zorba = App::person(&zorba_data, &home, &lookup, "zorba").await;
+        let mut quixote = App::person(&quixote_data, &home, &lookup, "quixote").await;
+        let (zorba_code, quixote_code) = (zorba.code(), quixote.code());
+        zorba.send(&format!("/add {quixote_code}")).await;
+        zorba.send("marker-7f3a is the secret").await;
+        quixote.until("zorba's message", |s| s.chats.get(&zorba_code).is_some_and(|c| !c.messages.is_empty())).await;
+        quixote.send("/chat zorba").await;
+        quixote.send("/accept").await;
+        quixote.send("marker-7f3a back").await;
+        zorba.until("the reply", |s| s.chats[&quixote_code].messages.len() == 2).await;
+        let text = std::fs::read_to_string(log).unwrap();
+        assert!(text.contains("link up"), "something was logged:\n{text}");
+        for secret in ["marker-7f3a", "zorba", "quixote", &zorba_code.to_string(), &quixote_code.to_string()] {
+            assert!(!text.contains(secret), "the log holds {secret:?}:\n{text}");
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(log).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+    }
+
     #[tokio::test]
     async fn two_people_chat_with_marks_unread_and_presence() {
         let lookup = MemoryLookup::new();

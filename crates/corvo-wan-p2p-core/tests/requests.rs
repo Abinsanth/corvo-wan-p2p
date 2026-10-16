@@ -6,7 +6,7 @@ mod common;
 use std::time::Duration;
 
 use common::{Fake, Peer, eventually, frames_until_quiet, friends, is_cut_off, next_frame, next_frames, say};
-use corvo_wan_p2p_core::chat::{ChatError, Event, MAX_GUESTS, MAX_REQUEST_MESSAGES, MAX_REQUESTS, WINDOW};
+use corvo_wan_p2p_core::chat::{ChatError, Config, Event, MAX_GUESTS, MAX_REQUEST_MESSAGES, MAX_REQUESTS, WINDOW};
 use corvo_wan_p2p_core::identity::Seed;
 use corvo_wan_p2p_core::proto::{Frame, PROTO_VERSION, write_frame};
 use corvo_wan_p2p_core::store::{Mark, Standing};
@@ -387,4 +387,78 @@ async fn a_turned_down_link_delivers_nothing() {
     .await;
     assert!(a.client.history(cc).await.unwrap().is_empty());
     assert!(a.client.people().await.unwrap().iter().all(|p| p.code == cc));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn idle_guests_are_dropped_to_make_room() {
+    let lookup = MemoryLookup::new();
+    let config = Config { guest_idle: Duration::from_secs(1), ..common::FAST };
+    let a = Peer::start_with_config(&lookup, "abin", config).await;
+    let mut guests = Vec::new();
+    for _ in 0..MAX_GUESTS {
+        let fake = Fake::new(&lookup).await;
+        let streams = fake.hello(a.code, PROTO_VERSION).await.expect("room for this guest");
+        guests.push((fake, streams));
+    }
+    let extra = Fake::new(&lookup).await;
+    assert!(extra.hello(a.code, PROTO_VERSION).await.is_none(), "full at first");
+    // None of them says a thing, so after a second they're let go.
+    let (_, (_, recv, _)) = guests.last_mut().unwrap();
+    assert!(is_cut_off(recv).await, "an idle guest was dropped");
+    let mut got_in = false;
+    for _ in 0..30 {
+        if extra.hello(a.code, PROTO_VERSION).await.is_some() {
+            got_in = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(got_in);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_guest_made_mid_handshake_needs_room_too() {
+    let lookup = MemoryLookup::new();
+    let a = Peer::start(&lookup, "abin").await;
+    let friend = Fake::new(&lookup).await;
+    a.client.add_contact(friend.code).await.unwrap();
+    // Connected as a contact, but not said hello yet.
+    let conn = friend.connect(a.code).await.unwrap();
+    let mut guests = Vec::new();
+    for _ in 0..MAX_GUESTS {
+        let fake = Fake::new(&lookup).await;
+        guests.push((fake.hello(a.code, PROTO_VERSION).await.expect("room"), fake));
+    }
+    a.client.remove(friend.code, false).await.unwrap();
+    // Now a stranger, with every guest slot taken.
+    assert!(friend.hello_on(&conn, PROTO_VERSION).await.is_none(), "got in past the guest limit");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn removing_a_full_request_lets_its_unacked_messages_make_a_new_one() {
+    let lookup = MemoryLookup::new();
+    let mut a = Peer::start(&lookup, "abin").await;
+    let fake = Fake::new(&lookup).await;
+    let (mut send, mut recv, _) = fake.hello(a.code, PROTO_VERSION).await.unwrap();
+    for i in 0..MAX_REQUEST_MESSAGES + 5 {
+        say(&mut send, &format!("m{i:02}"), "hi").await;
+    }
+    for _ in 0..MAX_REQUEST_MESSAGES {
+        next_frame(&mut recv, |f| matches!(f, Frame::Ack { .. })).await;
+    }
+    a.client.remove(fake.code, false).await.unwrap();
+    a.skip_pending().await;
+    // Their app sends the 5 it never got acks for.
+    let (mut send, mut recv, _) = fake.hello(a.code, PROTO_VERSION).await.unwrap();
+    for i in MAX_REQUEST_MESSAGES..MAX_REQUEST_MESSAGES + 5 {
+        say(&mut send, &format!("m{i:02}"), "hi").await;
+    }
+    for _ in 0..5 {
+        next_frame(&mut recv, |f| matches!(f, Frame::Ack { .. })).await;
+    }
+    let fc = fake.code;
+    a.expect(|e| matches!(e, Event::Request { from, .. } if *from == fc)).await;
+    let people = a.client.people().await.unwrap();
+    assert_eq!(people.iter().map(|p| (p.code, p.standing)).collect::<Vec<_>>(), [(fc, Standing::Request)]);
+    assert_eq!(a.client.history(fc).await.unwrap().len(), MAX_REQUEST_MESSAGES + 5);
 }

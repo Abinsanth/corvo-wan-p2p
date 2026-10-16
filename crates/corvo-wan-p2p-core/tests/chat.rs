@@ -5,7 +5,7 @@ mod common;
 use std::time::Duration;
 
 use common::{Fake, Peer, eventually, friends, is_cut_off, next_frame, say};
-use corvo_wan_p2p_core::chat::{ChatError, Event};
+use corvo_wan_p2p_core::chat::{ChatError, Config, Event};
 use corvo_wan_p2p_core::identity::Seed;
 use corvo_wan_p2p_core::proto::{Frame, MAX_FRAME, MAX_TEXT, PROTO_VERSION, write_frame};
 use corvo_wan_p2p_core::store::Mark;
@@ -285,4 +285,66 @@ async fn bad_requests_are_refused() {
     assert!(matches!(a.client.send(stranger, &"\u{1}".repeat(MAX_TEXT)).await, Err(ChatError::TooLong)));
     a.client.send(stranger, &"a".repeat(MAX_TEXT)).await.unwrap();
     assert!(a.client.set_name("").await.is_err());
+}
+
+/// The gaps between the first few dials of a contact whose app answers wrongly.
+async fn dial_gaps(fake: &Fake, times: &std::sync::Mutex<Vec<tokio::time::Instant>>, n: usize) -> Vec<Duration> {
+    eventually(async || times.lock().unwrap().len() > n).await;
+    let times = times.lock().unwrap();
+    let _ = fake;
+    times.windows(2).take(n).map(|w| w[1] - w[0]).collect()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn retries_start_at_the_first_wait_and_double() {
+    let lookup = MemoryLookup::new();
+    let fake = Fake::new(&lookup).await;
+    let times = fake.answer_with_times(Frame::Ack { id: "not a hello".into() });
+    let a = Peer::start(&lookup, "abin").await;
+    a.client.add_contact(fake.code).await.unwrap();
+    // retry_first is 200 ms here, retry_max 1 s.
+    let gaps = dial_gaps(&fake, &times, 2).await;
+    assert!(gaps[0] < Duration::from_millis(350), "first retry after {:?}", gaps[0]);
+    assert!((Duration::from_millis(350)..Duration::from_millis(700)).contains(&gaps[1]), "second after {:?}", gaps[1]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_contact_that_hangs_up_at_once_is_retried_less_and_less() {
+    let lookup = MemoryLookup::new();
+    let fake = Fake::new(&lookup).await;
+    let times = fake.answer_and_hang_up(fake.hello_frame(PROTO_VERSION));
+    let config = Config { retry_max: Duration::from_secs(5), ..common::FAST };
+    let a = Peer::start_with_config(&lookup, "abin", config).await;
+    a.client.add_contact(fake.code).await.unwrap();
+    // Waits of 200, 400 and 800 ms on top of each round's own time, so the
+    // gaps grow; going offline every time would keep them the same.
+    let gaps = dial_gaps(&fake, &times, 3).await;
+    eprintln!("hang-up gaps: {gaps:?}");
+    assert!(gaps[2] > gaps[0] + Duration::from_millis(300), "gaps {gaps:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_endpoint_with_another_key_is_refused() {
+    let lookup = MemoryLookup::new();
+    let dir = tempfile::tempdir().unwrap();
+    let store = corvo_wan_p2p_core::store::Store::create(
+        dir.path(),
+        "pass",
+        corvo_wan_p2p_core::store::KdfParams::FAST_INSECURE,
+        &Seed::generate(),
+        "abin",
+    )
+    .unwrap();
+    let endpoint = corvo_wan_p2p_core::net::local_endpoint(Seed::generate().secret_key(), lookup).await.unwrap();
+    let started = corvo_wan_p2p_core::chat::Client::start(store, endpoint, common::FAST);
+    assert!(matches!(started, Err(ChatError::WrongKey)));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_network_is_said_offline_only_after_a_moment_to_connect() {
+    let lookup = MemoryLookup::new();
+    // No relays here, so it never connects; `connecting` is 300 ms.
+    let mut a = Peer::start(&lookup, "abin").await;
+    a.expect_none(Duration::from_millis(150), |e| matches!(e, Event::Network { .. })).await;
+    a.expect(|e| *e == Event::Network { online: false }).await;
 }

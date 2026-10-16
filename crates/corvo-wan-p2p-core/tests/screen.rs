@@ -87,6 +87,26 @@ async fn a_request_can_only_rename_itself_so_often() {
     assert_eq!(a.client.people().await.unwrap()[0].name, format!("x{MAX_REQUEST_RENAMES}"));
 }
 
+/// Apps from before 0.1.0-rc.1 sent their name after their messages, so a
+/// request's first name came as a "change" from no name at all.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_request_naming_itself_after_its_first_message_is_not_a_rename() {
+    let lookup = MemoryLookup::new();
+    let mut a = Peer::start(&lookup, "abin").await;
+    let fake = Fake::new(&lookup).await;
+    let (mut send, _recv, _) = fake.hello(a.code, PROTO_VERSION).await.unwrap();
+    say(&mut send, "m1", "hi").await;
+    let fc = fake.code;
+    a.expect(|e| *e == Event::Request { from: fc, name: String::new() }).await;
+    for i in 0..=MAX_REQUEST_RENAMES {
+        write_frame(&mut send, &Frame::Name { name: format!("x{i}") }).await.unwrap();
+    }
+    for i in 0..=MAX_REQUEST_RENAMES {
+        let want = Event::Name { of: fc, name: format!("x{i}") };
+        a.expect(|e| *e == want).await;
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_contact_can_rename_as_often_as_they_like() {
     let lookup = MemoryLookup::new();

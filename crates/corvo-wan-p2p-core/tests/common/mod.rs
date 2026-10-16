@@ -24,6 +24,9 @@ pub const FAST: Config = Config {
     handshake_timeout: Duration::from_secs(5),
     retry_first: Duration::from_millis(200),
     retry_max: Duration::from_secs(1),
+    stable_link: Duration::from_secs(1),
+    guest_idle: Duration::from_secs(10),
+    connecting: Duration::from_millis(300),
     kdf: KdfParams::FAST_INSECURE,
 };
 
@@ -57,6 +60,13 @@ impl Peer {
         let (dir, seed) = (tempfile::tempdir().unwrap(), Seed::generate());
         Store::create(dir.path(), "pass", KdfParams::DEFAULT, &seed, name).unwrap();
         Peer::open_with(lookup, dir, seed, Config { kdf: KdfParams::DEFAULT, ..FAST }).await
+    }
+
+    /// A new account whose engine runs with `config`.
+    pub async fn start_with_config(lookup: &MemoryLookup, name: &str, config: Config) -> Peer {
+        let (dir, seed) = (tempfile::tempdir().unwrap(), Seed::generate());
+        Store::create(dir.path(), "pass", KdfParams::FAST_INSECURE, &seed, name).unwrap();
+        Peer::open_with(lookup, dir, seed, config).await
     }
 
     async fn open(lookup: &MemoryLookup, dir: TempDir, seed: Seed) -> Peer {
@@ -164,6 +174,26 @@ impl Fake {
 
     /// Like [`Fake::hello`], but sends `then` straight after the hello,
     /// without waiting for the app's answer.
+    /// Only connects, saying nothing yet (see [`Fake::hello_on`]).
+    pub async fn connect(&self, to: Code) -> Option<iroh::endpoint::Connection> {
+        tokio::time::timeout(PATIENCE, self.endpoint.connect(to.key(), ALPN)).await.ok()?.ok()
+    }
+
+    /// Says hello on a connection from [`Fake::connect`].
+    pub async fn hello_on(
+        &self,
+        conn: &iroh::endpoint::Connection,
+        proto: u32,
+    ) -> Option<(SendStream, RecvStream, Frame)> {
+        let exchange = async {
+            let (mut send, mut recv) = conn.open_bi().await.ok()?;
+            write_frame(&mut send, &self.hello_frame(proto)).await.ok()?;
+            let theirs = read_frame(&mut recv).await.ok()?;
+            Some((send, recv, theirs))
+        };
+        tokio::time::timeout(PATIENCE, exchange).await.expect("the exchange took too long")
+    }
+
     pub async fn hello_with(&self, to: Code, proto: u32, then: &[Frame]) -> Option<(SendStream, RecvStream, Frame)> {
         let exchange = async {
             let conn = self.endpoint.connect(to.key(), ALPN).await.ok()?;
@@ -223,17 +253,13 @@ impl Fake {
         times
     }
 
-    /// Answers every connection with `reply`, then hangs up at once (code 0).
-    pub fn answer_and_hang_up(&self, reply: Frame) -> Arc<AtomicUsize> {
-        let count = Arc::new(AtomicUsize::new(0));
-        let counter = count.clone();
-        self.answer(
-            move |_| {
-                counter.fetch_add(1, Ordering::SeqCst);
-            },
-            Answer::ReplyThenClose(reply),
-        );
-        count
+    /// Answers every connection with `reply`, then hangs up a moment later (code 0).
+    /// Notes when each connection came.
+    pub fn answer_and_hang_up(&self, reply: Frame) -> Arc<Mutex<Vec<tokio::time::Instant>>> {
+        let times = Arc::new(Mutex::new(Vec::new()));
+        let noted = times.clone();
+        self.answer(move |at| noted.lock().unwrap().push(at), Answer::ReplyThenClose(reply));
+        times
     }
 
     /// Reads each hello and closes the connection with `code` and `reason`,
@@ -259,6 +285,8 @@ impl Fake {
                         }
                         Answer::ReplyThenClose(reply) => {
                             let _ = write_frame(&mut send, &reply).await;
+                            // Long enough for the link to come up first.
+                            tokio::time::sleep(Duration::from_millis(100)).await;
                             conn.close(VarInt::from_u32(0), b"bye");
                         }
                         Answer::Close(code, reason) => conn.close(VarInt::from_u32(code), reason),

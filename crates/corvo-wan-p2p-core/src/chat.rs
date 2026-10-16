@@ -44,7 +44,9 @@ pub const MAX_REQUEST_RENAMES: usize = 5;
 /// The most messages sent to one peer and not yet acked; the rest wait their turn.
 pub const WINDOW: usize = 32;
 /// Frames waiting to be written to one peer. A peer that lets this fill isn't
-/// reading what we send, and is cut off.
+/// reading what we send, and is cut off. In bytes it's bounded too: at most
+/// [`WINDOW`] of them are messages (each under [`MAX_FRAME`]), and the rest
+/// are small (acks, read receipts, names), so about 2 MiB per peer at worst.
 pub(crate) const OUT_QUEUE: usize = 128;
 /// Frames and news from all connections waiting for the core.
 const INTERNAL_QUEUE: usize = 64;
@@ -62,6 +64,8 @@ mod close {
     pub const DUPLICATE: u32 = 6;
     /// They weren't reading what we sent.
     pub const FLOOD: u32 = 7;
+    /// A guest that said nothing for too long.
+    pub const IDLE: u32 = 8;
 }
 
 /// Timings and passphrase settings. [`Config::DEFAULT`] is what the app uses;
@@ -76,6 +80,15 @@ pub struct Config {
     pub retry_first: Duration,
     /// …up to this.
     pub retry_max: Duration,
+    /// How long a link must have lasted for its end to count as going offline
+    /// rather than as a failed attempt (which backs off further).
+    pub stable_link: Duration,
+    /// How long a guest (someone who isn't a contact) may stay connected
+    /// without sending anything.
+    pub guest_idle: Duration,
+    /// How long, at start, the relay gets to answer before the network is
+    /// said to be offline.
+    pub connecting: Duration,
     /// How a new passphrase is stretched (`/passphrase`).
     pub kdf: KdfParams,
 }
@@ -86,6 +99,9 @@ impl Config {
         handshake_timeout: Duration::from_secs(10),
         retry_first: Duration::from_secs(5),
         retry_max: Duration::from_secs(300),
+        stable_link: Duration::from_secs(30),
+        guest_idle: Duration::from_secs(60),
+        connecting: Duration::from_secs(10),
         kdf: KdfParams::DEFAULT,
     };
 }
@@ -144,6 +160,8 @@ pub enum ChatError {
     WrongPassphrase,
     #[error("the chat engine has stopped")]
     Stopped,
+    #[error("the network key doesn't belong to this account")]
+    WrongKey,
 }
 
 type Reply<T> = oneshot::Sender<Result<T, ChatError>>;
@@ -225,6 +243,9 @@ impl Client {
     pub fn start(store: Store, endpoint: Endpoint, config: Config) -> Result<Client, ChatError> {
         let profile = store.profile()?;
         let me = profile.seed.code();
+        if endpoint.id() != me.key() {
+            return Err(ChatError::WrongKey);
+        }
         let (commands, commands_rx) = mpsc::unbounded_channel();
         let (events_tx, events) = mpsc::unbounded_channel();
         let (internal, internal_rx) = mpsc::channel(INTERNAL_QUEUE);
@@ -374,6 +395,9 @@ struct Link {
     heard_name: Option<String>,
     /// Their app's run, from its hello (0 from apps before sessions).
     session: u64,
+    /// When the link came up, and when they last sent anything.
+    opened: Instant,
+    heard: Instant,
 }
 
 impl Link {
@@ -393,7 +417,8 @@ impl Link {
 
 struct Retry {
     at: Instant,
-    delay: Duration,
+    /// Attempts that failed since the last link that lasted.
+    failures: u32,
 }
 
 struct Core {
@@ -429,7 +454,8 @@ struct Core {
 impl Core {
     async fn run(mut self, mut commands: mpsc::UnboundedReceiver<Command>, mut internal: mpsc::Receiver<Internal>) {
         let accept = tokio::spawn(accept_loop(self.endpoint.clone(), self.internal.clone()));
-        let network = tokio::spawn(watch_network(self.endpoint.clone(), self.internal.clone()));
+        let watcher = self.endpoint.home_relay_status();
+        let network = tokio::spawn(watch_network(watcher, self.internal.clone(), self.config.connecting));
         match self.store.contacts() {
             Ok(contacts) => {
                 for contact in contacts {
@@ -438,6 +464,8 @@ impl Core {
             }
             Err(e) => self.problem(e),
         }
+        let mut sweep = tokio::time::interval((self.config.guest_idle / 4).max(Duration::from_millis(50)));
+        sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             let due = self.next_dial();
             tokio::select! {
@@ -447,6 +475,7 @@ impl Core {
                 },
                 Some(message) = internal.recv() => self.internal(message),
                 _ = sleep_until(due) => self.dial_due(),
+                _ = sweep.tick() => self.sweep_guests(),
             }
         }
         accept.abort();
@@ -664,8 +693,18 @@ impl Core {
         match message {
             Internal::Incoming(conn) => self.incoming(conn),
             Internal::Ready { peer, id, conn, role, hello, out, verdict } => {
-                let link =
-                    Link { id, out, conn, initiator: peer, in_flight: HashSet::new(), heard_name: None, session: 0 };
+                let now = Instant::now();
+                let link = Link {
+                    id,
+                    out,
+                    conn,
+                    initiator: peer,
+                    in_flight: HashSet::new(),
+                    heard_name: None,
+                    session: 0,
+                    opened: now,
+                    heard: now,
+                };
                 self.ready(peer, role, hello, link, verdict);
             }
             Internal::Frame { peer, frame } => self.frame(peer, frame),
@@ -798,6 +837,17 @@ impl Core {
             return;
         }
         self.mismatched.remove(&peer);
+        // A contact removed while saying hello is a guest now, and needs room like any.
+        if !contact && !self.guests.contains(&link.id) {
+            match self.room_for_guest(standing.is_none()) {
+                Ok(true) => {}
+                Ok(false) => return refuse(self, link, close::REFUSED),
+                Err(e) => {
+                    refuse(self, link, close::ERROR);
+                    return self.problem(e);
+                }
+            }
+        }
         link.session = session;
         link.initiator = if role == Role::Dialer { self.me } else { peer };
         let was_online = if let Some(existing) = self.links.get(&peer) {
@@ -825,7 +875,6 @@ impl Core {
         }
         self.guests.remove(&link.id);
         self.links.insert(peer, link);
-        self.retry.remove(&peer);
         if !was_online {
             self.emit(Event::Online(peer));
         }
@@ -851,9 +900,8 @@ impl Core {
         // From a connection dropped since (blocked or removed): ignore. Frames
         // from a connection being replaced still count, since every frame is
         // safe to receive twice and dropping one could strand a message.
-        if !self.links.contains_key(&peer) {
-            return;
-        }
+        let Some(link) = self.links.get_mut(&peer) else { return };
+        link.heard = Instant::now();
         let result = self.store.standing(&peer).and_then(|standing| match frame {
             Frame::Msg { id, sent_at, text } => self.message(peer, standing, id, sent_at, text),
             Frame::Ack { id } => {
@@ -934,8 +982,11 @@ impl Core {
             }
             Some(Standing::Blocked) => {}
             Some(standing @ (Standing::Contact | Standing::Request)) => {
-                if self.store.person(&peer)?.is_some_and(|p| p.name != name) {
-                    if standing == Standing::Request {
+                let Some(before) = self.store.person(&peer)?.map(|p| p.name) else { return Ok(()) };
+                if before != name {
+                    // A request's first name isn't a change: apps before
+                    // 0.1.0-rc.1 sent it after their first message.
+                    if standing == Standing::Request && !before.is_empty() {
                         let renames = self.renames.entry(peer).or_default();
                         if *renames >= MAX_REQUEST_RENAMES {
                             return Ok(());
@@ -955,7 +1006,8 @@ impl Core {
         if !self.links.get(&peer).is_some_and(|l| l.id == id) {
             return; // a connection we had already replaced or dropped
         }
-        self.links.remove(&peer);
+        let Some(link) = self.links.remove(&peer) else { return };
+        let lasted = link.opened.elapsed() >= self.config.stable_link;
         match self.store.is_contact(&peer) {
             Ok(true) => {}
             Ok(false) => return, // guests and requests are never dialed back
@@ -967,7 +1019,21 @@ impl Core {
         } else {
             self.went_offline(peer);
         }
-        self.retry_in(peer, self.config.retry_first);
+        if lasted {
+            self.retry.insert(peer, Retry { at: Instant::now() + self.config.retry_first, failures: 0 });
+        } else {
+            // Up and straight down again: as good as a failed attempt.
+            self.after_failure(peer, None);
+        }
+    }
+
+    /// Closes guest links that have said nothing for [`Config::guest_idle`],
+    /// so strangers who stay silent can't hold every guest slot.
+    fn sweep_guests(&mut self) {
+        let idle = self.config.guest_idle;
+        for link in self.links.values().filter(|l| self.guests.contains(&l.id) && l.heard.elapsed() >= idle) {
+            link.conn.close(close::IDLE.into(), b"idle");
+        }
     }
 
     /// A contact's app speaks protocol `theirs`: said once, and again only if it changes.
@@ -985,12 +1051,23 @@ impl Core {
     }
 
     fn retry_in(&mut self, peer: Code, delay: Duration) {
-        self.retry.insert(peer, Retry { at: Instant::now() + delay, delay: delay.max(self.config.retry_first) });
+        let failures = self.retry.get(&peer).map_or(0, |r| r.failures);
+        self.retry.insert(peer, Retry { at: Instant::now() + delay, failures });
+    }
+
+    /// Tries again after `wait`, or else after the first wait doubled once
+    /// for every failure since the last link that lasted.
+    fn after_failure(&mut self, peer: Code, wait: Option<Duration>) {
+        let failures = self.retry.get(&peer).map_or(0, |r| r.failures);
+        let doubled = self.config.retry_first.saturating_mul(1 << failures.min(20));
+        let delay = wait.unwrap_or(doubled).min(self.config.retry_max);
+        self.retry.insert(peer, Retry { at: Instant::now() + delay, failures: failures.saturating_add(1) });
     }
 
     /// Reaching a contact didn't work out: try again after `wait`, or else
-    /// twice as long as last time. Nothing to do while another connection to
-    /// them is up, or if they aren't a contact (any more).
+    /// after a wait that doubles with each failure (see `after_failure`).
+    /// Nothing to do while another connection to them is up, or if they
+    /// aren't a contact (any more).
     fn back_off(&mut self, peer: Code, wait: Option<Duration>) {
         if self.links.contains_key(&peer) {
             return;
@@ -1003,8 +1080,7 @@ impl Core {
         if self.quiet.remove(&peer) {
             self.went_offline(peer);
         }
-        let doubled = self.retry.get(&peer).map_or(self.config.retry_first, |r| r.delay * 2);
-        self.retry_in(peer, wait.unwrap_or(doubled).min(self.config.retry_max));
+        self.after_failure(peer, wait);
     }
 
     fn next_dial(&self) -> Option<Instant> {
@@ -1066,19 +1142,38 @@ async fn accept_loop(endpoint: Endpoint, internal: mpsc::Sender<Internal>) {
     }
 }
 
-/// Tells the core whether the endpoint is connected to a relay: now, and on
-/// every change. Without one, only peers on the same network can be reached.
-async fn watch_network(endpoint: Endpoint, internal: mpsc::Sender<Internal>) {
-    let mut watcher = endpoint.home_relay_status();
+/// Tells the core whether the endpoint is connected to a relay: once it is,
+/// or `connecting` has passed at start, and then on every change. Without
+/// one, only peers on the same network can be reached. Ends with the core.
+async fn watch_network(
+    mut watcher: impl Watcher<Value = Vec<RelayStatus>>,
+    internal: mpsc::Sender<Internal>,
+    connecting: Duration,
+) {
+    let online = |relays: &[RelayStatus]| relays.iter().any(RelayStatus::is_connected);
     let mut relays = watcher.get();
+    // At start the relay hasn't had a chance to answer: "offline" would be wrong.
+    let deadline = Instant::now() + connecting;
+    while !online(&relays) {
+        tokio::select! {
+            changed = tokio::time::timeout_at(deadline, watcher.updated()) => match changed {
+                Ok(Ok(now)) => relays = now,
+                Ok(Err(_)) => return,
+                Err(_) => break,
+            },
+            _ = internal.closed() => return,
+        }
+    }
     loop {
-        let online = relays.iter().any(RelayStatus::is_connected);
-        if internal.send(Internal::Network(online)).await.is_err() {
+        if internal.send(Internal::Network(online(&relays))).await.is_err() {
             return;
         }
-        match watcher.updated().await {
-            Ok(now) => relays = now,
-            Err(_) => return, // the endpoint is gone
+        tokio::select! {
+            changed = watcher.updated() => match changed {
+                Ok(now) => relays = now,
+                Err(_) => return,
+            },
+            _ = internal.closed() => return,
         }
     }
 }
@@ -1118,14 +1213,25 @@ mod tests {
     use super::*;
     use crate::identity::Seed;
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_network_watcher_ends_when_the_core_stops() {
+        let lookup = iroh::address_lookup::MemoryLookup::new();
+        let endpoint = crate::net::local_endpoint(Seed::generate().secret_key(), lookup).await.unwrap();
+        let (tx, mut rx) = mpsc::channel(4);
+        let watcher = tokio::spawn(watch_network(endpoint.home_relay_status(), tx, Duration::from_millis(10)));
+        assert!(matches!(rx.recv().await, Some(Internal::Network(false))));
+        drop(rx);
+        tokio::time::timeout(Duration::from_secs(1), watcher).await.expect("it ended").unwrap();
+    }
+
     #[test]
     fn connected_or_dialing_peers_are_never_due() {
         let now = Instant::now();
         let (linked, dialing, waiting) = (Seed::generate().code(), Seed::generate().code(), Seed::generate().code());
         let mut retry = HashMap::new();
-        retry.insert(linked, Retry { at: now - Duration::from_secs(9), delay: Duration::from_secs(1) });
-        retry.insert(dialing, Retry { at: now - Duration::from_secs(8), delay: Duration::from_secs(1) });
-        retry.insert(waiting, Retry { at: now + Duration::from_secs(3), delay: Duration::from_secs(1) });
+        retry.insert(linked, Retry { at: now - Duration::from_secs(9), failures: 0 });
+        retry.insert(dialing, Retry { at: now - Duration::from_secs(8), failures: 0 });
+        retry.insert(waiting, Retry { at: now + Duration::from_secs(3), failures: 0 });
         let busy = |peer: &Code| *peer == linked || *peer == dialing;
         assert_eq!(next_due(&retry, busy), Some(now + Duration::from_secs(3)));
         assert_eq!(next_due(&retry, |_| true), None);

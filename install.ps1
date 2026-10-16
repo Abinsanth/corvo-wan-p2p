@@ -3,7 +3,8 @@
 #   irm https://raw.githubusercontent.com/Abinsanth/corvo-wan-p2p/release/install.ps1 | iex
 #
 # Installs the latest release to %LOCALAPPDATA%\Programs\corvo-wan-p2p, or to
-# $env:CORVO_WAN_P2P_INSTALL_DIR if set, and adds it to your user PATH. Set
+# $env:CORVO_WAN_P2P_INSTALL_DIR if set, and adds it to your user PATH unless
+# $env:CORVO_WAN_P2P_NO_MODIFY_PATH is set. Set
 # $env:CORVO_WAN_P2P_VERSION (like v0.1.0-rc.1) for a particular release,
 # pre-releases included. Never needs admin.
 
@@ -86,7 +87,13 @@ function Install-CorvoWanP2p {
     $key = Get-Item 'HKCU:\Environment'
     $userPath = $key.GetValue('Path', '', 'DoNotExpandEnvironmentNames')
     $entries = @($userPath -split ';' | ForEach-Object { $_.TrimEnd('\') })
-    if ($entries -notcontains $installDir.TrimEnd('\')) {
+    if ($entries -contains $installDir.TrimEnd('\')) {
+        Write-Output "run: $app"
+    } elseif ($env:CORVO_WAN_P2P_NO_MODIFY_PATH) {
+        Write-Output ''
+        Write-Output "$installDir isn't on your PATH. Add it to your user PATH (search Windows for"
+        Write-Output "'Edit environment variables for your account'), then open a new terminal."
+    } else {
         $newPath = if ($userPath) { "$userPath;$installDir" } else { $installDir }
         Set-ItemProperty -Path 'HKCU:\Environment' -Name Path -Value $newPath -Type ExpandString
         # Set-ItemProperty doesn't tell Explorer the environment changed; these calls do, so new terminals see PATH.
@@ -95,8 +102,6 @@ function Install-CorvoWanP2p {
         $env:Path = "$env:Path;$installDir"
         Write-Output ''
         Write-Output "added $installDir to your PATH. Open a new terminal, then run: $app"
-    } else {
-        Write-Output "run: $app"
     }
 }
 

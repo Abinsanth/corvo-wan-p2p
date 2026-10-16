@@ -171,6 +171,8 @@ pub enum Outcome {
     },
     /// The version now installed.
     Updated(Result<String, String>),
+    /// `/update` after an update: this version is installed and waits for a restart.
+    UpdatedAlready(String),
     /// Something that leaves the app unusable, like the engine not starting.
     Fatal(String),
 }

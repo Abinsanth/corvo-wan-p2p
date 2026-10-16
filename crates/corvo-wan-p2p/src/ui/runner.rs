@@ -21,6 +21,7 @@ use super::people::Act;
 use super::state::{CHAT_LEN, Secret};
 use super::update::{Effect, Msg, Outcome};
 use crate::selfupdate::{self, Release, Urls};
+use semver::Version;
 
 /// For commands that need the engine, before it has started.
 const NOT_STARTED: &str = "the chat engine hasn't started";
@@ -47,12 +48,17 @@ pub enum Flow {
 /// Where `/update` looks, and what it found.
 struct Updates {
     urls: Urls,
-    /// The binary to replace; the running one when `None`.
-    target: Option<PathBuf>,
-    /// The asset to install; this system's when `None`.
-    asset: Option<String>,
+    /// The binary to replace: the running one, found at start (on Linux its
+    /// path reads as deleted once it's been replaced).
+    target: Result<PathBuf, String>,
+    /// The asset to install: this system's.
+    asset: Result<String, String>,
+    /// Run the new binary before the swap, to see it works here.
+    verify: bool,
     /// The release the last check found.
     found: Option<Release>,
+    /// The version installed since this app started, which a restart runs.
+    installed: Option<Version>,
 }
 
 pub struct Runner<W: Write> {
@@ -71,29 +77,44 @@ pub struct Runner<W: Write> {
 impl<W: Write> Runner<W> {
     /// `dir` is the data folder; `home` is where the recovery file goes.
     pub fn new(dir: PathBuf, home: Option<PathBuf>, config: Config, net: Net, out: W) -> Runner<W> {
-        let updates = Updates { urls: Urls::default(), target: None, asset: None, found: None };
+        let (os, arch) = (std::env::consts::OS, std::env::consts::ARCH);
+        let updates = Updates {
+            urls: Urls::default(),
+            target: selfupdate::running_exe().map_err(|e| format!("couldn't find the running app: {e}")),
+            asset: selfupdate::asset_name(os, arch).ok_or_else(|| selfupdate::no_build(os, arch)),
+            verify: true,
+            found: None,
+            installed: None,
+        };
         Runner { dir, home, config, net, out, store: None, client: None, updates }
     }
 
     /// Points `/update` at `urls`, installing `asset` over `target`.
     #[cfg(test)]
     fn with_updates(mut self, urls: Urls, asset: String, target: PathBuf) -> Self {
-        self.updates = Updates { urls, target: Some(target), asset: Some(asset), found: None };
+        let verify = selfupdate::testing::VERIFY;
+        self.updates = Updates { urls, target: Ok(target), asset: Ok(asset), verify, found: None, installed: None };
         self
     }
 
-    async fn install_update(&self, release: &Release) -> Result<(), String> {
-        let (os, arch) = (std::env::consts::OS, std::env::consts::ARCH);
-        let asset = match &self.updates.asset {
-            Some(asset) => asset.clone(),
-            None => selfupdate::asset_name(os, arch)
-                .ok_or_else(|| format!("no release build for {os}/{arch}; build from source"))?,
-        };
-        let target = match &self.updates.target {
-            Some(target) => target.clone(),
-            None => selfupdate::running_exe().map_err(|e| format!("couldn't find the running app: {e}"))?,
-        };
-        selfupdate::install_with(&self.updates.urls, release, &asset, &target).await
+    /// The newer version with a build for this system, if there is one.
+    async fn check_update(&mut self) -> Result<Option<String>, String> {
+        let target = self.updates.target.clone()?;
+        if selfupdate::is_built_from_source(&target) {
+            return Err(selfupdate::FROM_SOURCE.into());
+        }
+        let asset = self.updates.asset.clone()?;
+        let found = selfupdate::check_with(&self.updates.urls, &selfupdate::current(), &asset).await?;
+        let version = found.as_ref().map(|r| r.version.to_string());
+        self.updates.found = found;
+        Ok(version)
+    }
+
+    async fn install_update(&mut self, release: &Release) -> Result<(), String> {
+        let (target, asset) = (self.updates.target.clone()?, self.updates.asset.clone()?);
+        selfupdate::install_with(&self.updates.urls, release, &asset, &target, self.updates.verify).await?;
+        self.updates.installed = Some(release.version.clone());
+        Ok(())
     }
 
     /// Does `effect`. An error here is the terminal failing; everything else
@@ -176,15 +197,10 @@ impl<W: Write> Runner<W> {
                 Ok(client) => client.set_name(&name).await.map_err(|e| e.to_string()),
                 Err(e) => Err(e),
             }),
-            Effect::CheckUpdate { yes } => {
-                let found = selfupdate::check_with(&self.updates.urls, &selfupdate::current()).await;
-                let result = found.map(|found| {
-                    let version = found.as_ref().map(|r| r.version.to_string());
-                    self.updates.found = found;
-                    version
-                });
-                Outcome::UpdateChecked { yes, result }
-            }
+            Effect::CheckUpdate { yes } => match &self.updates.installed {
+                Some(version) => Outcome::UpdatedAlready(version.to_string()),
+                None => Outcome::UpdateChecked { yes, result: self.check_update().await },
+            },
             Effect::InstallUpdate => Outcome::Updated(match self.updates.found.take() {
                 Some(release) => self.install_update(&release).await.map(|()| release.version.to_string()),
                 None => Err("nothing to install: /update looks for a newer version first".into()),
@@ -298,10 +314,10 @@ impl<W: Write> Runner<W> {
                 self.copy(words.expose()).map_err(|e| format!("couldn't copy them: {e}"))?;
                 Ok(PhraseDone::Copied)
             }
-            PhraseUse::Save { overwrite: false } if let Some(path) = self.recovery_file() => {
-                Ok(PhraseDone::Exists(path))
-            }
-            PhraseUse::Save { overwrite } => self.write_recovery(&seed, overwrite).map(PhraseDone::Saved),
+            PhraseUse::Save { overwrite } => match self.recovery_file() {
+                Some(path) if !overwrite => Ok(PhraseDone::Exists(path)),
+                _ => self.write_recovery(&seed, overwrite).map(PhraseDone::Saved),
+            },
         }
     }
 }
@@ -731,7 +747,12 @@ mod tests {
         assert!(app.said().last().unwrap().starts_with("v9.0.0 is available"));
         app.send("y").await;
         assert_eq!(app.said().last().unwrap(), "updated to v9.0.0: /quit and start corvo-wan-p2p again to use it");
-        assert_eq!(std::fs::read_to_string(&target).unwrap(), "new");
+        assert_ne!(std::fs::read_to_string(&target).unwrap(), "old");
+        app.send("/update").await;
+        assert_eq!(
+            app.said().last().unwrap(),
+            "v9.0.0 is installed already: /quit and start corvo-wan-p2p again to use it"
+        );
         app.runner.shutdown().await;
     }
 }

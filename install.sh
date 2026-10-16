@@ -36,6 +36,9 @@ sha256() {
 main() {
     need curl
     need tar
+    if [ -z "${CORVO_WAN_P2P_INSTALL_DIR:-}" ] && [ -z "${HOME:-}" ]; then
+        fail "HOME isn't set: set it, or CORVO_WAN_P2P_INSTALL_DIR to the folder to install to"
+    fi
     install_dir="${CORVO_WAN_P2P_INSTALL_DIR:-$HOME/.local/bin}"
     version="${CORVO_WAN_P2P_VERSION:-}"
     if [ -n "$version" ]; then
@@ -89,7 +92,11 @@ main() {
 # script doesn't edit (fish and others).
 profile_file() {
     case "$(basename "${SHELL:-}")" in
-        zsh) echo "${ZDOTDIR:-$HOME}/.zshrc" ;;
+        zsh)
+            # ZDOTDIR is often set in ~/.zshenv, which only zsh reads: ask it.
+            zdotdir="$(zsh -c 'printf %s "${ZDOTDIR:-$HOME}"' 2> /dev/null)" || zdotdir=""
+            echo "${zdotdir:-${ZDOTDIR:-$HOME}}/.zshrc"
+            ;;
         bash)
             if [ "$(uname -s)" != Darwin ]; then
                 echo "$HOME/.bashrc"
@@ -109,7 +116,8 @@ profile_file() {
 }
 
 # Makes `corvo-wan-p2p` work in new terminals: adds the folder to PATH in the
-# shell's profile, once. Skipped with CORVO_WAN_P2P_NO_MODIFY_PATH=1.
+# shell's profile, once. Skipped with CORVO_WAN_P2P_NO_MODIFY_PATH=1. Says
+# exactly what to do by hand when it can't.
 add_to_path() {
     dir="$1"
     case ":$PATH:" in
@@ -118,24 +126,42 @@ add_to_path() {
             return
             ;;
     esac
-    line="export PATH=\"$dir:\$PATH\""
-    profile="$(profile_file)"
-    if [ -n "$profile" ] && [ -f "$profile" ] && grep -qF "$dir" "$profile"; then
+    # In single quotes, so the folder stays as it is whatever is in its name.
+    line="export PATH='$(printf '%s' "$dir" | sed "s/'/'\\\\''/g")':\"\$PATH\""
+    # What installers before 0.1.0 wrote.
+    old_line="export PATH=\"$dir:\$PATH\""
+    shell="$(basename "${SHELL:-}")"
+    profile=""
+    if [ -n "${HOME:-}" ]; then
+        profile="$(profile_file)"
+    fi
+    if [ -n "$profile" ] && [ -f "$profile" ] && { grep -qxF "$line" "$profile" || grep -qxF "$old_line" "$profile"; }; then
         echo "$dir is already in $profile: open a new terminal, then run: $APP"
         return
     fi
+    # A profile that can't be written gets the hint below, not the shell's error.
     if [ -z "${CORVO_WAN_P2P_NO_MODIFY_PATH:-}" ] && [ -n "$profile" ] &&
-        printf '\n# added by the %s installer\n%s\n' "$APP" "$line" >> "$profile" 2> /dev/null; then
+        { printf '\n# added by the %s installer\n%s\n' "$APP" "$line" >> "$profile"; } 2> /dev/null; then
         echo
         echo "added $dir to your PATH in $profile."
         echo "Open a new terminal (or run: . \"$profile\"), then run: $APP"
         return
     fi
     echo
-    echo "$dir isn't on your PATH. Add this line to your shell profile"
-    echo "(~/.zshrc or ~/.bashrc), then open a new terminal:"
-    echo
-    echo "    $line"
+    echo "$dir isn't on your PATH."
+    if [ "$shell" = fish ]; then
+        echo "Run this once in fish, then open a new terminal:"
+        echo
+        echo "    fish_add_path '$(printf '%s' "$dir" | sed "s/[\\\\']/\\\\&/g")'"
+    elif [ -n "$profile" ]; then
+        echo "Add this line to $profile, then open a new terminal:"
+        echo
+        echo "    $line"
+    else
+        echo "Add this line to your shell's profile, then open a new terminal:"
+        echo
+        echo "    $line"
+    fi
 }
 
 main "$@"

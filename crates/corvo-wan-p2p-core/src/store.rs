@@ -171,10 +171,11 @@ impl Store {
         let db_path = dir.join(DB_FILE);
         private_file().create(true).truncate(false).open(&db_path)?;
         let db = Connection::open(&db_path)?;
-        // WAL: a write is one append and, with NORMAL, no sync per commit (a
-        // power cut can lose the last moments, never corrupt the file).
         let not_ours = |e: StoreError| not_a_store(&db_path, e);
-        db.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA busy_timeout = 1000;")
+        // WAL: a commit is one append and one sync, not three. FULL keeps that
+        // sync, since a saved message is acked at once and key.json is written
+        // after the profile: a power cut mustn't take back either.
+        db.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL; PRAGMA busy_timeout = 1000;")
             .map_err(|e| not_ours(e.into()))?;
         let field_key = crypt::subkey(&data_key, FIELD_KEY_LABEL);
         let tag_key = crypt::subkey(&data_key, TAG_KEY_LABEL);
@@ -336,5 +337,23 @@ fn remove_if_present(path: &Path) -> Result<(), StoreError> {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e.into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A message is acked as soon as it's saved, and `key.json` is written
+    /// after the profile, so every commit must reach the disk first (FULL),
+    /// even in WAL mode.
+    #[test]
+    fn every_commit_is_synced() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::create(dir.path(), "pass", KdfParams::FAST_INSECURE, &Seed::generate(), "abin").unwrap();
+        let synchronous: i64 = store.db.pragma_query_value(None, "synchronous", |r| r.get(0)).unwrap();
+        assert_eq!(synchronous, 2, "FULL");
+        let mode: String = store.db.pragma_query_value(None, "journal_mode", |r| r.get(0)).unwrap();
+        assert_eq!(mode, "wal");
     }
 }

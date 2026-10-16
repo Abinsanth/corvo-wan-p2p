@@ -15,6 +15,8 @@ use super::update::{Effect, Outcome};
 
 pub struct Onboarding {
     step: Step,
+    /// A new or recovered account was made (not just unlocked).
+    made: bool,
     /// What happened since the last answer: mistakes, and what was done.
     pub notes: Vec<Line>,
 }
@@ -86,7 +88,12 @@ impl Onboarding {
             (false, true) => Step::Words,
             (false, false) => Step::Choose,
         };
-        Onboarding { step, notes: Vec::new() }
+        Onboarding { step, made: false, notes: Vec::new() }
+    }
+
+    /// Whether this ends with a new or recovered account, rather than an unlock.
+    pub fn made_account(&self) -> bool {
+        self.made
     }
 
     pub fn ask(&self) -> Ask {
@@ -110,7 +117,7 @@ impl Onboarding {
     /// At the code step, for tests.
     #[cfg(test)]
     pub fn at_code(code: Code, recovered: bool) -> Onboarding {
-        Onboarding { step: Step::Code { code, recovered }, notes: Vec::new() }
+        Onboarding { step: Step::Code { code, recovered }, made: false, notes: Vec::new() }
     }
 
     /// What this step says above the input; `can_copy` as in `State`.
@@ -287,6 +294,7 @@ impl Onboarding {
             },
             Step::Code { .. } => {
                 effects.push(Effect::Start);
+                self.made = true;
                 Step::Starting
             }
             // Nothing is asked while waiting.

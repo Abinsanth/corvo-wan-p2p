@@ -20,6 +20,7 @@ use super::complete;
 use super::people::{self, Act, Show};
 use super::state::{Screen, Secret, State, Tone, WHEEL_STEP};
 use super::view::{areas, chat_page, input_rows, popup_area, sidebar_rows, sidebar_scrolled, sidebar_showing, tab_at};
+use super::window::{self, Overlay};
 
 #[derive(Debug)]
 pub enum Msg {
@@ -264,6 +265,13 @@ pub fn update(state: &mut State, msg: Msg) -> Vec<Effect> {
     match msg {
         // A key while the words are up only hides them.
         Msg::Key(key) if state.reveal.is_some() && key.kind != KeyEventKind::Release => state.reveal = None,
+        // A window takes every key but Ctrl-C.
+        Msg::Key(key) if state.overlay.is_some() => match action_for(key) {
+            Some(Action::Quit) => on_action(state, Action::Quit, &mut effects),
+            _ if key.kind != KeyEventKind::Release => window::key(state, key),
+            _ => {}
+        },
+        Msg::Paste(_) | Msg::Mouse(_) if state.overlay.is_some() => {}
         Msg::Key(key) => {
             if state.ask().is_some() {
                 state.editor.make_room_for_answer();
@@ -517,6 +525,7 @@ fn on_command(state: &mut State, cmd: Cmd, effects: &mut Vec<Effect>) {
             state.select_tab(0);
         }
         Cmd::Clear => state.clear_tab(),
+        Cmd::Welcome => state.overlay = Some(Overlay::Welcome { scroll: 0 }),
         cmd @ (Cmd::Passphrase | Cmd::Phrase | Cmd::PhraseSave | Cmd::PhraseCopy) => account::begin(state, cmd),
         Cmd::Quit => effects.push(Effect::Quit),
         Cmd::Update { yes } => effects.push(Effect::CheckUpdate { yes }),
@@ -532,7 +541,11 @@ fn on_command(state: &mut State, cmd: Cmd, effects: &mut Vec<Effect>) {
 fn on_done(state: &mut State, outcome: Outcome, effects: &mut Vec<Effect>) {
     match outcome {
         Outcome::Started { name, code, recovery_file } => {
+            let welcome = matches!(&state.screen, Screen::Onboarding(o) if o.made_account());
             state.screen = Screen::Main;
+            if welcome {
+                state.overlay = Some(Overlay::Welcome { scroll: 0 });
+            }
             state.short_code = code.short();
             state.code = Some(code);
             state.say(Tone::Good, format!("welcome, {name}. Your code is {code}"));

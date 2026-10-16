@@ -104,6 +104,7 @@ A green dot next to a contact means they're online. Next to your own messages:
 | `/close` | close this chat tab |
 | `/clear` | clear the screen (Ctrl-L) |
 | `/update` | check for a newer version and install it |
+| `/welcome` | show the welcome again |
 | `/help` | list commands |
 | `/quit` | quit (Ctrl-C) |
 

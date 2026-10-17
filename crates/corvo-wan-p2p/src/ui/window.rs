@@ -1,5 +1,6 @@
 //! Windows over the main screen: the start art (with the tips after a new or
-//! recovered account), the help, `/about`, and an update's steps.
+//! recovered account), the help, `/about`, an update's steps, and the
+//! Profile tab's windows with fields (see `form`).
 
 use std::path::Path;
 
@@ -7,6 +8,7 @@ use corvo_wan_p2p_core::VERSION;
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
 
 use super::commands::{HELP, KEYS};
+use super::form::Form;
 use super::state::State;
 use super::view::wrap;
 use crate::selfupdate::{REPO, Stage};
@@ -32,6 +34,9 @@ pub enum Overlay {
         scroll: u16,
     },
     Update(UpdateView),
+    /// A window with fields. It draws itself (`form::rows`), since its rows
+    /// may hold your words, and takes its own keys (`form::key`).
+    Form(Form),
 }
 
 /// An update under way: which version, the stage it's at, and why it
@@ -100,6 +105,7 @@ impl Overlay {
             Overlay::Help { .. } => "─ Help ",
             Overlay::About { .. } => "─ About ",
             Overlay::Update(_) => "─ Update ",
+            Overlay::Form(form) => form.title(),
         }
     }
 
@@ -107,7 +113,7 @@ impl Overlay {
     pub fn hint(&self) -> Option<&'static str> {
         match self {
             Overlay::Start { .. } => None,
-            Overlay::Help { .. } | Overlay::About { .. } => Some(" Esc closes ─"),
+            Overlay::Help { .. } | Overlay::About { .. } | Overlay::Form(_) => Some(" Esc closes ─"),
             Overlay::Update(UpdateView { failed: None, .. }) => Some(" Esc hides ─"),
             Overlay::Update(_) => Some(" any key closes ─"),
         }
@@ -121,6 +127,7 @@ impl Overlay {
             Overlay::Help { .. } => 80,
             Overlay::About { .. } => 64,
             Overlay::Update(_) => 52,
+            Overlay::Form(_) => 56,
         }
     }
 
@@ -130,6 +137,7 @@ impl Overlay {
             | Overlay::Help { scroll }
             | Overlay::About { scroll, .. }
             | Overlay::Update(UpdateView { scroll, .. }) => *scroll,
+            Overlay::Form(_) => 0,
         }
     }
 
@@ -139,6 +147,7 @@ impl Overlay {
             | Overlay::Help { scroll }
             | Overlay::About { scroll, .. }
             | Overlay::Update(UpdateView { scroll, .. }) => *scroll = to,
+            Overlay::Form(_) => {}
         }
     }
 }
@@ -169,6 +178,8 @@ pub fn rows(overlay: &Overlay, size: (u16, u16)) -> Vec<String> {
             "License MIT".into(),
         ]),
         Overlay::Update(view) => update_rows(view, inner),
+        // Drawn by `view::draw_form`, which wipes its rows after use.
+        Overlay::Form(_) => Vec::new(),
     }
 }
 
@@ -538,7 +549,7 @@ mod tests {
     fn the_help_reads_as_decided() {
         let help = help_rows(74);
         for row in [
-            "You        /name <new name>  your display name",
+            "You        /profile          name, passphrase, 12 words",
             "Friends    /code             your code",
             "           /add <code>       add a friend",
             "Chatting   /chat <name>      open a chat",
@@ -556,7 +567,7 @@ mod tests {
     fn a_narrow_help_puts_each_group_on_its_own_row() {
         let help = help_rows(34);
         assert_eq!(help[0], "You");
-        assert!(help[1].starts_with("  /name <new name>"), "{help:#?}");
+        assert!(help[1].starts_with("  /profile"), "{help:#?}");
         assert!(help.iter().any(|r| r == "Keys"));
         assert!(help.iter().all(|r| r.width() <= 34), "{help:#?}");
     }

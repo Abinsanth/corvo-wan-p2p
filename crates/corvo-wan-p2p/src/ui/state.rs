@@ -13,7 +13,6 @@ use corvo_wan_p2p_core::store::{Person, Standing, StoredMessage};
 use zeroize::Zeroizing;
 
 use super::account::Pending;
-use super::commands::may_hold_a_secret;
 use super::onboarding::Onboarding;
 use super::window::Overlay;
 
@@ -288,8 +287,7 @@ impl History {
         let at = match self.at {
             None if self.entries.is_empty() => return None,
             None => {
-                // A line with a passphrase in it isn't kept, even as the draft.
-                self.draft = if may_hold_a_secret(current) { String::new() } else { current.to_string() };
+                self.draft = current.to_string();
                 self.entries.len() - 1
             }
             Some(0) => return None,
@@ -376,10 +374,21 @@ pub struct Line {
     pub tone: Tone,
 }
 
+/// What a tab shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TabKind {
+    /// The app's own lines.
+    Corvo,
+    /// A chat, and who it's with.
+    Chat(Code),
+    /// Your name and code, and a menu for your account. It closes when you
+    /// leave it.
+    Profile,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Tab {
-    /// Who the chat is with; `None` for the `corvo` tab.
-    pub peer: Option<Code>,
+    pub kind: TabKind,
     pub title: String,
     /// The `corvo` tab's lines. A chat tab draws its messages from `State::chats`.
     pub lines: Vec<Line>,
@@ -390,11 +399,23 @@ pub struct Tab {
 
 impl Tab {
     pub fn corvo() -> Tab {
-        Tab { peer: None, title: "corvo".into(), lines: Vec::new(), cleared: 0 }
+        Tab { kind: TabKind::Corvo, title: "corvo".into(), lines: Vec::new(), cleared: 0 }
     }
 
     pub fn chat(peer: Code, title: String) -> Tab {
-        Tab { peer: Some(peer), title, lines: Vec::new(), cleared: 0 }
+        Tab { kind: TabKind::Chat(peer), title, lines: Vec::new(), cleared: 0 }
+    }
+
+    pub fn profile() -> Tab {
+        Tab { kind: TabKind::Profile, title: "profile".into(), lines: Vec::new(), cleared: 0 }
+    }
+
+    /// Who the chat is with, if it's a chat.
+    pub fn peer(&self) -> Option<Code> {
+        match self.kind {
+            TabKind::Chat(code) => Some(code),
+            _ => None,
+        }
     }
 }
 
@@ -489,8 +510,8 @@ pub struct State {
     pub busy: Option<&'static str>,
     /// A command asking its questions in the input box.
     pub pending: Option<Pending>,
-    /// Your 12 words, shown over the chat until a key is pressed.
-    pub reveal: Option<Secret>,
+    /// The Profile tab's menu item marked `›`.
+    pub profile_at: usize,
     /// Everyone you know of, blocked people too.
     pub known: Vec<Person>,
     /// What each of `known` is called on screen (see `names::labels`).
@@ -542,7 +563,7 @@ impl State {
             title: String::new(),
             busy: None,
             pending: None,
-            reveal: None,
+            profile_at: 0,
             known: Vec::new(),
             labels: HashMap::new(),
             connected: HashSet::new(),
@@ -608,7 +629,7 @@ impl State {
         self.changes += 1;
         self.labels = names::labels(&self.known);
         for i in 1..self.tabs.len() {
-            if let Some(code) = self.tabs[i].peer {
+            if let Some(code) = self.tabs[i].peer() {
                 self.tabs[i].title = self.label(&code);
             }
         }
@@ -635,7 +656,7 @@ impl State {
 
     /// The tab for a chat with `code`, opened if needed; selected if `switch`.
     pub fn open_chat(&mut self, code: Code, switch: bool) {
-        let at = match self.tabs.iter().position(|t| t.peer == Some(code)) {
+        let at = match self.tabs.iter().position(|t| t.peer() == Some(code)) {
             Some(at) => at,
             None => {
                 self.tabs.push(Tab::chat(code, self.label(&code)));
@@ -649,19 +670,38 @@ impl State {
 
     /// Closes the chat with `code`, if it's open.
     pub fn close_chat(&mut self, code: Code) {
-        let Some(at) = self.tabs.iter().position(|t| t.peer == Some(code)) else { return };
+        let Some(at) = self.tabs.iter().position(|t| t.peer() == Some(code)) else { return };
         let was = self.current;
         self.tabs.remove(at);
-        if was == at {
-            self.select_tab(at - 1);
-        } else if was > at {
+        if was >= at {
             self.current = was - 1;
+            self.scroll.follow_end();
         }
     }
 
     /// The person in the open tab, if it's a chat.
     pub fn open_peer(&self) -> Option<Code> {
-        self.tab().peer
+        self.tab().peer()
+    }
+
+    pub fn on_profile(&self) -> bool {
+        self.tab().kind == TabKind::Profile
+    }
+
+    /// Opens the Profile tab right after the corvo tab, or goes back to it.
+    pub fn open_profile(&mut self) {
+        let at = match self.tabs.iter().position(|t| t.kind == TabKind::Profile) {
+            Some(at) => at,
+            None => {
+                self.tabs.insert(1, Tab::profile());
+                self.profile_at = 0;
+                if self.current >= 1 {
+                    self.current += 1;
+                }
+                1
+            }
+        };
+        self.select_tab(at);
     }
 
     /// Unread messages from contacts and requests.
@@ -677,11 +717,19 @@ impl State {
         self.current == 0
     }
 
-    pub fn select_tab(&mut self, idx: usize) {
-        if idx < self.tabs.len() {
-            self.current = idx;
-            self.scroll.follow_end();
+    /// Shows tab `idx`. Leaving the Profile tab closes it.
+    pub fn select_tab(&mut self, mut idx: usize) {
+        if idx >= self.tabs.len() {
+            return;
         }
+        if idx != self.current && self.on_profile() {
+            self.tabs.remove(self.current);
+            if idx > self.current {
+                idx -= 1;
+            }
+        }
+        self.current = idx;
+        self.scroll.follow_end();
     }
 
     pub fn step_tab(&mut self, delta: isize) {
@@ -710,7 +758,7 @@ impl State {
         self.changes += 1;
         let tab = &self.tabs[self.current];
         // A chat tab's mark counts its messages; the corvo tab's, its lines.
-        let len = match tab.peer {
+        let len = match tab.peer() {
             Some(peer) => self.chats.get(&peer).map_or(0, |c| c.messages.len()),
             None => tab.lines.len(),
         };
@@ -718,13 +766,14 @@ impl State {
         self.scroll.follow_end();
     }
 
-    /// Closes the open chat tab and shows the one before it. The `corvo` tab stays.
+    /// Closes the open tab and shows the one before it. The `corvo` tab stays.
     pub fn close_tab(&mut self) -> bool {
         if self.on_corvo() {
             return false;
         }
         self.tabs.remove(self.current);
-        self.select_tab(self.current - 1);
+        self.current -= 1;
+        self.scroll.follow_end();
         true
     }
 }
@@ -851,6 +900,67 @@ mod tests {
         assert_eq!(corvo.lines[0].text, "line 1");
         assert_eq!(corvo.cleared, CORVO_LEN - 1, "the mark moves with the lines");
         assert_eq!(corvo.lines[corvo.cleared].text, "after");
+    }
+
+    fn with_chats() -> (State, Code, Code) {
+        let mut state = State::new("ana".into(), "abcdefgh".into());
+        let (rahul, maria) = (
+            corvo_wan_p2p_core::identity::Seed::generate().code(),
+            corvo_wan_p2p_core::identity::Seed::generate().code(),
+        );
+        state.open_chat(rahul, false);
+        state.open_chat(maria, false);
+        (state, rahul, maria)
+    }
+
+    fn kinds(state: &State) -> Vec<TabKind> {
+        state.tabs.iter().map(|t| t.kind).collect()
+    }
+
+    #[test]
+    fn profile_opens_after_corvo_and_again_selects_it() {
+        let (mut state, rahul, maria) = with_chats();
+        state.select_tab(2);
+        state.open_profile();
+        assert_eq!(kinds(&state), [TabKind::Corvo, TabKind::Profile, TabKind::Chat(rahul), TabKind::Chat(maria)]);
+        assert_eq!(state.current, 1);
+        assert!(state.on_profile());
+        state.profile_at = 2;
+        state.open_profile();
+        assert_eq!(state.tabs.len(), 4, "only one");
+        assert_eq!((state.current, state.profile_at), (1, 2), "the same tab, as it was");
+    }
+
+    #[test]
+    fn leaving_the_profile_tab_closes_it() {
+        let (mut state, rahul, maria) = with_chats();
+        state.open_profile();
+        state.select_tab(3);
+        assert_eq!(kinds(&state), [TabKind::Corvo, TabKind::Chat(rahul), TabKind::Chat(maria)]);
+        assert_eq!(state.open_peer(), Some(maria), "the tab chosen, not the one that moved into its place");
+
+        state.open_profile();
+        state.step_tab(-1);
+        assert_eq!(kinds(&state), [TabKind::Corvo, TabKind::Chat(rahul), TabKind::Chat(maria)]);
+        assert!(state.on_corvo());
+
+        state.open_profile();
+        state.step_tab(1);
+        assert_eq!(state.open_peer(), Some(rahul));
+        assert_eq!(state.tabs.len(), 3);
+
+        state.open_profile();
+        let stranger = corvo_wan_p2p_core::identity::Seed::generate().code();
+        state.open_chat(stranger, true);
+        assert_eq!(state.open_peer(), Some(stranger));
+        assert!(!state.tabs.iter().any(|t| t.kind == TabKind::Profile));
+
+        state.open_profile();
+        state.open_chat(rahul, false);
+        assert!(state.on_profile(), "a chat opened in the background doesn't close it");
+        assert!(state.close_tab());
+        assert!(state.on_corvo(), "/close closes it too");
+        assert_eq!(state.tabs.len(), 4);
     }
 
     #[test]

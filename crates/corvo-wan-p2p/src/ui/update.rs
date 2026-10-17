@@ -811,12 +811,12 @@ mod tests {
         press(&mut s, KeyCode::Up);
         assert_eq!(s.profile_at, 0, "stays on the menu");
         assert_eq!(s.editor.text(), "", "not the history");
-        press(&mut s, KeyCode::Down);
-        press(&mut s, KeyCode::Down);
-        press(&mut s, KeyCode::Down);
-        assert_eq!(s.profile_at, 2);
+        for _ in 0..4 {
+            press(&mut s, KeyCode::Down);
+        }
+        assert_eq!(s.profile_at, 3, "stops at the last item");
         press(&mut s, KeyCode::Enter);
-        assert!(matches!(&s.overlay, Some(Overlay::Form(f)) if f.title() == "─ Your 12 words "));
+        assert!(matches!(&s.overlay, Some(Overlay::Form(f)) if f.title() == "─ Delete account "));
     }
 
     #[test]

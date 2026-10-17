@@ -5,7 +5,6 @@ use std::path::PathBuf;
 
 use corvo_wan_p2p_core::identity::Code;
 
-use super::clip::{MAYBE, NO_COPY};
 use super::commands::Cmd;
 use super::people::Act;
 use super::state::{Ask, Secret, State, Tone};
@@ -19,8 +18,6 @@ pub enum PhraseUse {
     Show,
     /// Write the recovery file, replacing one that's there only with `overwrite`.
     Save { overwrite: bool },
-    /// Copy them to the clipboard.
-    Copy,
 }
 
 /// What `/phrase` did.
@@ -31,7 +28,6 @@ pub enum PhraseDone {
     /// The passphrase was right, but the recovery file is there and wasn't
     /// to be replaced; nothing was written.
     Exists(PathBuf),
-    Copied,
 }
 
 /// A command in the middle of asking its questions.
@@ -53,6 +49,8 @@ pub enum Pending {
     Remove { code: Code },
     /// `/update`: install the newer version found?
     Update,
+    /// `/code`: save it to the code file?
+    SaveCode,
 }
 
 impl Pending {
@@ -67,6 +65,7 @@ impl Pending {
             Pending::Replace { .. } => ("replace it? y/n: ", false),
             Pending::Remove { .. } => ("delete your history too? y/n: ", false),
             Pending::Update => ("update now? y/n: ", false),
+            Pending::SaveCode => ("save it to ~/corvo-wan-p2p-code.txt? y/n: ", false),
         };
         Ask { label: label.into(), masked }
     }
@@ -81,11 +80,6 @@ pub fn begin(state: &mut State, cmd: Cmd) {
             Pending::Passphrase(PhraseUse::Save { overwrite: false }),
             "type your passphrase to save your 12 words to the recovery file",
         ),
-        Cmd::PhraseCopy if !state.can_copy => {
-            state.select_tab(0);
-            return state.say(Tone::Bad, format!("{NO_COPY}: /phrase shows your words to write down instead"));
-        }
-        Cmd::PhraseCopy => (Pending::Passphrase(PhraseUse::Copy), "type your passphrase to copy your 12 words"),
         _ => return,
     };
     state.select_tab(0);
@@ -174,6 +168,20 @@ pub fn answer(state: &mut State, text: Secret) -> Vec<Effect> {
                 Some(Pending::Update)
             }
         },
+        Pending::SaveCode => match text.expose().trim().to_lowercase().as_str() {
+            "y" | "yes" => {
+                effects.push(Effect::WriteCode);
+                None
+            }
+            "n" | "no" => {
+                state.say(Tone::Plain, "not saved; /code asks again");
+                None
+            }
+            _ => {
+                state.say(Tone::Bad, "type y or n");
+                Some(Pending::SaveCode)
+            }
+        },
         // Nothing is asked while waiting.
         checking @ Pending::Checking { .. } => Some(checking),
     };
@@ -201,13 +209,6 @@ pub fn done(state: &mut State, outcome: Outcome) -> Vec<Effect> {
         Outcome::PassphraseChanged(Ok(())) => state.say(Tone::Good, "passphrase changed: use the new one from now on"),
         Outcome::PassphraseChanged(Err(why)) => state.say(Tone::Bad, format!("{why}; nothing changed")),
         Outcome::Phrase(Ok(PhraseDone::Shown(words))) => state.reveal = Some(words),
-        Outcome::Phrase(Ok(PhraseDone::Copied)) => state.say(
-            Tone::Good,
-            format!(
-                "sent your 12 words to your clipboard, {MAYBE}: paste them into a password manager, \
-                 then copy something else over them"
-            ),
-        ),
         Outcome::Phrase(Ok(PhraseDone::Saved(path))) => state.say(
             Tone::Good,
             format!(
@@ -381,16 +382,6 @@ mod tests {
         done(&mut s, Outcome::Phrase(Err("wrong passphrase".into())));
         assert_eq!(s.reveal, None);
         assert_eq!(*last(&s), Line { text: "wrong passphrase".into(), tone: Tone::Bad });
-    }
-
-    #[test]
-    fn phrase_copy_copies_after_the_passphrase() {
-        let mut s = state();
-        send(&mut s, "/phrase copy");
-        assert_eq!(send(&mut s, "pw"), vec![Effect::Phrase { passphrase: secret("pw"), then: PhraseUse::Copy }]);
-        done(&mut s, Outcome::Phrase(Ok(PhraseDone::Copied)));
-        assert_eq!(last(&s).tone, Tone::Good);
-        assert!(last(&s).text.contains("sent your 12 words to your clipboard"));
     }
 
     #[test]

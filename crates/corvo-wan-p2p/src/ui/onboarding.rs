@@ -9,7 +9,6 @@ use corvo_wan_p2p_core::store::StoreError;
 
 use zeroize::Zeroizing;
 
-use super::clip::{MAYBE, NO_COPY};
 use super::state::{Ask, Editor, Line, Secret, Tone};
 use super::update::{Effect, Outcome};
 
@@ -120,8 +119,8 @@ impl Onboarding {
         Onboarding { step: Step::Code { code, recovered }, made: false, notes: Vec::new() }
     }
 
-    /// What this step says above the input; `can_copy` as in `State`.
-    pub fn guidance(&self, can_copy: bool) -> Vec<String> {
+    /// What this step says above the input.
+    pub fn guidance(&self) -> Vec<String> {
         let lines: &[&str] = match &self.step {
             Step::Unlock => &["Type your passphrase to unlock your account."],
             Step::ConfirmWipe => &[
@@ -160,12 +159,7 @@ impl Onboarding {
                 } else {
                     "Send it to friends any way you like: they add you with /add and your code."
                 };
-                let copy = if can_copy {
-                    format!("Your code, sent to your clipboard {MAYBE}:")
-                } else {
-                    format!("Your code ({NO_COPY}: select it to copy it):")
-                };
-                return vec![copy, code.to_string(), then.into(), "Press Enter to start.".into()];
+                return vec!["Your code:".into(), code.to_string(), then.into(), "Press Enter to start.".into()];
             }
             Step::Creating { .. } | Step::Starting => &[],
         };
@@ -285,7 +279,7 @@ impl Onboarding {
                         Tone::Warn,
                         "your words weren't saved to a file. Write them down, or use /phrase save once you're in.",
                     );
-                    show_code(&seed, false, &mut effects)
+                    show_code(&seed, false)
                 }
                 _ => {
                     self.note(Tone::Bad, "type y or n");
@@ -334,9 +328,7 @@ impl Onboarding {
                 effects.push(Effect::Exit(format!("couldn't make your account: {why}")));
                 Step::Starting
             }
-            (Step::Creating { seed, recovered: true }, Outcome::Created(Ok(()))) => {
-                show_code(&seed, true, &mut effects)
-            }
+            (Step::Creating { seed, recovered: true }, Outcome::Created(Ok(()))) => show_code(&seed, true),
             (Step::Creating { seed, recovered: false }, Outcome::Created(Ok(()))) => {
                 effects.push(Effect::CheckRecovery);
                 Step::Creating { seed, recovered: false }
@@ -355,7 +347,7 @@ impl Onboarding {
                         path.display()
                     ),
                 );
-                show_code(&seed, false, &mut effects)
+                show_code(&seed, false)
             }
             (Step::Creating { seed, .. }, Outcome::RecoveryWritten(Err(why))) => {
                 self.note(
@@ -365,7 +357,7 @@ impl Onboarding {
                          /phrase shows them again once you're in."
                     ),
                 );
-                show_code(&seed, false, &mut effects)
+                show_code(&seed, false)
             }
             (step, _) => step,
         };
@@ -387,11 +379,9 @@ pub fn lowered(text: &Secret) -> Zeroizing<String> {
     Zeroizing::new(text.expose().trim().to_lowercase())
 }
 
-/// The code step, which copies the code as it opens.
-fn show_code(seed: &Seed, recovered: bool, effects: &mut Vec<Effect>) -> Step {
-    let code = seed.code();
-    effects.push(Effect::Copy(code.to_string()));
-    Step::Code { code, recovered }
+/// The code step.
+fn show_code(seed: &Seed, recovered: bool) -> Step {
+    Step::Code { code: seed.code(), recovered }
 }
 
 /// Two different word positions, smaller first.
@@ -483,7 +473,7 @@ mod tests {
     fn a_new_account_from_start_to_the_code() {
         let mut s = begin(false, false);
         assert_eq!(label(&s), "n or r: ");
-        assert!(onboarding(&s).guidance(true).iter().any(|l| l.contains("no account")));
+        assert!(onboarding(&s).guidance().iter().any(|l| l.contains("no account")));
         let seed = new_until_words(&mut s);
         assert_eq!(onboarding(&s).words().unwrap().len(), 12);
         let effects = type_back(&mut s, &seed);
@@ -502,10 +492,10 @@ mod tests {
         );
         let path = PathBuf::from("/home/ana/corvo-wan-p2p-recovery.txt");
         let effects = done(&mut s, Outcome::RecoveryWritten(Ok(path)));
-        assert_eq!(effects, vec![Effect::Copy(seed.code().to_string())], "the code is copied");
+        assert_eq!(effects, vec![], "nothing is copied");
         assert!(last_note(&s).text.contains("/home/ana/corvo-wan-p2p-recovery.txt"));
         assert!(last_note(&s).text.contains("delete"));
-        assert!(onboarding(&s).guidance(true).iter().any(|l| l.contains(&seed.code().to_string())));
+        assert!(onboarding(&s).guidance().iter().any(|l| l.contains(&seed.code().to_string())));
         assert_eq!(send(&mut s, ""), vec![Effect::Start]);
         assert_eq!(s.busy, Some("starting…"));
 
@@ -584,7 +574,7 @@ mod tests {
         done(&mut s, Outcome::Created(Ok(())));
         let path = PathBuf::from("/home/ana/corvo-wan-p2p-recovery.txt");
         assert!(done(&mut s, Outcome::RecoveryFile(Some(path))).is_empty());
-        assert!(onboarding(&s).guidance(true)[0].contains("/home/ana/corvo-wan-p2p-recovery.txt"));
+        assert!(onboarding(&s).guidance()[0].contains("/home/ana/corvo-wan-p2p-recovery.txt"));
         assert_eq!(label(&s), "replace it? y/n: ");
         assert!(send(&mut s, "what").is_empty());
         assert_eq!(label(&s), "replace it? y/n: ");
@@ -598,7 +588,7 @@ mod tests {
         type_back(&mut s, &seed);
         done(&mut s, Outcome::Created(Ok(())));
         done(&mut s, Outcome::RecoveryFile(Some(PathBuf::from("/h/corvo-wan-p2p-recovery.txt"))));
-        assert_eq!(send(&mut s, "no"), vec![Effect::Copy(seed.code().to_string())]);
+        assert_eq!(send(&mut s, "no"), vec![]);
         assert_eq!(last_note(&s).tone, Tone::Warn);
         assert!(last_note(&s).text.contains("/phrase save"));
         assert_eq!(send(&mut s, ""), vec![Effect::Start]);
@@ -612,7 +602,7 @@ mod tests {
         done(&mut s, Outcome::Created(Ok(())));
         done(&mut s, Outcome::RecoveryFile(None));
         let effects = done(&mut s, Outcome::RecoveryWritten(Err("disk full".into())));
-        assert_eq!(effects, vec![Effect::Copy(seed.code().to_string())]);
+        assert_eq!(effects, vec![]);
         assert_eq!(last_note(&s).tone, Tone::Bad);
         assert!(last_note(&s).text.contains("disk full"));
     }
@@ -667,8 +657,8 @@ mod tests {
             vec![Effect::Create { seed: seed.clone(), name: "ana".into(), passphrase: Secret::new("pw".into()) }]
         );
         let effects = done(&mut s, Outcome::Created(Ok(())));
-        assert_eq!(effects, vec![Effect::Copy(seed.code().to_string())], "no recovery file: you have the words");
-        assert!(onboarding(&s).guidance(true).iter().any(|l| l.contains("same as before")));
+        assert_eq!(effects, vec![], "no recovery file: you have the words");
+        assert!(onboarding(&s).guidance().iter().any(|l| l.contains("same as before")));
         assert_eq!(send(&mut s, ""), vec![Effect::Start]);
     }
 
@@ -699,7 +689,7 @@ mod tests {
     fn recover_with_an_account_deletes_it_after_yes() {
         let mut s = begin(true, true);
         assert_eq!(label(&s), "type yes: ");
-        assert!(onboarding(&s).guidance(true)[0].contains("deletes"));
+        assert!(onboarding(&s).guidance()[0].contains("deletes"));
         assert_eq!(send(&mut s, " YES "), vec![Effect::Wipe]);
         assert_eq!(s.busy, Some("deleting…"));
         assert!(done(&mut s, Outcome::Wiped(Ok(()))).is_empty());

@@ -15,7 +15,7 @@ use zeroize::Zeroizing;
 
 use super::account::{self, PhraseDone, PhraseUse};
 use super::chat::{self, Loaded};
-use super::commands::{Cmd, Input, may_hold_a_secret, parse};
+use super::commands::{Cmd, Input, may_hold_a_secret, parse, usage};
 use super::complete;
 use super::people::{self, Act, Show};
 use super::state::{PATH_TICKS, Screen, Secret, State, Tone, WHEEL_STEP};
@@ -45,8 +45,6 @@ pub enum Effect {
     /// Leave, and print this once the terminal is back to normal.
     Exit(String),
     SetTitle(String),
-    /// Put this on the clipboard (OSC 52).
-    Copy(String),
     /// Unlock the account and start the engine.
     Unlock(Secret),
     /// Make the account. The engine starts later, with [`Effect::Start`].
@@ -103,6 +101,10 @@ pub enum Effect {
     },
     /// Install the release the last check found.
     InstallUpdate,
+    /// Whether the code file is there.
+    ShowCode,
+    /// Write the code file.
+    WriteCode,
 }
 
 impl Effect {
@@ -181,6 +183,11 @@ pub enum Outcome {
     Updated(Result<String, String>),
     /// `/update` after an update: this version is installed and waits for a restart.
     UpdatedAlready(String),
+    /// `saved` is where the code file is, if it's there.
+    CodeShown {
+        saved: Option<PathBuf>,
+    },
+    CodeWritten(Result<PathBuf, String>),
     /// Something that leaves the app unusable, like the engine not starting.
     Fatal(String),
 }
@@ -530,7 +537,20 @@ fn on_line(state: &mut State, line: &str, effects: &mut Vec<Effect>) {
             }
         }
         Input::Wrong(why) => state.say(Tone::Bad, why),
+        Input::Usage(name) => usage_card(state, name),
         Input::Cmd(cmd) => on_command(state, cmd, effects),
+    }
+}
+
+/// How the command called `name` is typed, what it does and an example, in
+/// the corvo tab.
+fn usage_card(state: &mut State, name: &str) {
+    let Some(card) = usage(name) else { return };
+    state.select_tab(0);
+    state.say(Tone::Plain, card.usage);
+    state.say(Tone::Dim, card.what);
+    if let Some(example) = card.example {
+        state.say(Tone::Dim, format!("e.g.  {example}"));
     }
 }
 
@@ -539,7 +559,7 @@ fn on_command(state: &mut State, cmd: Cmd, effects: &mut Vec<Effect>) {
         Cmd::Help => state.overlay = Some(Overlay::Help { scroll: 0 }),
         Cmd::Clear => state.clear_tab(),
         Cmd::Welcome => state.overlay = Some(Overlay::Welcome { scroll: 0 }),
-        cmd @ (Cmd::Passphrase | Cmd::Phrase | Cmd::PhraseSave | Cmd::PhraseCopy) => account::begin(state, cmd),
+        cmd @ (Cmd::Passphrase | Cmd::Phrase | Cmd::PhraseSave) => account::begin(state, cmd),
         Cmd::Quit => effects.push(Effect::Quit),
         Cmd::Update { yes } => effects.push(Effect::CheckUpdate { yes }),
         Cmd::Close => {
@@ -582,6 +602,8 @@ fn on_done(state: &mut State, outcome: Outcome, effects: &mut Vec<Effect>) {
         Outcome::Acted { code, act, result, people } => people::acted(state, code, act, result, people),
         Outcome::Named(result) => people::named(state, result),
         Outcome::Refreshed { show, result } => people::refreshed(state, show, result),
+        Outcome::CodeShown { saved } => people::code_shown(state, saved),
+        Outcome::CodeWritten(result) => people::code_written(state, result),
         other => match &mut state.screen {
             Screen::Onboarding(onboarding) => effects.extend(onboarding.done(other)),
             Screen::Main => effects.extend(account::done(state, other)),
@@ -652,6 +674,60 @@ mod tests {
 
     fn last_corvo(state: &State) -> &Line {
         state.tabs[0].lines.last().expect("the corvo tab has lines")
+    }
+
+    #[test]
+    fn a_usage_card_prints_three_lines_in_the_corvo_tab() {
+        let mut s = state();
+        s.select_tab(1);
+        let from = s.tabs[0].lines.len();
+        assert!(send(&mut s, "/chat").is_empty());
+        assert!(s.on_corvo(), "the corvo tab shows it");
+        let card: Vec<(&str, Tone)> = s.tabs[0].lines[from..].iter().map(|l| (l.text.as_str(), l.tone)).collect();
+        assert_eq!(
+            card,
+            [
+                ("/chat <name>", Tone::Plain),
+                ("Opens a chat with a contact or a request.", Tone::Dim),
+                ("e.g.  /chat rahul", Tone::Dim),
+            ]
+        );
+        assert_eq!(s.flash, None, "a card isn't an error");
+        let from = s.tabs[0].lines.len();
+        send(&mut s, "/clear now");
+        assert_eq!(s.tabs[0].lines.len() - from, 2, "no example for a command that takes nothing");
+    }
+
+    #[test]
+    fn nothing_mentions_the_clipboard() {
+        use crate::ui::commands::HELP;
+        use crate::ui::onboarding::Onboarding;
+        let mut texts: Vec<String> = HELP
+            .iter()
+            .flat_map(|(_, commands)| commands.iter())
+            .map(|(usage, what)| format!("{usage} {what}"))
+            .collect();
+        let mut s = state();
+        s.code = Some(Seed::generate().code());
+        send(&mut s, "/code");
+        update(&mut s, Msg::Done(Outcome::CodeShown { saved: None }));
+        send(&mut s, "y");
+        update(&mut s, Msg::Done(Outcome::CodeWritten(Ok("/h/corvo-wan-p2p-code.txt".into()))));
+        texts.extend(s.tabs[0].lines.iter().map(|l| l.text.clone()));
+        texts.extend(s.ask().map(|a| a.label));
+        for recovered in [false, true] {
+            texts.extend(Onboarding::at_code(Seed::generate().code(), recovered).guidance());
+        }
+        for name in crate::ui::commands::COMMANDS {
+            if let Input::Usage(name) = parse(&format!("/{name} x y z")) {
+                let card = usage(name).unwrap();
+                texts.extend([card.usage, card.what].map(String::from));
+            }
+        }
+        let copying: Vec<&String> =
+            texts.iter().filter(|t| t.to_lowercase().contains("clipboard") || t.contains("copied")).collect();
+        assert!(copying.is_empty(), "{copying:#?}");
+        assert!(texts.iter().any(|t| t == "Your code:"), "onboarding just shows it");
     }
 
     #[test]
@@ -872,11 +948,9 @@ mod tests {
             assert!(!last_corvo(&s).text.contains("secret") && !last_corvo(&s).text.contains("hunter2"));
         }
         assert_eq!(s.ask(), None, "nothing is asked");
-        assert!(s.tabs[0].lines.iter().any(|l| l.text == "type /passphrase alone; it asks for them hidden"));
-        assert_eq!(
-            last_corvo(&s).text,
-            "type /phrase alone, or /phrase save or /phrase copy; it asks for your passphrase hidden"
-        );
+        let said: Vec<&str> = s.tabs[0].lines.iter().map(|l| l.text.as_str()).collect();
+        assert!(said.contains(&"/passphrase") && said.contains(&"/phrase [save]"), "their cards: {said:?}");
+        assert!(!said.iter().any(|l| l.contains("secret") || l.contains("hunter2")));
         let mut kept = Vec::new();
         while let Some(entry) = s.history.prev("") {
             kept.push(entry);
@@ -915,7 +989,6 @@ mod tests {
         use zeroize::Zeroizing;
         let pasted: Zeroizing<String> = one_line_answer("my pass\r\nphrase\n".into());
         assert_eq!(pasted.as_str(), "my pass phrase");
-        let _: Zeroizing<String> = crate::ui::clip::osc52("words");
         let _: Vec<Zeroizing<String>> = crate::ui::view::word_grid(&["abandon", "ability"], 80);
         let _: Zeroizing<String> = crate::ui::onboarding::lowered(&Secret::new(" Pass ".into()));
         assert_eq!(crate::ui::onboarding::lowered(&Secret::new(" Pass ".into())).as_str(), "pass");

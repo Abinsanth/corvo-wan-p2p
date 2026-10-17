@@ -510,8 +510,6 @@ pub struct State {
     /// for every message but the tick.
     pub changes: u64,
     pub rows: RowCache,
-    /// Whether the terminal may copy to the clipboard (see `clip::can_copy`).
-    pub can_copy: bool,
     /// A window over the main screen, while open.
     pub overlay: Option<Overlay>,
     /// How the connection to someone went when last asked: the open chat's,
@@ -551,7 +549,6 @@ impl State {
             sidebar_for: None,
             changes: 0,
             rows: RowCache::default(),
-            can_copy: true,
             overlay: None,
             path: None,
             ticks: 0,

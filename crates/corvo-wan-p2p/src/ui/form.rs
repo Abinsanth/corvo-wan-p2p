@@ -13,8 +13,8 @@ use zeroize::Zeroizing;
 use super::account::{PhraseDone, PhraseUse};
 use super::people;
 use super::state::{Line, Secret, State, Tone};
-use super::update::{Effect, Outcome};
-use super::view::word_grid;
+use super::update::{Effect, Outcome, one_line_answer};
+use super::view::{BIGGER_FOR_WORDS, word_grid, wrap};
 use super::window::Overlay;
 
 /// The most a field holds, in bytes. Its buffer is this big from the start,
@@ -235,103 +235,133 @@ pub fn key(state: &mut State, key: KeyEvent) -> Vec<Effect> {
 }
 
 /// A paste while a form is open goes into the field being typed in, on one
-/// line. It's wiped after.
+/// line and without a line ending, as an answer to the unlock prompt would:
+/// a passphrase pasted here is the one that unlocks. It's wiped after.
 pub fn paste(state: &mut State, text: String) {
-    let text = Zeroizing::new(text);
+    let text = one_line_answer(text);
     let Some(Overlay::Form(form)) = &mut state.overlay else { return };
     if form.waiting || form.done || form.words_shown().is_some() {
         return;
     }
     let field = &mut form.fields[form.focus];
     for c in text.chars() {
-        field.push(if c == '\r' || c == '\n' { ' ' } else { c });
+        field.push(c);
     }
 }
 
-/// What came of a form's effect. If its window was closed meanwhile, a name
-/// or passphrase change is still said in the corvo tab, and the words are
-/// dropped.
+/// What came of a form's effect. It goes to the window waiting for it; if
+/// that window was closed meanwhile, a name or passphrase change is still
+/// said in the corvo tab, and the words are dropped.
 pub fn done(state: &mut State, outcome: Outcome) -> Vec<Effect> {
-    let form = match &mut state.overlay {
-        Some(Overlay::Form(form)) => Some(form),
-        _ => None,
-    };
-    match (form, outcome) {
-        (Some(form), Outcome::Named(Err(why))) if form.kind == FormKind::Name => {
-            form.waiting = false;
-            form.say(Tone::Bad, why);
-        }
-        (form, Outcome::Named(result)) => {
-            if form.is_some_and(|f| f.kind == FormKind::Name) && result.is_ok() {
+    match outcome {
+        Outcome::Named(result) => match (waiting(&mut state.overlay, |k| *k == FormKind::Name), result) {
+            (Some(form), Err(why)) => {
+                form.waiting = false;
+                form.say(Tone::Bad, why);
+            }
+            (Some(_), Ok(name)) => {
                 state.overlay = None;
+                people::named(state, Ok(name));
             }
-            people::named(state, result);
-        }
-        (Some(form), Outcome::PassphraseChanged(result)) if form.kind == FormKind::Passphrase => {
-            form.waiting = false;
-            form.done = true;
-            match result {
-                Ok(()) => form.say(Tone::Good, "done: use the new one from now on"),
-                Err(why) => form.say(Tone::Bad, format!("{why}; nothing changed")),
+            (None, result) => people::named(state, result),
+        },
+        Outcome::PassphraseChanged(result) => match waiting(&mut state.overlay, |k| *k == FormKind::Passphrase) {
+            Some(form) => {
+                form.waiting = false;
+                form.done = true;
+                match result {
+                    Ok(()) => form.say(Tone::Good, "done: use the new one from now on"),
+                    Err(why) => form.say(Tone::Bad, format!("{why}; nothing changed")),
+                }
             }
-        }
-        (_, Outcome::PassphraseChanged(Ok(()))) => {
-            state.say(Tone::Good, "passphrase changed: use the new one from now on")
-        }
-        (_, Outcome::PassphraseChanged(Err(why))) => state.say(Tone::Bad, format!("{why}; nothing changed")),
-        (Some(form), Outcome::Phrase(result)) => {
-            form.waiting = false;
-            match (&mut form.kind, result) {
-                (FormKind::Words { words, .. }, Ok(PhraseDone::Shown(shown))) => {
-                    *words = Some(shown);
-                    form.fields.clear();
-                    form.note = None;
+            None => match result {
+                Ok(()) => state.say(Tone::Good, "passphrase changed: use the new one from now on"),
+                Err(why) => state.say(Tone::Bad, format!("{why}; nothing changed")),
+            },
+        },
+        Outcome::Phrase(result) => match waiting(&mut state.overlay, |k| matches!(k, FormKind::Words { .. })) {
+            Some(form) => {
+                form.waiting = false;
+                match (&mut form.kind, result) {
+                    (FormKind::Words { words, .. }, Ok(PhraseDone::Shown(shown))) => {
+                        *words = Some(shown);
+                        form.fields.clear();
+                        form.note = None;
+                    }
+                    (_, Ok(PhraseDone::Shown(_))) => {}
+                    (_, Ok(PhraseDone::Saved(path))) => form.say(Tone::Good, format!("saved in {}", path.display())),
+                    (_, Ok(PhraseDone::Exists(path))) => {
+                        form.say(Tone::Plain, format!("already saved in {}", path.display()))
+                    }
+                    // A wrong passphrase before the words show: type it again.
+                    (FormKind::Words { passphrase, words: None }, Err(why)) => {
+                        *passphrase = None;
+                        form.say(Tone::Bad, why);
+                    }
+                    (_, Err(why)) => form.say(Tone::Bad, why),
                 }
-                (_, Ok(PhraseDone::Shown(_))) => {}
-                (_, Ok(PhraseDone::Saved(path))) => form.say(Tone::Good, format!("saved in {}", path.display())),
-                (_, Ok(PhraseDone::Exists(path))) => {
-                    form.say(Tone::Plain, format!("already saved in {}", path.display()))
-                }
-                // A wrong passphrase before the words show: type it again.
-                (FormKind::Words { passphrase, words: None }, Err(why)) => {
-                    *passphrase = None;
-                    form.say(Tone::Bad, why);
-                }
-                (_, Err(why)) => form.say(Tone::Bad, why),
             }
-        }
-        (None, Outcome::Phrase(Ok(PhraseDone::Saved(path)))) => {
-            state.say(Tone::Good, format!("your words are saved in {}", path.display()))
-        }
-        // The window is gone, and the words with it.
-        (None, Outcome::Phrase(_)) => {}
+            None => {
+                if let Ok(PhraseDone::Saved(path)) = result {
+                    state.say(Tone::Good, format!("your words are saved in {}", path.display()));
+                }
+                // Anything else, the words with it, is dropped here.
+            }
+        },
         _ => {}
     }
     Vec::new()
 }
 
-/// The form's rows in `inner` columns, each with its tone. Wiped after use:
-/// they may hold your words.
-pub fn rows(form: &Form, inner: usize) -> Vec<(Zeroizing<String>, Tone)> {
+/// The open form, if it's waiting for a result and is of the `kind` asked.
+fn waiting(overlay: &mut Option<Overlay>, kind: fn(&FormKind) -> bool) -> Option<&mut Form> {
+    match overlay {
+        Some(Overlay::Form(form)) if form.waiting && kind(&form.kind) => Some(form),
+        _ => None,
+    }
+}
+
+/// The form's rows in `inner` columns, at most `room` of them, each with
+/// its tone. Wiped after use: they may hold your words.
+///
+/// The fields or the words come first, and the words are never cut off: if
+/// they don't fit, it says to make the window bigger instead. Below them,
+/// wrapped, what happened and the keys; a blank row and the warning go
+/// first when there's no room for everything.
+pub fn rows(form: &Form, inner: usize, room: usize) -> Vec<(Zeroizing<String>, Tone)> {
     let mut rows = Vec::new();
-    let plain = |text: &str| (Zeroizing::new(text.to_string()), Tone::Plain);
     if let Some(words) = form.words_shown() {
         let words: Vec<&str> = words.expose().split_whitespace().collect();
         rows.extend(word_grid(&words, u16::try_from(inner).unwrap_or(u16::MAX)).into_iter().map(|r| (r, Tone::Plain)));
+        if rows.len() > room {
+            return vec![(Zeroizing::new(BIGGER_FOR_WORDS.into()), Tone::Warn)];
+        }
     } else {
         let width = form.fields.iter().map(|f| f.label.width()).max().unwrap_or(0);
         for (i, field) in form.fields.iter().enumerate() {
             rows.push((field_row(field, i == form.focus, width, inner), Tone::Plain));
         }
     }
-    rows.push(plain(""));
-    if form.words_shown().is_some() {
-        rows.push((Zeroizing::new(format!("Never share these. S saves them to {RECOVERY_FILE}")), Tone::Warn));
+    let wrapped = |text: &str, tone: Tone| -> Vec<(Zeroizing<String>, Tone)> {
+        wrap(text, inner).into_iter().map(|r| (Zeroizing::new(r), tone)).collect()
+    };
+    let blank = vec![(Zeroizing::new(String::new()), Tone::Plain)];
+    let warning = match form.words_shown() {
+        Some(_) => wrapped(&format!("Never share these. S saves them to {RECOVERY_FILE}"), Tone::Warn),
+        None => Vec::new(),
+    };
+    let note = form.note.as_ref().map_or_else(Vec::new, |n| wrapped(&n.text, n.tone));
+    let hint = wrapped(form.hint(), Tone::Dim);
+    // In the order they're dropped when there's no room.
+    let mut extras = [blank, warning, hint, note];
+    let mut drop = 0;
+    while rows.len() + extras.iter().map(Vec::len).sum::<usize>() > room && drop < extras.len() {
+        extras[drop].clear();
+        drop += 1;
     }
-    if let Some(note) = &form.note {
-        rows.push((Zeroizing::new(note.text.clone()), note.tone));
-    }
-    rows.push((Zeroizing::new(form.hint().into()), Tone::Dim));
+    let [blank, warning, hint, note] = extras;
+    rows.extend(blank.into_iter().chain(warning).chain(note).chain(hint));
+    rows.truncate(room);
     rows
 }
 
@@ -404,7 +434,7 @@ mod tests {
     }
 
     fn shown(state: &State) -> Vec<String> {
-        rows(form(state), 46).iter().map(|(r, _)| r.to_string()).collect()
+        rows(form(state), 46, 100).iter().map(|(r, _)| r.to_string()).collect()
     }
 
     fn secret(text: &str) -> Secret {
@@ -488,7 +518,7 @@ mod tests {
         done(&mut s, Outcome::Phrase(Ok(PhraseDone::Shown(secret("abandon ability able")))));
         let rows = shown(&s);
         assert!(rows[0].starts_with(" 1. abandon"), "{rows:?}");
-        assert!(rows.iter().any(|r| r.contains("Never share these. S saves them to ~/corvo-wan-p2p-recovery.txt")));
+        assert!(rows.join(" ").contains("Never share these. S saves them to ~/corvo-wan-p2p-recovery.txt"));
         let effects = press(&mut s, KeyCode::Char('s'));
         assert_eq!(
             effects,
@@ -541,6 +571,62 @@ mod tests {
         assert_eq!(s.overlay, None);
         assert_eq!(s.history.prev(""), None, "nothing in the history");
         assert!(!format!("{:?}", form_debug()).contains("hunter2"));
+    }
+
+    #[test]
+    fn a_pasted_line_ending_is_not_part_of_the_passphrase() {
+        for pasted in ["new-pw\n", "new-pw\r\n"] {
+            let mut s = open(1);
+            type_text(&mut s, "pw");
+            press(&mut s, KeyCode::Tab);
+            update(&mut s, Msg::Paste(pasted.into()));
+            press(&mut s, KeyCode::Tab);
+            update(&mut s, Msg::Paste(pasted.into()));
+            let effects = press(&mut s, KeyCode::Enter);
+            assert_eq!(
+                effects,
+                vec![Effect::ChangePassphrase { old: secret("pw"), new: secret("new-pw") }],
+                "{pasted:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_late_result_does_not_land_in_a_window_opened_again() {
+        let mut s = open(2);
+        type_text(&mut s, "pw");
+        press(&mut s, KeyCode::Enter);
+        press(&mut s, KeyCode::Esc);
+        press(&mut s, KeyCode::Enter);
+        assert!(matches!(&s.overlay, Some(Overlay::Form(_))), "opened again");
+        done(&mut s, Outcome::Phrase(Ok(PhraseDone::Shown(secret("abandon ability able")))));
+        assert!(form(&s).words_shown().is_none(), "no words where no passphrase was typed");
+
+        let mut s = open(1);
+        done(&mut s, Outcome::PassphraseChanged(Ok(())));
+        assert!(!form(&s).done, "a window being typed in isn't finished by an old result");
+        assert!(s.tabs[0].lines.last().unwrap().text.starts_with("passphrase changed"), "said in the corvo tab");
+
+        let mut s = open(0);
+        done(&mut s, Outcome::Named(Ok("Old".into())));
+        assert!(matches!(&s.overlay, Some(Overlay::Form(_))), "the new window stays");
+        assert_eq!(s.name, "Old", "the name did change");
+    }
+
+    #[test]
+    fn long_notes_wrap_inside_the_window() {
+        let mut s = open(2);
+        type_text(&mut s, "pw");
+        press(&mut s, KeyCode::Enter);
+        done(&mut s, Outcome::Phrase(Ok(PhraseDone::Shown(secret("abandon ability able")))));
+        press(&mut s, KeyCode::Char('s'));
+        let path = "/Users/someone-with-a-long-name/corvo-wan-p2p-recovery.txt";
+        done(&mut s, Outcome::Phrase(Ok(PhraseDone::Exists(PathBuf::from(path)))));
+        for inner in [34, 50] {
+            let rows: Vec<String> = rows(form(&s), inner, 100).iter().map(|(r, _)| r.to_string()).collect();
+            assert!(rows.iter().all(|r| r.width() <= inner), "{inner}: {rows:#?}");
+            assert!(rows.concat().contains("corvo-wan-p2p-recovery.txt"), "the whole path shows: {rows:#?}");
+        }
     }
 
     fn form_debug() -> Form {

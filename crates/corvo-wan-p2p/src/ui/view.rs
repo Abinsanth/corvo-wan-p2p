@@ -445,18 +445,14 @@ fn rows_of(text: &str, width: u16) -> Vec<Cow<'_, str>> {
 }
 
 /// A window with fields, centred. Its rows are drawn from where they're kept
-/// (no copies), and wiped after. The words are never cut off: if they don't
-/// all fit, it says to make the window bigger instead.
+/// (no copies), and wiped after.
 fn draw_form(frame: &mut Frame, form: &Form, overlay: &Overlay, area: Rect) {
     let width = overlay.width().min(area.width);
     let inner = usize::from(width.saturating_sub(6));
-    let mut rows = form::rows(form, inner);
-    let room = usize::from(area.height.saturating_sub(4)).max(1);
-    let grid = form.words_shown().map_or(0, |_| rows.iter().take_while(|(r, _)| !r.is_empty()).count());
-    if grid > room {
-        rows = vec![(Zeroizing::new(BIGGER_FOR_WORDS.to_string()), Tone::Warn)];
-    }
-    rows.truncate(room);
+    // All the height but the border: the words and what S did need it on a
+    // small terminal.
+    let room = usize::from(area.height.saturating_sub(2)).max(1);
+    let rows = form::rows(form, inner, room);
     let height = rows.len() as u16 + 2;
     let at =
         Rect::new(area.x + (area.width - width) / 2, area.y + area.height.saturating_sub(height) / 2, width, height);
@@ -1293,9 +1289,14 @@ mod tests {
         let Screen::Onboarding(o) = &onboarding.screen else { panic!() };
         let seed = Seed::from_phrase(&o.words().unwrap().join(" ")).unwrap();
         let main = words_window(&seed);
+        let mut saved = words_window(&seed);
+        if let Some(Overlay::Form(form)) = &mut saved.overlay {
+            let text = "saved in /home/ana/corvo-wan-p2p-recovery.txt".into();
+            form.note = Some(Line { text, tone: Tone::Good });
+        }
         for w in MIN_WIDTH..=120 {
             for h in MIN_HEIGHT..=40 {
-                for state in [&onboarding, &main] {
+                for state in [&onboarding, &main, &saved] {
                     let buf = render(state, w, h);
                     assert!(
                         shows_all_words(&buf, &seed) || screen(&buf).contains(BIGGER_FOR_WORDS),
@@ -1303,6 +1304,9 @@ mod tests {
                         screen(&buf)
                     );
                 }
+                // What S did shows with the words, at every size.
+                let shown = screen(&render(&saved, w, h));
+                assert!(shown.contains("saved in") && shown.contains("corvo-wan-p2p-recovery"), "{w}×{h}:\n{shown}");
             }
         }
     }

@@ -341,7 +341,11 @@ pub fn wrap(text: &str, width: usize) -> Vec<String> {
     let mut row = String::new();
     let mut row_w = 0;
     for c in text.chars() {
-        let w = c.width().unwrap_or(0);
+        // What it adds to the row as drawn: a variation selector can make the
+        // character before it wider (❤ is one column, ❤️ two).
+        row.push(c);
+        let w = row.width().saturating_sub(row_w);
+        row.pop();
         if row_w + w > width && !row.is_empty() {
             match row.rfind(' ') {
                 // A space that doesn't fit is where the row ends.
@@ -363,7 +367,7 @@ pub fn wrap(text: &str, width: usize) -> Vec<String> {
             continue;
         }
         row.push(c);
-        row_w += w;
+        row_w = row.width();
     }
     rows.push(row);
     rows
@@ -1523,6 +1527,21 @@ mod tests {
         let block: Vec<&String> = rows.iter().filter(|r| r.contains('x')).collect();
         let edge = |r: &String| r.trim_end().width();
         assert_eq!(edge(last), edge(block[0]), "flush with the block's right edge: {rows:#?}");
+    }
+
+    #[test]
+    fn rows_on_either_side_are_never_wider_than_drawn() {
+        let texts = ["ok ❤️ ".repeat(12), "日本語のメッセージ😀".repeat(5), "x".repeat(90), "a\nb".into()];
+        for width in [25, 26, 27, 31, 41, 59] {
+            for text in &texts {
+                let tail = format!(" 14:02 {}", "✓ ");
+                let rows = line_rows(&format!("{text}{tail}"), tail.len(), width, Side::Right);
+                assert!(rows.iter().all(|r| r.width() == width), "{width}: right rows are padded to it: {rows:#?}");
+                assert!(rows.last().unwrap().trim_end().ends_with("14:02 ✓"), "{width}: {rows:#?}");
+                let left = line_rows(&format!("14:02 {text}"), 6, width, Side::Left);
+                assert!(left.iter().all(|r| r.width() <= bubble(width)), "{width}: {left:#?}");
+            }
+        }
     }
 
     #[test]

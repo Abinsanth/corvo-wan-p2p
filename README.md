@@ -98,10 +98,7 @@ online, and how many of your messages are still waiting.
 
 | Command | What it does |
 |---|---|
-| `/name <new name>` | change your display name |
-| `/passphrase` | change your passphrase |
-| `/phrase` | show your 12 words again (asks your passphrase first) |
-| `/phrase save` | write them to `~/corvo-wan-p2p-recovery.txt` again |
+| `/profile` | your name and code, and a menu to change your name or passphrase or see your 12 words |
 | `/code` | show your code in a box, and offer to save it to `~/corvo-wan-p2p-code.txt` |
 | `/add <code>` | add a friend by their code and open a chat |
 | `/contacts` | a table of your contacts A–Z (online or last seen), then your requests |
@@ -127,6 +124,30 @@ text that begins with `/`.
 Someone you block can't reach you, and you look offline to them. If you
 unblock them and they write again, they come back as a request. A stranger's
 request holds at most 20 messages until you accept it.
+
+## Your profile
+
+`/profile` opens a **Profile** tab right after the corvo tab. It shows your
+name and code, and a menu:
+
+```
+› Change name
+  Change passphrase
+  Show 12 words
+```
+
+↑/↓ choose and Enter opens the item in a window:
+
+- **Change name:** your name now, and a field for the new one. Enter saves it.
+- **Change passphrase:** the current one, the new one and the new one again,
+  all hidden.
+- **Show 12 words:** asks your passphrase, then shows the words. `S` saves
+  them to `~/corvo-wan-p2p-recovery.txt`, or says where that file already is.
+  Closing the window wipes the words from memory.
+
+Esc closes a window, and Esc again closes the tab. Moving to another tab
+closes it too. What you type in these windows never goes into the input
+history.
 
 ## One code per computer
 

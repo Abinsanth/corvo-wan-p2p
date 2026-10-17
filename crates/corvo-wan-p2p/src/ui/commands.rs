@@ -23,7 +23,6 @@ pub enum Cmd {
     Passphrase,
     Phrase,
     PhraseSave,
-    PhraseCopy,
     Close,
     Clear,
     Update {
@@ -43,6 +42,9 @@ pub enum Input {
     Cmd(Cmd),
     /// What was wrong with the command, ready to show.
     Wrong(String),
+    /// A known command typed without what it needs, or with the wrong words:
+    /// its name, for its [`Usage`] card.
+    Usage(&'static str),
 }
 
 /// Every command name `parse` accepts, aliases included, in the order "did you
@@ -75,43 +77,38 @@ pub const COMMANDS: &[&str] = &[
 /// What `/help` lists, by group: each command and what it does.
 pub const HELP: &[(&str, &[(&str, &str)])] = &[
     (
+        "You",
+        &[
+            ("/name <new name>", "your display name"),
+            ("/passphrase", "change your passphrase"),
+            ("/phrase", "your 12 words"),
+            ("/phrase save", "save them to a file"),
+        ],
+    ),
+    (
         "Friends",
         &[
-            ("/code", "show your code and send it to your clipboard, if your terminal allows it"),
-            ("/add <code>", "add a friend by their code and open a chat"),
-            ("/accept [name]", "accept a request (the one in this tab if no name)"),
-            ("/block [name]", "block a request or contact (this tab if no name)"),
+            ("/code", "your code"),
+            ("/add <code>", "add a friend"),
+            ("/contacts", "contacts and requests"),
+            ("/requests", "people waiting for you"),
+            ("/blocked", "blocked people"),
+            ("/accept [name]", "accept a request"),
+            ("/block [name]", "block someone"),
             ("/unblock <name>", "unblock someone"),
-            ("/remove <name>", "delete a contact (asks whether to delete the history too)"),
-            ("/contacts", "your contacts, who's online, last seen"),
-            ("/requests", "people who messaged you but aren't contacts yet"),
-            ("/blocked", "list blocked people"),
-            ("/info <name>", "their code, name, online / last seen"),
+            ("/remove <name>", "delete a contact"),
+            ("/info <name>", "about a contact"),
         ],
     ),
     (
         "Chatting",
-        &[
-            ("/chat <name>", "open a chat (Tab completes names)"),
-            ("/close", "close this chat tab"),
-            ("/clear", "clear the screen (Ctrl-L)"),
-        ],
-    ),
-    (
-        "You",
-        &[
-            ("/name <new name>", "change your display name"),
-            ("/passphrase", "change your history passphrase"),
-            ("/phrase", "show your 12 recovery words again (asks your passphrase first)"),
-            ("/phrase save", "write them to ~/corvo-wan-p2p-recovery.txt again"),
-            ("/phrase copy", "send them to your clipboard, if your terminal allows it"),
-        ],
+        &[("/chat <name>", "open a chat"), ("/close", "close this tab"), ("/clear", "clear the screen (Ctrl-L)")],
     ),
     (
         "App",
         &[
-            ("/update [yes]", "check for and install a newer version"),
-            ("/welcome", "show the welcome again"),
+            ("/update", "get the newest version"),
+            ("/welcome", "the welcome again"),
             ("/help  /h", "this list"),
             ("/quit  /q", "quit (Ctrl-C)"),
         ],
@@ -120,17 +117,88 @@ pub const HELP: &[(&str, &[(&str, &str)])] = &[
 
 /// The keys, for `/help`.
 pub const KEYS: &[(&str, &str)] = &[
-    ("Tab", "complete a command or a name"),
-    ("Shift-Tab, Alt-1..9", "switch tabs (Alt-←/→ too)"),
-    ("Alt+Enter", "a new line in your message"),
-    ("PgUp/PgDn, wheel", "scroll"),
+    ("Tab", "complete"),
+    ("Shift-Tab, Alt-1..9", "switch tabs"),
+    ("Alt+Enter", "new line"),
+    ("PgUp/PgDn", "scroll"),
     ("↑/↓", "what you typed before"),
-    ("Ctrl-L", "clear the screen"),
-    ("Ctrl-C", "quit"),
 ];
 
-/// The marks beside your messages, for `/help`.
-pub const MARKS: &[(&str, &str)] = &[("·", "waiting"), ("✓", "delivered"), ("✓✓", "read")];
+/// How a command is typed, what it does in one sentence, and an example:
+/// the card shown when it's typed wrong.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Usage {
+    pub usage: &'static str,
+    pub what: &'static str,
+    pub example: Option<&'static str>,
+}
+
+const fn card(usage: &'static str, what: &'static str, example: Option<&'static str>) -> Usage {
+    Usage { usage, what, example }
+}
+
+/// Each command's card, by its name (not an alias).
+const USAGES: &[(&str, Usage)] = &[
+    ("code", card("/code", "Shows your code and offers to save it to a file.", None)),
+    ("add", card("/add <code>", "Adds a friend by their code and opens a chat with them.", Some("/add corvo1…"))),
+    ("chat", card("/chat <name>", "Opens a chat with a contact or a request.", Some("/chat rahul"))),
+    ("contacts", card("/contacts", "Lists your contacts A to Z, then your requests.", None)),
+    ("requests", card("/requests", "Lists the people who messaged you but aren't contacts yet.", None)),
+    (
+        "accept",
+        card("/accept [name]", "Accepts a request: the one named, or the one in this tab.", Some("/accept rahul")),
+    ),
+    ("block", card("/block [name]", "Blocks someone: the one named, or the one in this tab.", Some("/block rahul"))),
+    ("unblock", card("/unblock <name>", "Lets someone you blocked reach you again.", Some("/unblock rahul"))),
+    ("blocked", card("/blocked", "Lists the people you've blocked.", None)),
+    (
+        "remove",
+        card(
+            "/remove <name>",
+            "Deletes a contact, and asks whether to delete your history too.",
+            Some("/remove rahul"),
+        ),
+    ),
+    ("info", card("/info <name>", "Shows a contact's code, name and when they were last seen.", Some("/info rahul"))),
+    ("name", card("/name <new name>", "Changes the name your friends see.", Some("/name Ana Maria"))),
+    ("passphrase", card("/passphrase", "Changes your passphrase. Type it alone: it asks for them hidden.", None)),
+    (
+        "phrase",
+        card(
+            "/phrase [save]",
+            "Shows your 12 words, or saves them to a file. It asks for your passphrase hidden.",
+            Some("/phrase save"),
+        ),
+    ),
+    ("close", card("/close", "Closes this chat tab.", None)),
+    ("clear", card("/clear", "Clears the screen. Ctrl-L does too.", None)),
+    (
+        "update",
+        card(
+            "/update [yes]",
+            "Looks for a newer version; with yes it installs it without asking.",
+            Some("/update yes"),
+        ),
+    ),
+    ("welcome", card("/welcome", "Shows the welcome again.", None)),
+    ("help", card("/help  /h", "Lists the commands and keys.", None)),
+    ("quit", card("/quit  /q", "Quits the app. Ctrl-C does too.", None)),
+];
+
+/// The card for the command called `name`, alias or not.
+pub fn usage(name: &str) -> Option<&'static Usage> {
+    card_of(name).map(|(_, usage)| usage)
+}
+
+/// The card for `name`, with the name it's kept under.
+fn card_of(name: &str) -> Option<&'static (&'static str, Usage)> {
+    let name = match name {
+        "h" => "help",
+        "q" => "quit",
+        other => other,
+    };
+    USAGES.iter().find(|(n, _)| *n == name)
+}
 
 /// Names that were never commands here but people type anyway, and what they meant.
 const MEANT: &[(&str, &str)] = &[("exit", "quit")];
@@ -153,43 +221,43 @@ pub fn parse(line: &str) -> Input {
     let words: Vec<&str> = args.split_whitespace().collect();
     let cmd = match name.as_str() {
         "" => return Input::Wrong("type a command after the /, or /help".into()),
-        "code" => no_args(args, "code", Cmd::Code),
-        "contacts" => no_args(args, "contacts", Cmd::Contacts),
-        "requests" => no_args(args, "requests", Cmd::Requests),
-        "blocked" => no_args(args, "blocked", Cmd::Blocked),
-        "passphrase" if args.is_empty() => Ok(Cmd::Passphrase),
-        "passphrase" => Err("type /passphrase alone; it asks for them hidden".into()),
-        "close" => no_args(args, "close", Cmd::Close),
-        "clear" => no_args(args, "clear", Cmd::Clear),
-        "welcome" => no_args(args, "welcome", Cmd::Welcome),
-        "help" | "h" => no_args(args, "help", Cmd::Help),
-        "quit" | "q" => no_args(args, "quit", Cmd::Quit),
-        "add" if args.is_empty() => Err("try: /add <code>  (ask your friend for theirs; yours is /code)".into()),
-        "add" => args.parse().map(Cmd::Add).map_err(|e| e.to_string()),
-        "chat" => named(args, "chat").map(Cmd::Chat),
-        "unblock" => named(args, "unblock").map(Cmd::Unblock),
-        "remove" => named(args, "remove").map(Cmd::Remove),
-        "info" => named(args, "info").map(Cmd::Info),
+        "code" => no_args(args, Cmd::Code),
+        "contacts" => no_args(args, Cmd::Contacts),
+        "requests" => no_args(args, Cmd::Requests),
+        "blocked" => no_args(args, Cmd::Blocked),
+        "passphrase" => no_args(args, Cmd::Passphrase),
+        "close" => no_args(args, Cmd::Close),
+        "clear" => no_args(args, Cmd::Clear),
+        "welcome" => no_args(args, Cmd::Welcome),
+        "help" | "h" => no_args(args, Cmd::Help),
+        "quit" | "q" => no_args(args, Cmd::Quit),
+        "add" if args.is_empty() => Err(None),
+        "add" => args.parse().map(Cmd::Add).map_err(|e| Some(e.to_string())),
+        "chat" => named(args).map(Cmd::Chat),
+        "unblock" => named(args).map(Cmd::Unblock),
+        "remove" => named(args).map(Cmd::Remove),
+        "info" => named(args).map(Cmd::Info),
         "accept" => Ok(Cmd::Accept(optional(args))),
         "block" => Ok(Cmd::Block(optional(args))),
-        "name" if args.is_empty() => Err("try: /name <new name>".into()),
-        "name" => clean_name(args).map(Cmd::Name).map_err(|e| e.to_string()),
+        "name" if args.is_empty() => Err(None),
+        "name" => clean_name(args).map(Cmd::Name).map_err(|e| Some(e.to_string())),
         "phrase" => match words.as_slice() {
             [] => Ok(Cmd::Phrase),
             ["save"] => Ok(Cmd::PhraseSave),
-            ["copy"] => Ok(Cmd::PhraseCopy),
-            _ => Err("type /phrase alone, or /phrase save or /phrase copy; it asks for your passphrase hidden".into()),
+            _ => Err(None),
         },
         "update" => match words.as_slice() {
             [] => Ok(Cmd::Update { yes: false }),
             ["yes" | "y"] => Ok(Cmd::Update { yes: true }),
-            _ => Err("try: /update or /update yes".into()),
+            _ => Err(None),
         },
-        other => Err(unknown(other)),
+        other => Err(Some(unknown(other))),
     };
     match cmd {
         Ok(cmd) => Input::Cmd(cmd),
-        Err(why) => Input::Wrong(why),
+        Err(Some(why)) => Input::Wrong(why),
+        // Every name that gets here has a card.
+        Err(None) => Input::Usage(card_of(&name).map_or("help", |(name, _)| name)),
     }
 }
 
@@ -201,17 +269,20 @@ pub fn may_hold_a_secret(line: &str) -> bool {
     let words: Vec<&str> = args.split_whitespace().collect();
     match name.to_lowercase().as_str() {
         "passphrase" => !words.is_empty(),
-        "phrase" => !matches!(words.as_slice(), [] | ["save"] | ["copy"]),
+        "phrase" => !matches!(words.as_slice(), [] | ["save"]),
         _ => false,
     }
 }
 
-fn no_args(args: &str, name: &str, cmd: Cmd) -> Result<Cmd, String> {
-    if args.is_empty() { Ok(cmd) } else { Err(format!("try: /{name}")) }
+/// A command, or why not: `None` for its usage card, else what was wrong.
+type Parsed<T> = Result<T, Option<String>>;
+
+fn no_args(args: &str, cmd: Cmd) -> Parsed<Cmd> {
+    if args.is_empty() { Ok(cmd) } else { Err(None) }
 }
 
-fn named(args: &str, name: &str) -> Result<String, String> {
-    if args.is_empty() { Err(format!("try: /{name} <name>")) } else { Ok(args.to_string()) }
+fn named(args: &str) -> Parsed<String> {
+    if args.is_empty() { Err(None) } else { Ok(args.to_string()) }
 }
 
 fn optional(args: &str) -> Option<String> {
@@ -278,7 +349,6 @@ impl Cmd {
             Cmd::Passphrase => "/passphrase",
             Cmd::Phrase => "/phrase",
             Cmd::PhraseSave => "/phrase save",
-            Cmd::PhraseCopy => "/phrase copy",
             Cmd::Close => "/close",
             Cmd::Clear => "/clear",
             Cmd::Update { .. } => "/update",
@@ -315,11 +385,40 @@ mod tests {
         for name in COMMANDS {
             let slash = format!("/{name}");
             let found = usages.iter().filter(|u| u.split_whitespace().any(|word| word == slash)).count();
-            // /phrase save and /phrase copy are listed beside /phrase.
-            let want = if *name == "phrase" { 3 } else { 1 };
+            // /phrase save is listed beside /phrase.
+            let want = if *name == "phrase" { 2 } else { 1 };
             assert_eq!(found, want, "{slash} in the help: {usages:?}");
         }
-        assert_eq!(HELP.iter().map(|(group, _)| *group).collect::<Vec<_>>(), ["Friends", "Chatting", "You", "App"]);
+        assert_eq!(HELP.iter().map(|(group, _)| *group).collect::<Vec<_>>(), ["You", "Friends", "Chatting", "App"]);
+    }
+
+    #[test]
+    fn every_command_has_a_usage() {
+        for name in COMMANDS {
+            let card = usage(name).unwrap_or_else(|| panic!("/{name} has no usage"));
+            let slash = format!("/{name}");
+            assert!(card.usage.split_whitespace().any(|w| w == slash), "/{name}: {card:?}");
+            assert!(card.what.ends_with('.'), "/{name}: one sentence");
+            assert!(card.example.is_none_or(|e| e.starts_with(&slash)), "/{name}: {card:?}");
+        }
+        assert_eq!(usage("h"), usage("help"), "aliases share it");
+        assert_eq!(usage("q"), usage("quit"));
+        assert_eq!(usage("nope"), None);
+    }
+
+    #[test]
+    fn a_command_missing_its_name_gives_its_usage() {
+        assert_eq!(parse("/chat"), Input::Usage("chat"));
+        assert_eq!(parse("/add"), Input::Usage("add"));
+        assert_eq!(parse("/q now"), Input::Usage("quit"), "under its name, not the alias");
+    }
+
+    #[test]
+    fn a_bad_code_is_still_a_one_line_error() {
+        let text = Seed::generate().code().to_string();
+        assert!(wrong(&format!("/add {}", &text[..30])).contains("probably missing"));
+        assert!(wrong("/name a\u{202E}b").contains("can't"), "a bad name too");
+        assert!(wrong("/frobnicate").starts_with("unknown command"));
     }
 
     #[test]
@@ -355,18 +454,18 @@ mod tests {
 
     #[test]
     fn commands_without_arguments_refuse_extra_ones() {
-        for (line, hint) in [
-            ("/code now", "try: /code"),
-            ("/contacts all", "try: /contacts"),
-            ("/requests x", "try: /requests"),
-            ("/blocked x", "try: /blocked"),
-            ("/passphrase new", "type /passphrase alone; it asks for them hidden"),
-            ("/close bob", "try: /close"),
-            ("/clear all", "try: /clear"),
-            ("/help me", "try: /help"),
-            ("/q now", "try: /quit"),
+        for (line, name) in [
+            ("/code now", "code"),
+            ("/contacts all", "contacts"),
+            ("/requests x", "requests"),
+            ("/blocked x", "blocked"),
+            ("/passphrase new", "passphrase"),
+            ("/close bob", "close"),
+            ("/clear all", "clear"),
+            ("/help me", "help"),
+            ("/q now", "quit"),
         ] {
-            assert_eq!(wrong(line), hint, "{line}");
+            assert_eq!(parse(line), Input::Usage(name), "{line}");
         }
     }
 
@@ -377,7 +476,7 @@ mod tests {
         let text = code.to_string();
         let (a, b) = text.split_at(20);
         assert_eq!(cmd(&format!("/add {a} {b}")), Cmd::Add(code), "pasted with a break in it");
-        assert!(wrong("/add").starts_with("try: /add <code>"));
+        assert_eq!(parse("/add"), Input::Usage("add"));
         assert!(wrong(&format!("/add {}", &text[..30])).contains("probably missing"));
         // One character of the key changed: only the checksum can tell.
         let swapped = if &text[10..11] == "q" { "p" } else { "q" };
@@ -392,13 +491,8 @@ mod tests {
         assert_eq!(cmd("/unblock rahul·m4x8"), Cmd::Unblock("rahul·m4x8".into()));
         assert_eq!(cmd("/remove rahul"), Cmd::Remove("rahul".into()));
         assert_eq!(cmd("/info rahul"), Cmd::Info("rahul".into()));
-        for (line, hint) in [
-            ("/chat", "try: /chat <name>"),
-            ("/unblock ", "try: /unblock <name>"),
-            ("/remove", "try: /remove <name>"),
-            ("/info", "try: /info <name>"),
-        ] {
-            assert_eq!(wrong(line), hint, "{line}");
+        for (line, name) in [("/chat", "chat"), ("/unblock ", "unblock"), ("/remove", "remove"), ("/info", "info")] {
+            assert_eq!(parse(line), Input::Usage(name), "{line}");
         }
     }
 
@@ -413,7 +507,7 @@ mod tests {
     #[test]
     fn name_is_checked_like_any_display_name() {
         assert_eq!(cmd("/name  Ana   Maria "), Cmd::Name("Ana Maria".into()));
-        assert_eq!(wrong("/name"), "try: /name <new name>");
+        assert_eq!(parse("/name"), Input::Usage("name"));
         assert!(wrong(&format!("/name {}", "x".repeat(33))).contains("33 characters"));
         assert!(wrong("/name a\u{202E}b").contains("can't"));
     }
@@ -421,14 +515,13 @@ mod tests {
     #[test]
     fn phrase_and_update_take_a_fixed_word() {
         assert_eq!(cmd("/phrase save"), Cmd::PhraseSave);
-        assert_eq!(cmd("/phrase copy"), Cmd::PhraseCopy);
-        let alone = "type /phrase alone, or /phrase save or /phrase copy; it asks for your passphrase hidden";
-        assert_eq!(wrong("/phrase print"), alone);
-        assert_eq!(wrong("/phrase save now"), alone);
+        assert_eq!(parse("/phrase copy"), Input::Usage("phrase"), "no clipboard any more");
+        assert_eq!(parse("/phrase print"), Input::Usage("phrase"));
+        assert_eq!(parse("/phrase save now"), Input::Usage("phrase"));
         assert_eq!(cmd("/update"), Cmd::Update { yes: false });
         assert_eq!(cmd("/update yes"), Cmd::Update { yes: true });
         assert_eq!(cmd("/update y"), Cmd::Update { yes: true });
-        assert_eq!(wrong("/update now"), "try: /update or /update yes");
+        assert_eq!(parse("/update now"), Input::Usage("update"));
     }
 
     #[test]

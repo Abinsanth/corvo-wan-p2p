@@ -3,9 +3,10 @@
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
 
-use super::commands::{HELP, KEYS, MARKS};
+use super::commands::{HELP, KEYS};
 use super::state::State;
 use super::view::wrap;
+use unicode_width::UnicodeWidthStr;
 
 /// A window over the main screen, and how far down it's scrolled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -14,9 +15,12 @@ pub enum Overlay {
     Help { scroll: u16 },
 }
 
-/// Where a help line's description starts: after a two-space indent and
-/// the command (or key), padded.
-const DESCRIBED_AT: usize = 23;
+/// The help's columns: the group, then the command (or key), then what it
+/// does. Narrower than `GROUP + COMMAND + DESCRIPTION`, each group's name
+/// goes on a row of its own instead.
+const GROUP: usize = 11;
+const COMMAND: usize = 18;
+const DESCRIPTION: usize = 12;
 /// Columns a window's text leaves for its border and margins: two at the
 /// left, at least two at the right.
 const FRAME: u16 = 6;
@@ -25,7 +29,7 @@ const WELCOME: &[&str] = &[
     "Chat with friends directly, computer to computer.",
     "",
     "• Your code is your address. Share it freely:",
-    "  /code shows it and copies it.",
+    "  /code shows it and saves it to a file.",
     "• Your 12 words are your account. Never share",
     "  them, and keep a copy off this computer.",
     "• To add a friend: /add <their code>, then say hi.",
@@ -86,27 +90,31 @@ pub fn rows(overlay: &Overlay, size: (u16, u16)) -> Vec<String> {
     }
 }
 
-/// The help in `inner` columns: each group's heading, then its commands with
-/// their descriptions, which wrap under themselves; then the keys and marks.
+/// The help in `inner` columns: each group with its commands and what they
+/// do, which wraps under itself; then the keys.
 fn help_rows(inner: usize) -> Vec<String> {
+    let wide = inner >= GROUP + COMMAND + DESCRIPTION;
+    let indent = if wide { GROUP } else { 2 };
     let mut rows = Vec::new();
-    let mut section = |title: &str, items: &[(&str, &str)]| {
-        rows.push(title.to_string());
-        for (name, what) in items {
-            let width = inner.saturating_sub(DESCRIBED_AT).max(12);
-            for (i, part) in wrap(what, width).into_iter().enumerate() {
-                let head =
-                    if i == 0 { format!("  {name:<w$}", w = DESCRIBED_AT - 2) } else { " ".repeat(DESCRIBED_AT) };
+    for (group, items) in HELP.iter().chain([("Keys", KEYS)].iter()) {
+        if !wide {
+            rows.push(group.to_string());
+        }
+        for (i, (name, what)) in items.iter().enumerate() {
+            let lead = if wide && i == 0 { format!("{group:<GROUP$}") } else { " ".repeat(indent) };
+            // A long key gets two spaces after it, past the column.
+            let column = COMMAND.max(name.width() + 2);
+            let width = inner.saturating_sub(indent + column).max(DESCRIPTION);
+            for (j, part) in wrap(what, width).into_iter().enumerate() {
+                let head = if j == 0 {
+                    format!("{lead}{name}{}", " ".repeat(column - name.width()))
+                } else {
+                    " ".repeat(indent + column)
+                };
                 rows.push(format!("{head}{part}"));
             }
         }
-    };
-    for (group, commands) in HELP {
-        section(group, commands);
     }
-    section("", &[]);
-    section("Keys", KEYS);
-    section("Marks", MARKS);
     rows
 }
 
@@ -272,10 +280,38 @@ mod tests {
 
     #[test]
     fn a_long_help_line_wraps_under_its_description() {
-        let help = rows(&Overlay::Help { scroll: 0 }, (80, 24));
-        let at = help.iter().position(|r| r.contains("/code")).expect("listed");
-        let indent = help[at].find("show").expect("described");
-        assert!(help[at + 1].starts_with(&" ".repeat(indent)), "{:?}", &help[at..at + 2]);
+        let help = help_rows(GROUP + COMMAND + DESCRIPTION);
+        let at = help.iter().position(|r| r.contains("/contacts")).expect("listed");
+        assert!(help[at].ends_with("  contacts and"), "{:?}", &help[at..at + 2]);
+        let indent = help[at].find("contacts and").expect("described");
+        assert_eq!(help[at + 1], format!("{}requests", " ".repeat(indent)));
+    }
+
+    #[test]
+    fn the_help_reads_as_decided() {
+        let help = help_rows(74);
+        for row in [
+            "You        /name <new name>  your display name",
+            "Friends    /code             your code",
+            "           /add <code>       add a friend",
+            "Chatting   /chat <name>      open a chat",
+            "App        /update           get the newest version",
+            "           /quit  /q         quit (Ctrl-C)",
+            "Keys       Tab               complete",
+            "           Shift-Tab, Alt-1..9  switch tabs",
+            "           ↑/↓               what you typed before",
+        ] {
+            assert!(help.iter().any(|r| r == row), "{row:?} missing: {help:#?}");
+        }
+    }
+
+    #[test]
+    fn a_narrow_help_puts_each_group_on_its_own_row() {
+        let help = help_rows(34);
+        assert_eq!(help[0], "You");
+        assert!(help[1].starts_with("  /name <new name>"), "{help:#?}");
+        assert!(help.iter().any(|r| r == "Keys"));
+        assert!(help.iter().all(|r| r.width() <= 34), "{help:#?}");
     }
 
     #[test]

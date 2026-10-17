@@ -30,8 +30,7 @@ fn main() -> anyhow::Result<()> {
     ui::install_panic_hook();
     let dir = data_dir().context("couldn't tell where your home folder is; set HOME (APPDATA on Windows)")?;
     logging::start(&dir);
-    let mut state = State::onboarding(Onboarding::start(Store::exists(&dir), args.recover));
-    state.can_copy = ui::clip::can_copy(std::env::var("TERM_PROGRAM").ok().as_deref());
+    let state = State::onboarding(Onboarding::start(Store::exists(&dir), args.recover));
     let runner = Runner::new(dir, home_dir(), Config::DEFAULT, Net::Internet, stdout());
     if let Some(why) = runtime.block_on(ui::run(state, runner))? {
         eprintln!("{why}");

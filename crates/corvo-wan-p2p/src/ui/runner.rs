@@ -9,14 +9,13 @@ use anyhow::Context;
 use corvo_wan_p2p_core::chat::{ChatError, Client, Config, Event};
 use corvo_wan_p2p_core::identity::{Code, Seed};
 use corvo_wan_p2p_core::net::internet_endpoint;
-use corvo_wan_p2p_core::recovery;
 use corvo_wan_p2p_core::store::{Mark, Standing, Store, StoreError, StoredMessage};
+use corvo_wan_p2p_core::{codefile, recovery};
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::SetTitle;
 
 use super::account::{PhraseDone, PhraseUse};
 use super::chat::{History, Loaded};
-use super::clip::osc52;
 use super::people::Act;
 use super::state::{CHAT_LEN, Secret};
 use super::update::{Effect, Msg, Outcome};
@@ -66,7 +65,7 @@ pub struct Runner<W: Write> {
     home: Option<PathBuf>,
     config: Config,
     net: Net,
-    /// The terminal: window titles and the clipboard are written here.
+    /// The terminal: window titles are written here.
     out: W,
     /// An account just made, until the engine starts on it.
     store: Option<Store>,
@@ -125,10 +124,6 @@ impl<W: Write> Runner<W> {
             Effect::Exit(why) => return Ok(Flow::Exit(why)),
             Effect::SetTitle(title) => {
                 execute!(self.out, SetTitle(title))?;
-                return Ok(Flow::Next(None));
-            }
-            Effect::Copy(text) => {
-                self.copy(&text)?;
                 return Ok(Flow::Next(None));
             }
             Effect::Unlock(passphrase) => {
@@ -216,6 +211,10 @@ impl<W: Write> Runner<W> {
                 Some(release) => self.install_update(&release).await.map(|()| release.version.to_string()),
                 None => Err("nothing to install: /update looks for a newer version first".into()),
             }),
+            Effect::ShowCode => {
+                Outcome::CodeShown { saved: self.home.as_deref().map(codefile::path).filter(|p| p.exists()) }
+            }
+            Effect::WriteCode => self.write_code(),
             Effect::Refresh(show) => Outcome::Refreshed {
                 show,
                 result: match self.client() {
@@ -272,12 +271,6 @@ impl<W: Write> Runner<W> {
         done.map_err(|e| e.to_string())
     }
 
-    fn copy(&mut self, text: &str) -> std::io::Result<()> {
-        let sequence = osc52(text);
-        self.out.write_all(sequence.as_bytes())?;
-        self.out.flush()
-    }
-
     /// Starts the engine on `store`; anything that stops it is fatal.
     async fn start(&mut self, store: Store) -> Outcome {
         match self.try_start(store).await {
@@ -304,6 +297,21 @@ impl<W: Write> Runner<W> {
         Ok(Outcome::Started { name: profile.name, code, recovery_file: self.recovery_file() })
     }
 
+    /// Writes the code file; one that's there already is reported as there.
+    fn write_code(&self) -> Outcome {
+        let Some(home) = self.home.as_deref() else {
+            return Outcome::CodeWritten(Err("couldn't find your home folder".into()));
+        };
+        let Some(client) = &self.client else { return Outcome::CodeWritten(Err(NOT_STARTED.into())) };
+        match codefile::write(home, &client.me()) {
+            Ok(path) => Outcome::CodeWritten(Ok(path)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                Outcome::CodeShown { saved: Some(codefile::path(home)) }
+            }
+            Err(e) => Outcome::CodeWritten(Err(e.to_string())),
+        }
+    }
+
     /// Where the recovery file is, if it's there.
     fn recovery_file(&self) -> Option<PathBuf> {
         self.home.as_deref().map(recovery::path).filter(|p| p.exists())
@@ -321,10 +329,6 @@ impl<W: Write> Runner<W> {
         let words = Secret::new(seed.phrase());
         match then {
             PhraseUse::Show => Ok(PhraseDone::Shown(words)),
-            PhraseUse::Copy => {
-                self.copy(words.expose()).map_err(|e| format!("couldn't copy them: {e}"))?;
-                Ok(PhraseDone::Copied)
-            }
             PhraseUse::Save { overwrite } => match self.recovery_file() {
                 Some(path) if !overwrite => Ok(PhraseDone::Exists(path)),
                 _ => self.write_recovery(&seed, overwrite).map(PhraseDone::Saved),
@@ -361,7 +365,6 @@ pub fn date(unix_secs: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ui::clip::osc52;
     use crate::ui::onboarding::Onboarding;
     use crate::ui::state::{Screen, State};
     use crate::ui::update::update;
@@ -500,7 +503,7 @@ mod tests {
             assert!(file.contains(&format!("{:>2}. {word}", i + 1)));
         }
         assert!(file.contains(&seed.code().to_string()));
-        assert!(app.written().contains(osc52(&seed.code().to_string()).as_str()), "the code is copied");
+        assert!(!app.written().contains("\x1b]52"), "nothing is sent to the clipboard");
         assert_eq!(app.send("").await, None);
         assert!(matches!(app.state.screen, Screen::Main));
         assert_eq!(app.state.code, Some(seed.code()));
@@ -541,7 +544,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn phrase_shows_saves_and_copies_the_words() {
+    async fn phrase_shows_and_saves_the_words() {
         let (data, home) = (TempDir::new().unwrap(), TempDir::new().unwrap());
         let mut app = App::open(&data, &home, false);
         let seed = app.make_account().await;
@@ -556,10 +559,6 @@ mod tests {
         app.handle(Msg::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE))).await;
         assert_eq!(app.state.reveal, None);
 
-        app.send("/phrase copy").await;
-        app.send("pw").await;
-        assert!(app.written().contains(osc52(&seed.phrase()).as_str()));
-
         recovery::remove(home.path()).unwrap();
         app.send("/phrase save").await;
         app.send("pw").await;
@@ -569,6 +568,24 @@ mod tests {
         assert_eq!(app.state.ask().unwrap().label, "replace it? y/n: ");
         app.send("y").await;
         assert!(app.said().last().unwrap().starts_with("your words are saved in"));
+        app.runner.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn code_offers_the_code_file_then_says_where_it_is() {
+        let (data, home) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        let mut app = App::open(&data, &home, false);
+        let seed = app.make_account().await;
+        app.start().await;
+        app.send("/code").await;
+        assert_eq!(app.state.ask().unwrap().label, "save it to ~/corvo-wan-p2p-code.txt? y/n: ");
+        app.send("y").await;
+        let file = codefile::path(home.path());
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), format!("{}\n", seed.code()));
+        assert!(app.said().last().unwrap().starts_with(&format!("saved in {}", file.display())));
+        app.send("/code").await;
+        assert_eq!(app.state.ask(), None, "not asked again");
+        assert_eq!(app.said().last().unwrap(), &format!("it's saved in {}", file.display()));
         app.runner.shutdown().await;
     }
 

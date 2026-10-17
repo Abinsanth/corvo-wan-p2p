@@ -4,13 +4,13 @@
 
 pub mod account;
 pub mod chat;
-pub mod clip;
 pub mod commands;
 pub mod complete;
 pub mod onboarding;
 pub mod people;
 pub mod runner;
 pub mod state;
+pub mod table;
 pub mod update;
 pub mod view;
 pub mod window;

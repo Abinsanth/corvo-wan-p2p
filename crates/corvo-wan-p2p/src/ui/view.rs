@@ -386,7 +386,7 @@ fn draw_onboarding(frame: &mut Frame, state: &State, onboarding: &Onboarding, ar
     let title = format!(" {APP} {VERSION}");
     frame.render_widget(Paragraph::new(title).style(Style::new().add_modifier(Modifier::BOLD)), Rect::new(0, 0, w, 1));
     let body = Rect::new(1, 2, w - 2, h - 5);
-    let guidance_text = onboarding.guidance(state.can_copy);
+    let guidance_text = onboarding.guidance();
     let guidance: Vec<(Cow<str>, Style)> = guidance_text.iter().map(|t| plain(t)).collect();
     let mut notes: Vec<(Cow<str>, Style)> =
         onboarding.notes.iter().map(|n| (Cow::Borrowed(n.text.as_str()), tone(n.tone))).collect();
@@ -855,15 +855,22 @@ mod tests {
     }
 
     #[test]
-    fn the_help_window_shows_groups_keys_and_marks() {
+    fn the_help_window_shows_groups_and_keys_without_marks() {
         let mut state = State::new("ana".into(), "abcdefgh".into());
         state.overlay = Some(Overlay::Help { scroll: 0 });
         let buf = render(&state, 100, 50);
         let screen = (0..buf.area.height).map(|y| row(&buf, y)).collect::<Vec<_>>().join("\n");
-        for part in ["┌─ Help ─", " Esc closes ─┐", "│  Friends", "    /add <code>", "│  Keys", "    ✓✓ ", "read"]
-        {
+        for part in [
+            "┌─ Help ─",
+            " Esc closes ─┐",
+            "│  You        /name <new name>  your display name",
+            "│  Friends    /code             your code",
+            "│             /add <code>       add a friend",
+            "│  Keys       Tab               complete",
+        ] {
             assert!(screen.contains(part), "{part:?} missing:\n{screen}");
         }
+        assert!(!screen.contains("✓✓") && !screen.contains("Marks"), "{screen}");
     }
 
     #[test]
@@ -877,10 +884,10 @@ mod tests {
         };
         let top = screen(&state);
         assert!(top.contains("↓ more"), "{top}");
-        assert!(!top.contains("Marks"), "the end is out of sight on 80×24");
+        assert!(!top.contains("what you typed before"), "the end is out of sight on 80×24");
         state.overlay = Some(Overlay::Help { scroll: u16::MAX });
         let end = screen(&state);
-        assert!(end.contains("Marks") && !end.contains("↓ more"), "{end}");
+        assert!(end.contains("what you typed before") && !end.contains("↓ more"), "{end}");
         state.overlay = Some(Overlay::Welcome { scroll: 0 });
         assert!(!screen(&state).contains("↓ more"), "the welcome fits");
     }
@@ -1131,7 +1138,7 @@ mod tests {
         assert!(!screen(&render(&state, 80, 24)).contains("hunter2"));
 
         let mut state = busy_state();
-        for (command, questions) in [("/passphrase", 3), ("/phrase", 1), ("/phrase copy", 1)] {
+        for (command, questions) in [("/passphrase", 3), ("/phrase", 1), ("/phrase save", 1)] {
             send(&mut state, command);
             for _ in 0..questions {
                 typed(&mut state, secret);

@@ -120,6 +120,34 @@ fn wipe_removes_the_account() {
 }
 
 #[test]
+fn delete_all_removes_the_folder_with_everything_in_it() {
+    let parent = tempfile::tempdir().unwrap();
+    let dir = parent.path().join("corvo-wan-p2p");
+    drop(new_account(&dir));
+    for stray in ["key.json.tmp", "corvo-wan-p2p.log", "corvo-wan-p2p.log.old"] {
+        fs::write(dir.join(stray), "left over").unwrap();
+    }
+    fs::create_dir(dir.join("a folder")).unwrap();
+    fs::write(dir.join("a folder").join("inside"), "x").unwrap();
+    assert!(dir.join("lock").exists());
+    assert!(dir.join(DB_FILE).exists());
+    Store::delete_all(&dir).unwrap();
+    assert!(!dir.exists(), "the folder is gone");
+    assert_eq!(fs::read_dir(parent.path()).unwrap().count(), 0, "and nothing next to it");
+    Store::delete_all(&dir).unwrap(); // nothing there: still fine
+}
+
+#[test]
+fn delete_all_refuses_while_another_app_holds_the_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, _) = new_account(dir.path());
+    assert!(matches!(Store::delete_all(dir.path()), Err(StoreError::AlreadyRunning)));
+    assert!(Store::exists(dir.path()), "nothing was deleted");
+    drop(store);
+    Store::open(dir.path(), "first pass").unwrap();
+}
+
+#[test]
 fn a_create_that_crashed_before_key_json_can_be_redone() {
     let dir = tempfile::tempdir().unwrap();
     fs::write(dir.path().join(DB_FILE), b"half-made").unwrap();

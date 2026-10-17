@@ -45,6 +45,11 @@ impl Secret {
     pub fn expose(&self) -> &str {
         &self.0
     }
+
+    /// The text, still wiped when dropped.
+    pub fn into_inner(self) -> Zeroizing<String> {
+        self.0
+    }
 }
 
 impl fmt::Debug for Secret {

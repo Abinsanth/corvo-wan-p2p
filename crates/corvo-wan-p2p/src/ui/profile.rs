@@ -10,16 +10,21 @@ pub enum MenuItem {
     Name,
     Passphrase,
     Words,
+    DeleteAccount,
 }
 
 /// The menu, in order.
-pub const MENU: &[(&str, MenuItem)] =
-    &[("Change name", MenuItem::Name), ("Change passphrase", MenuItem::Passphrase), ("Show 12 words", MenuItem::Words)];
+pub const MENU: &[(&str, MenuItem)] = &[
+    ("Change name", MenuItem::Name),
+    ("Change passphrase", MenuItem::Passphrase),
+    ("Show 12 words", MenuItem::Words),
+    ("Delete account", MenuItem::DeleteAccount),
+];
 
 const HINT: &str = "↑/↓ choose · Enter open · Esc close";
 
 /// What the Profile tab shows: your name and code, then the menu with the
-/// chosen item marked `›`, then how to use it.
+/// chosen item marked `›` (Delete account in red), then how to use it.
 pub fn lines(state: &State) -> Vec<Line> {
     let line = |text: String, tone| Line { text, tone };
     let code = state.code.map_or_else(String::new, |c| c.to_string());
@@ -30,9 +35,10 @@ pub fn lines(state: &State) -> Vec<Line> {
         line(code, Tone::Plain),
     ];
     lines.push(line(String::new(), Tone::Plain));
-    for (i, (label, _)) in MENU.iter().enumerate() {
+    for (i, (label, item)) in MENU.iter().enumerate() {
         let mark = if i == state.profile_at { '›' } else { ' ' };
-        lines.push(line(format!("{mark} {label}"), Tone::Plain));
+        let tone = if *item == MenuItem::DeleteAccount { Tone::Bad } else { Tone::Plain };
+        lines.push(line(format!("{mark} {label}"), tone));
     }
     lines.push(line(String::new(), Tone::Plain));
     lines.push(line(HINT.into(), Tone::Dim));
@@ -51,6 +57,7 @@ pub fn open(state: &mut State) {
         MenuItem::Name => Form::name(&state.name),
         MenuItem::Passphrase => Form::passphrase(),
         MenuItem::Words => Form::words(),
+        MenuItem::DeleteAccount => Form::delete_account(),
     };
     state.overlay = Some(Overlay::Form(form));
 }

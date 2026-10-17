@@ -36,6 +36,12 @@ fn main() -> anyhow::Result<()> {
     let runner = Runner::new(dir, home_dir(), Config::DEFAULT, Net::Internet, stdout());
     match runtime.block_on(ui::run(state, runner))? {
         Ending::Quit => println!("{}", ui::window::goodbye().join("\n")),
+        Ending::Leave(notes) => {
+            println!("{}\n", ui::window::goodbye().join("\n"));
+            for note in notes {
+                println!("{note}");
+            }
+        }
         Ending::Exit(why) => {
             eprintln!("{why}");
             std::process::exit(1);

@@ -108,6 +108,13 @@ pub enum Effect {
     ShowCode,
     /// Write the code file.
     WriteCode,
+    /// Whether this is your passphrase, before deleting your account.
+    CheckPassphrase(Secret),
+    /// Stop the engine, delete everything the app keeps and leave; with
+    /// `uninstall`, the program too.
+    DeleteAccount {
+        uninstall: bool,
+    },
 }
 
 impl Effect {
@@ -119,7 +126,8 @@ impl Effect {
             Effect::Start => "starting…",
             Effect::Wipe => "deleting…",
             Effect::ChangePassphrase { .. } => "changing your passphrase…",
-            Effect::Phrase { .. } => "checking your passphrase…",
+            Effect::Phrase { .. } | Effect::CheckPassphrase(_) => "checking your passphrase…",
+            Effect::DeleteAccount { .. } => "deleting your account…",
             Effect::CheckUpdate { .. } => "checking for updates…",
             Effect::Install(_) => "updating…",
             _ => return None,
@@ -145,6 +153,8 @@ pub enum Outcome {
     RecoveryFile(Option<PathBuf>),
     RecoveryWritten(Result<PathBuf, String>),
     PassphraseChanged(Result<(), String>),
+    /// Whether the passphrase typed is yours.
+    PassphraseChecked(Result<bool, String>),
     Phrase(Result<PhraseDone, String>),
     Loaded(Result<Loaded, String>),
     /// Older messages, and how many of them couldn't be read.
@@ -623,9 +633,10 @@ fn on_done(state: &mut State, outcome: Outcome, effects: &mut Vec<Effect>) {
         Outcome::LoadedOlder { peer, result } => chat::loaded_older(state, peer, result),
         Outcome::Sent { to, text, result } => chat::sent(state, to, text, result),
         Outcome::Acted { code, act, result, people } => people::acted(state, code, act, result, people),
-        outcome @ (Outcome::Named(_) | Outcome::PassphraseChanged(_) | Outcome::Phrase(_)) => {
-            effects.extend(form::done(state, outcome))
-        }
+        outcome @ (Outcome::Named(_)
+        | Outcome::PassphraseChanged(_)
+        | Outcome::Phrase(_)
+        | Outcome::PassphraseChecked(_)) => effects.extend(form::done(state, outcome)),
         Outcome::Refreshed { show, result } => people::refreshed(state, show, result),
         Outcome::CodeShown { saved } => people::code_shown(state, saved),
         Outcome::CodeWritten(result) => people::code_written(state, result),

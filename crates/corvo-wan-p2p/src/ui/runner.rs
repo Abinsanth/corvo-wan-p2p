@@ -2,7 +2,7 @@
 //! the terminal. What came of each goes back to `update` as [`Msg::Done`].
 
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
@@ -25,6 +25,11 @@ use semver::Version;
 /// For commands that need the engine, before it has started.
 const NOT_STARTED: &str = "the chat engine hasn't started";
 const NOTHING_TO_INSTALL: &str = "nothing to install: /update looks for a newer version first";
+/// After uninstalling: what the installer did that stays.
+#[cfg(not(windows))]
+const PATH_STAYS: &str = "the PATH line the installer added to your shell profile stays; remove it if you like";
+#[cfg(windows)]
+const PATH_STAYS: &str = "the folder the installer added to your PATH stays there; remove it if you like";
 
 /// How the engine reaches other people.
 pub enum Net {
@@ -43,6 +48,8 @@ pub enum Flow {
     Quit,
     /// Leave, printing this.
     Exit(String),
+    /// The account is deleted: leave, printing the goodbye and these.
+    Leave(Vec<String>),
 }
 
 /// Where `/update` looks, and what it found.
@@ -120,6 +127,13 @@ impl<W: Write> Runner<W> {
         let version = found.as_ref().map(|r| r.version.to_string());
         self.updates.found = found;
         Ok(version)
+    }
+
+    /// Uninstalls `exe` in place of the running app.
+    #[cfg(test)]
+    fn with_exe(mut self, exe: PathBuf) -> Self {
+        self.updates.target = Ok(exe);
+        self
     }
 
     /// Does one `stage` of installing the release the last check found. A
@@ -249,6 +263,11 @@ impl<W: Write> Runner<W> {
             Effect::Install(stage) => Outcome::InstallStep { stage, result: self.install(stage).await },
             Effect::ShowCode => Outcome::CodeShown { saved: self.code_file() },
             Effect::WriteCode => self.write_code(),
+            Effect::CheckPassphrase(passphrase) => Outcome::PassphraseChecked(match self.client() {
+                Ok(client) => client.check_passphrase(passphrase.into_inner()).await.map_err(|e| e.to_string()),
+                Err(e) => Err(e),
+            }),
+            Effect::DeleteAccount { uninstall } => return self.delete_account(uninstall).await,
             Effect::Refresh(show) => Outcome::Refreshed {
                 show,
                 result: match self.client() {
@@ -258,6 +277,49 @@ impl<W: Write> Runner<W> {
             },
         };
         Ok(Flow::Next(Some(Msg::Done(outcome))))
+    }
+
+    /// Deletes everything the app keeps, after stopping the engine so the
+    /// store lets go of its files; with `uninstall`, the program too. Leaves
+    /// with what was done, or with what's left, by path, if something
+    /// wouldn't go (the program then stays).
+    async fn delete_account(&mut self, uninstall: bool) -> anyhow::Result<Flow> {
+        self.shutdown().await;
+        let (dir, home) = (self.dir.clone(), self.home.clone());
+        let left = blocking(move || delete_files(&dir, home.as_deref())).await?;
+        if !left.is_empty() {
+            let mut notes = vec!["your account couldn't be deleted completely; still there:".to_string()];
+            notes.extend(left);
+            if uninstall {
+                notes.push("the app wasn't uninstalled".into());
+            }
+            return Ok(Flow::Exit(notes.join("\n")));
+        }
+        let mut notes = vec!["your account is deleted from this computer".to_string()];
+        if uninstall {
+            notes.push(self.uninstall());
+            notes.push(PATH_STAYS.into());
+        }
+        Ok(Flow::Leave(notes))
+    }
+
+    /// Deletes the running program, or says how to.
+    fn uninstall(&self) -> String {
+        let exe = match &self.updates.target {
+            Ok(exe) => exe,
+            Err(why) => return format!("{why}; delete the corvo-wan-p2p program yourself"),
+        };
+        if selfupdate::is_built_from_source(exe) {
+            return "built from source: delete the folder you built it in".into();
+        }
+        // Windows won't delete a program that's running.
+        if cfg!(windows) {
+            return format!("to uninstall, run: del \"{}\"", exe.display());
+        }
+        match std::fs::remove_file(exe) {
+            Ok(()) => format!("uninstalled: removed {}", exe.display()),
+            Err(e) => format!("couldn't remove {} ({e}); to uninstall, run: rm \"{}\"", exe.display(), exe.display()),
+        }
     }
 
     /// The engine's next event; waits forever until it's started.
@@ -386,6 +448,27 @@ impl<W: Write> Runner<W> {
     }
 }
 
+/// Deletes the data folder `dir`, the recovery file and the code file. What
+/// wouldn't go, one line each: where it is and why.
+fn delete_files(dir: &Path, home: Option<&Path>) -> Vec<String> {
+    let mut left = Vec::new();
+    // The log lets go of its file first: Windows won't delete an open one.
+    crate::logging::forget(dir);
+    if let Err(e) = Store::delete_all(dir) {
+        left.push(format!("  {} ({e})", dir.display()));
+    }
+    // Without a home folder, neither file was ever written.
+    if let Some(home) = home {
+        if let Err(e) = recovery::remove(home) {
+            left.push(format!("  {} ({e})", recovery::path(home).display()));
+        }
+        if let Err(e) = codefile::remove(home) {
+            left.push(format!("  {} ({e})", codefile::path(home).display()));
+        }
+    }
+    left
+}
+
 /// Now, in Unix milliseconds.
 fn now_ms() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64)
@@ -432,6 +515,8 @@ mod tests {
     struct App {
         state: State,
         runner: Runner<Vec<u8>>,
+        /// What it printed on leaving after Delete account.
+        left: Option<Vec<String>>,
     }
 
     impl App {
@@ -446,7 +531,7 @@ mod tests {
             let state = State::onboarding(Onboarding::start(Store::exists(&dir), recover));
             let net = Net::Local(lookup.clone());
             let runner = Runner::new(dir, Some(home.path().to_path_buf()), FAST, net, Vec::new());
-            App { state, runner }
+            App { state, runner, left: None }
         }
 
         /// An account called `name` with passphrase `pw`, made straight in the
@@ -492,6 +577,10 @@ mod tests {
                     Flow::Next(None) => {}
                     Flow::Quit => return None,
                     Flow::Exit(why) => return Some(why),
+                    Flow::Leave(notes) => {
+                        self.left = Some(notes);
+                        return None;
+                    }
                 }
             }
             None
@@ -526,6 +615,16 @@ mod tests {
             }
             self.press(KeyCode::Enter).await;
             assert!(matches!(self.state.overlay, Some(Overlay::Form(_))), "the window opens");
+        }
+
+        /// Deletes the account from the Profile tab, answering `uninstall`
+        /// (y or n). `Some` with the message if the app exits.
+        async fn delete_account(&mut self, uninstall: char) -> Option<String> {
+            self.open_profile_item(3).await;
+            self.press(KeyCode::Enter).await;
+            self.fill(&["pw"]).await;
+            self.fill(&["delete"]).await;
+            self.handle(Msg::Key(KeyEvent::new(KeyCode::Char(uninstall), KeyModifiers::NONE))).await
         }
 
         /// Types `fields` into the open window, Tab between them, then Enter.
@@ -762,6 +861,89 @@ mod tests {
         assert!(!dir.join(crate::logging::LOG_FILE).exists());
         assert!(!dir.join("corvo-wan-p2p.log.old").exists());
         app.runner.shutdown().await;
+    }
+
+    /// An account named ana with the code and recovery files in `home`, and
+    /// a program at `exe` to uninstall.
+    async fn with_files(data: &TempDir, home: &TempDir, exe: &Path) -> App {
+        let app = App::person(data, home, &MemoryLookup::new(), "ana").await;
+        codefile::write(home.path(), &app.code()).unwrap();
+        recovery::write(home.path(), &Seed::generate(), "2026-10-17", false).unwrap();
+        std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+        std::fs::write(exe, "the app").unwrap();
+        App { runner: app.runner.with_exe(exe.to_path_buf()), ..app }
+    }
+
+    #[tokio::test]
+    async fn deleting_the_account_removes_the_folder_and_both_files() {
+        let (data, home, bin) = (TempDir::new().unwrap(), TempDir::new().unwrap(), TempDir::new().unwrap());
+        let exe = bin.path().join("corvo-wan-p2p");
+        let mut app = with_files(&data, &home, &exe).await;
+        let dir = data.path().join("corvo-wan-p2p");
+        std::fs::write(dir.join(crate::logging::LOG_FILE), "a log line\n").unwrap();
+        assert_eq!(app.delete_account('y').await, None);
+        let notes = app.left.clone().expect("it leaves");
+        assert!(!dir.exists(), "the data folder is gone");
+        assert_eq!(std::fs::read_dir(data.path()).unwrap().count(), 0);
+        assert_eq!(std::fs::read_dir(home.path()).unwrap().count(), 0, "both files are gone");
+        assert_eq!(notes[0], "your account is deleted from this computer");
+        if cfg!(windows) {
+            assert!(exe.exists());
+            assert_eq!(notes[1], format!("to uninstall, run: del \"{}\"", exe.display()));
+        } else {
+            assert!(!exe.exists(), "uninstalled");
+            assert_eq!(notes[1], format!("uninstalled: removed {}", exe.display()));
+        }
+        assert_eq!(notes[2], PATH_STAYS);
+        assert_eq!(notes.len(), 3);
+
+        let app = App::open(&data, &home, false);
+        assert_ne!(app.state.ask().unwrap().label, "passphrase: ", "a new start makes a new account");
+    }
+
+    #[tokio::test]
+    async fn deleting_without_uninstalling_keeps_the_app() {
+        let (data, home, bin) = (TempDir::new().unwrap(), TempDir::new().unwrap(), TempDir::new().unwrap());
+        let exe = bin.path().join("corvo-wan-p2p");
+        let mut app = with_files(&data, &home, &exe).await;
+        assert_eq!(app.delete_account('n').await, None);
+        assert_eq!(app.left, Some(vec!["your account is deleted from this computer".to_string()]));
+        assert!(exe.exists());
+        assert!(!data.path().join("corvo-wan-p2p").exists());
+    }
+
+    #[tokio::test]
+    async fn a_failed_delete_says_what_is_left() {
+        let (data, home, bin) = (TempDir::new().unwrap(), TempDir::new().unwrap(), TempDir::new().unwrap());
+        let exe = bin.path().join("corvo-wan-p2p");
+        let mut app = with_files(&data, &home, &exe).await;
+        // A folder where the code file goes won't delete as a file.
+        let code_file = codefile::path(home.path());
+        std::fs::remove_file(&code_file).unwrap();
+        std::fs::create_dir(&code_file).unwrap();
+        std::fs::write(code_file.join("inside"), "x").unwrap();
+        let exit = app.delete_account('y').await.expect("it exits with what's left");
+        let lines: Vec<&str> = exit.lines().collect();
+        assert_eq!(lines[0], "your account couldn't be deleted completely; still there:");
+        assert!(lines[1].starts_with(&format!("  {} (", code_file.display())), "{exit}");
+        assert_eq!(lines[2], "the app wasn't uninstalled");
+        assert_eq!(lines.len(), 3, "{exit}");
+        assert!(exe.exists());
+        assert!(!data.path().join("corvo-wan-p2p").exists(), "the rest went");
+        assert!(!recovery::path(home.path()).exists());
+        assert!(app.left.is_none(), "never says it's all gone");
+    }
+
+    #[tokio::test]
+    async fn uninstall_from_source_is_refused_with_a_note() {
+        let (data, home, bin) = (TempDir::new().unwrap(), TempDir::new().unwrap(), TempDir::new().unwrap());
+        let exe = bin.path().join("target").join("debug").join("corvo-wan-p2p");
+        let mut app = with_files(&data, &home, &exe).await;
+        assert_eq!(app.delete_account('y').await, None);
+        let notes = app.left.clone().expect("it leaves");
+        assert_eq!(notes[1], "built from source: delete the folder you built it in");
+        assert!(exe.exists(), "the build is left alone");
+        assert!(!data.path().join("corvo-wan-p2p").exists());
     }
 
     #[test]

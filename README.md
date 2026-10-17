@@ -5,7 +5,7 @@ app to app, end-to-end encrypted, with no server holding their messages. Share
 your code with a friend, they add it, and you chat. Messages wait on your
 machine until you're both online.
 
-**Status:** `v0.1.1`.
+**Status:** `v0.2.0`.
 
 ## Install
 
@@ -89,7 +89,8 @@ a contact means they're online. After your own messages:
 
 Each start opens with "corvo" in ASCII art and the version (any key closes
 it; it goes by itself after 2 seconds). The first start after making or
-recovering an account adds a few tips.
+recovering an account adds a few tips. Quitting leaves a small goodbye in
+the terminal.
 
 The bar at the bottom shows your name and code, whether you're online, how
 the open chat's connection goes (**direct** between the two computers, or
@@ -116,8 +117,12 @@ online, and how many of your messages are still waiting.
 | `/clear` | clear the screen (Ctrl-L) |
 | `/update` | check for a newer version and install it |
 | `/about` | the version, where your data lives, the source and the license |
-| `/help` | a short list of the commands and keys |
-| `/quit` | quit (Ctrl-C) |
+| `/help`, `/h` | a short list of the commands and keys |
+| `/quit`, `/q` | quit (Ctrl-C) |
+
+Keys: **Tab** completes, **Shift-Tab** or **Alt-1..9** switch tabs,
+**Alt+Enter** starts a new line, **PgUp/PgDn** scroll, and **↑/↓** bring back
+what you typed before.
 
 A command typed without what it needs, or with the wrong words, shows how
 it's typed, what it does and an example. Start a message with `//` to send

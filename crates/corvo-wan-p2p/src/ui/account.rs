@@ -9,7 +9,8 @@ use super::commands::Cmd;
 use super::people::Act;
 use super::state::{Ask, Secret, State, Tone};
 use super::update::{Effect, Outcome};
-use crate::selfupdate;
+use super::window::{Overlay, UpdateView};
+use crate::selfupdate::{self, Stage};
 
 /// What `/phrase` does with your words once your passphrase checks out.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,8 +48,8 @@ pub enum Pending {
     Replace { passphrase: Secret },
     /// `/remove`: delete the history with them too?
     Remove { code: Code },
-    /// `/update`: install the newer version found?
-    Update,
+    /// `/update`: install the newer `version` found?
+    Update { version: String },
     /// `/code`: save it to the code file?
     SaveCode,
 }
@@ -64,7 +65,7 @@ impl Pending {
             Pending::Checking { .. } => ("", true),
             Pending::Replace { .. } => ("replace it? y/n: ", false),
             Pending::Remove { .. } => ("delete your history too? y/n: ", false),
-            Pending::Update => ("update now? y/n: ", false),
+            Pending::Update { .. } => ("update now? y/n: ", false),
             Pending::SaveCode => ("save it to ~/corvo-wan-p2p-code.txt? y/n: ", false),
         };
         Ask { label: label.into(), masked }
@@ -154,9 +155,9 @@ pub fn answer(state: &mut State, text: Secret) -> Vec<Effect> {
                 Some(Pending::Remove { code })
             }
         },
-        Pending::Update => match text.expose().trim().to_lowercase().as_str() {
+        Pending::Update { version } => match text.expose().trim().to_lowercase().as_str() {
             "y" | "yes" => {
-                effects.push(Effect::InstallUpdate);
+                install(state, version, &mut effects);
                 None
             }
             "n" | "no" => {
@@ -165,7 +166,7 @@ pub fn answer(state: &mut State, text: Secret) -> Vec<Effect> {
             }
             _ => {
                 state.say(Tone::Bad, "type y or n");
-                Some(Pending::Update)
+                Some(Pending::Update { version })
             }
         },
         Pending::SaveCode => match text.expose().trim().to_lowercase().as_str() {
@@ -186,6 +187,14 @@ pub fn answer(state: &mut State, text: Secret) -> Vec<Effect> {
         checking @ Pending::Checking { .. } => Some(checking),
     };
     effects
+}
+
+/// Starts installing `version`: its window shows the stages as they go.
+fn install(state: &mut State, version: String, effects: &mut Vec<Effect>) {
+    state.overlay =
+        Some(Overlay::Update(UpdateView { version: version.clone(), stage: Stage::Fetch, failed: None, scroll: 0 }));
+    state.installing = Some(version);
+    effects.push(Effect::Install(Stage::Fetch));
 }
 
 /// Esc: stops asking.
@@ -226,20 +235,38 @@ pub fn done(state: &mut State, outcome: Outcome) -> Vec<Effect> {
         Outcome::UpdateChecked { result: Ok(None), .. } => {
             state.say(Tone::Plain, format!("you're up to date ({})", selfupdate::current()))
         }
-        Outcome::UpdateChecked { yes: true, result: Ok(Some(_)) } => effects.push(Effect::InstallUpdate),
+        Outcome::UpdateChecked { yes: true, result: Ok(Some(version)) } => install(state, version, &mut effects),
         Outcome::UpdateChecked { yes: false, result: Ok(Some(version)) } => {
             state.select_tab(0);
             state.say(
                 Tone::Plain,
                 format!("v{version} is available (you have {}). Update now? (Esc cancels)", selfupdate::current()),
             );
-            state.pending = Some(Pending::Update);
+            state.pending = Some(Pending::Update { version });
         }
         Outcome::UpdateChecked { result: Err(why), .. } => state.say(Tone::Bad, why),
-        Outcome::Updated(Ok(version)) => {
-            state.say(Tone::Good, format!("updated to v{version}: /quit and start corvo-wan-p2p again to use it"))
+        Outcome::InstallStep { stage, result: Ok(()) } => match stage.next() {
+            Some(next) => {
+                if let Some(Overlay::Update(view)) = &mut state.overlay {
+                    view.stage = next;
+                }
+                effects.push(Effect::Install(next));
+            }
+            None => {
+                if matches!(state.overlay, Some(Overlay::Update(_))) {
+                    state.overlay = None;
+                }
+                let version = state.installing.take().unwrap_or_default();
+                state.say(Tone::Good, format!("updated to v{version}: /quit and start corvo-wan-p2p again to use it"));
+            }
+        },
+        Outcome::InstallStep { result: Err(why), .. } => {
+            state.installing = None;
+            if let Some(Overlay::Update(view)) = &mut state.overlay {
+                view.failed = Some(why.clone());
+            }
+            state.say(Tone::Bad, why);
         }
-        Outcome::Updated(Err(why)) => state.say(Tone::Bad, why),
         Outcome::UpdatedAlready(version) => state.say(
             Tone::Plain,
             format!("v{version} is installed already: /quit and start corvo-wan-p2p again to use it"),
@@ -480,11 +507,63 @@ mod tests {
 
         send(&mut s, "/update");
         done(&mut s, Outcome::UpdateChecked { yes: false, result: Ok(Some("9.0.0".into())) });
-        assert_eq!(send(&mut s, "y"), vec![Effect::InstallUpdate]);
+        assert_eq!(send(&mut s, "y"), vec![Effect::Install(Stage::Fetch)]);
         assert_eq!(s.busy, Some("updating…"));
-        done(&mut s, Outcome::Updated(Ok("9.0.0".into())));
-        assert_eq!(last(&s).tone, Tone::Good);
-        assert_eq!(last(&s).text, "updated to v9.0.0: /quit and start corvo-wan-p2p again to use it");
+        assert!(matches!(&s.overlay, Some(Overlay::Update(v)) if v.version == "9.0.0" && v.stage == Stage::Fetch));
+    }
+
+    /// An update to 9.0.0 under way, its window open.
+    fn installing() -> State {
+        let mut s = state();
+        send(&mut s, "/update yes");
+        done(&mut s, Outcome::UpdateChecked { yes: true, result: Ok(Some("9.0.0".into())) });
+        s
+    }
+
+    fn step(stage: Stage, result: Result<(), String>) -> Outcome {
+        Outcome::InstallStep { stage, result }
+    }
+
+    #[test]
+    fn the_update_window_walks_fetch_check_swap() {
+        let mut s = installing();
+        assert_eq!(done(&mut s, step(Stage::Fetch, Ok(()))), vec![Effect::Install(Stage::Check)]);
+        assert!(matches!(&s.overlay, Some(Overlay::Update(v)) if v.stage == Stage::Check));
+        assert_eq!(done(&mut s, step(Stage::Check, Ok(()))), vec![Effect::Install(Stage::Swap)]);
+        assert!(matches!(&s.overlay, Some(Overlay::Update(v)) if v.stage == Stage::Swap));
+        assert!(done(&mut s, step(Stage::Swap, Ok(()))).is_empty());
+        assert_eq!(s.overlay, None, "it closes itself");
+        assert_eq!(
+            *last(&s),
+            Line { text: "updated to v9.0.0: /quit and start corvo-wan-p2p again to use it".into(), tone: Tone::Good }
+        );
+        assert_eq!(s.installing, None);
+    }
+
+    #[test]
+    fn a_hidden_update_goes_on_and_says_when_it_is_done() {
+        let mut s = installing();
+        press(&mut s, KeyCode::Esc);
+        assert_eq!(s.overlay, None, "Esc hides it");
+        assert_eq!(done(&mut s, step(Stage::Fetch, Ok(()))), vec![Effect::Install(Stage::Check)]);
+        send(&mut s, "/update");
+        assert_eq!(last(&s).text, "already updating: wait for it to finish");
+        done(&mut s, step(Stage::Check, Ok(())));
+        done(&mut s, step(Stage::Swap, Ok(())));
+        assert!(last(&s).text.starts_with("updated to v9.0.0"));
+    }
+
+    #[test]
+    fn a_failed_step_shows_in_the_window_then_in_the_corvo_tab() {
+        let mut s = installing();
+        done(&mut s, step(Stage::Fetch, Ok(())));
+        let why = "the download didn't match its checksum; nothing changed";
+        assert!(done(&mut s, step(Stage::Check, Err(why.into()))).is_empty(), "no further stage");
+        assert!(matches!(&s.overlay, Some(Overlay::Update(v)) if v.failed.as_deref() == Some(why)));
+        assert_eq!(*last(&s), Line { text: why.into(), tone: Tone::Bad });
+        assert_eq!(s.installing, None, "/update can try again");
+        press(&mut s, KeyCode::Char('x'));
+        assert_eq!(s.overlay, None, "any key closes it");
     }
 
     #[test]
@@ -492,7 +571,7 @@ mod tests {
         let mut s = state();
         assert_eq!(send(&mut s, "/update yes"), vec![Effect::CheckUpdate { yes: true }]);
         let effects = done(&mut s, Outcome::UpdateChecked { yes: true, result: Ok(Some("9.0.0".into())) });
-        assert_eq!(effects, vec![Effect::InstallUpdate]);
+        assert_eq!(effects, vec![Effect::Install(Stage::Fetch)]);
         assert_eq!(s.ask(), None);
     }
 
@@ -501,8 +580,8 @@ mod tests {
         let mut s = state();
         done(&mut s, Outcome::UpdateChecked { yes: false, result: Err("no connection to GitHub".into()) });
         assert_eq!(*last(&s), Line { text: "no connection to GitHub".into(), tone: Tone::Bad });
-        done(&mut s, Outcome::Updated(Err("the download didn't match its checksum; nothing changed".into())));
+        done(&mut s, Outcome::UpdateChecked { yes: false, result: Err(selfupdate::FROM_SOURCE.into()) });
         assert_eq!(last(&s).tone, Tone::Bad);
-        assert!(last(&s).text.contains("nothing changed"));
+        assert!(last(&s).text.contains("built from source"));
     }
 }

@@ -829,29 +829,82 @@ mod tests {
         (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect()
     }
 
+    fn screen_of(state: &State, w: u16, h: u16) -> String {
+        let buf = render(state, w, h);
+        (0..buf.area.height).map(|y| row(&buf, y)).collect::<Vec<_>>().join("\n")
+    }
+
     #[test]
-    fn the_welcome_window_reads_on_80_by_24_and_scrolls_on_less() {
+    fn the_tips_read_on_80_by_24_under_the_art_and_scroll_on_less() {
         let mut state = State::new("ana".into(), "abcdefgh".into());
-        state.overlay = Some(Overlay::Welcome { scroll: 0 });
-        let all = |buf: &Buffer| (0..buf.area.height).map(|y| row(buf, y)).collect::<Vec<_>>().join("\n");
-        let screen = all(&render(&state, 80, 24));
-        // As approved in #41.
+        state.overlay = Some(Overlay::start(true));
+        let screen = screen_of(&state, 80, 24);
+        // The tips' text as approved in #41.
         for part in [
             "┌─ Welcome to corvo ───",
+            r"│  | (__ | (_) || |    \ V / | (_) |",
             "│  Chat with friends directly, computer to computer.   │",
             "│  • Your 12 words are your account. Never share       │",
             "│              /help any time · Enter to start         │",
         ] {
             assert!(screen.contains(part), "{part:?} missing:\n{screen}");
         }
-        let short = all(&render(&state, 40, 12));
+        assert!(!screen.contains("↓ more"), "it all fits on 80×24:\n{screen}");
+        let short = screen_of(&state, 40, 12);
         assert!(short.contains("Welcome to corvo") && !short.contains("/help any time"), "{short}");
-        let total = window::rows(&Overlay::Welcome { scroll: 0 }, (40, 12)).len();
-        state.overlay =
-            Some(Overlay::Welcome { scroll: (total - usize::from(window::height((40, 12), total))) as u16 });
-        assert!(all(&render(&state, 40, 12)).contains("/help any time"), "scrolled to the end");
-        let bigger = all(&render(&state, 80, 24));
-        assert!(bigger.contains("Chat with friends directly"), "a bigger terminal shows it all:\n{bigger}");
+        let total = window::rows(&Overlay::start(true), (40, 12)).len();
+        let end = (total - usize::from(window::height((40, 12), total))) as u16;
+        state.overlay = Some(Overlay::Start { first_run: true, ticks_left: window::START_TICKS, scroll: end });
+        assert!(screen_of(&state, 40, 12).contains("/help any time"), "scrolled to the end");
+    }
+
+    #[test]
+    fn the_start_window_fits_40_by_12() {
+        let mut state = State::new("ana".into(), "abcdefgh".into());
+        state.overlay = Some(Overlay::start(false));
+        let screen = screen_of(&state, 40, 12);
+        for row in window::ART {
+            assert!(screen.contains(row), "{row:?} missing:\n{screen}");
+        }
+        assert!(screen.contains(&format!("corvo-wan-p2p v{}", corvo_wan_p2p_core::VERSION)), "{screen}");
+        assert!(!screen.contains("↓ more"), "{screen}");
+    }
+
+    #[test]
+    fn the_about_window_shows_version_data_folder_and_source() {
+        let mut state = State::new("ana".into(), "abcdefgh".into());
+        state.overlay = Some(Overlay::About { data_dir: "~/.config/corvo-wan-p2p".into(), scroll: 0 });
+        let screen = screen_of(&state, 80, 24);
+        for part in [
+            "┌─ About ",
+            " Esc closes ─┐",
+            &format!("│  corvo-wan-p2p v{}", corvo_wan_p2p_core::VERSION),
+            "│  Your data: ~/.config/corvo-wan-p2p",
+            "│  Source:    github.com/Abinsanth/corvo-wan-p2p",
+            "│  License MIT",
+        ] {
+            assert!(screen.contains(part), "{part:?} missing:\n{screen}");
+        }
+        let small = screen_of(&state, 40, 12);
+        assert!(small.contains("About") && small.contains("corvo-wan-p2p v"), "{small}");
+    }
+
+    #[test]
+    fn the_update_window_fits_40_by_12() {
+        use crate::selfupdate::Stage;
+        use crate::ui::window::UpdateView;
+        let mut state = State::new("ana".into(), "abcdefgh".into());
+        let view = UpdateView { version: "9.0.0".into(), stage: Stage::Check, failed: None, scroll: 0 };
+        state.overlay = Some(Overlay::Update(view.clone()));
+        let screen = screen_of(&state, 40, 12);
+        for part in ["Update", "Updating to v9.0.0", "✓ downloading", "› checking the download", "  installing"] {
+            assert!(screen.contains(part), "{part:?} missing:\n{screen}");
+        }
+        let why =
+            "can't replace /home/ana/.local/bin/corvo-wan-p2p: permission denied. Reinstall with: curl -fsSL x | sh";
+        state.overlay = Some(Overlay::Update(UpdateView { failed: Some(why.into()), ..view }));
+        let failed = screen_of(&state, 40, 12);
+        assert!(failed.contains("✗ checking the download") && failed.contains("↓ more"), "{failed}");
     }
 
     #[test]
@@ -888,8 +941,8 @@ mod tests {
         state.overlay = Some(Overlay::Help { scroll: u16::MAX });
         let end = screen(&state);
         assert!(end.contains("what you typed before") && !end.contains("↓ more"), "{end}");
-        state.overlay = Some(Overlay::Welcome { scroll: 0 });
-        assert!(!screen(&state).contains("↓ more"), "the welcome fits");
+        state.overlay = Some(Overlay::start(false));
+        assert!(!screen(&state).contains("↓ more"), "the start window fits");
     }
 
     fn render(state: &State, w: u16, h: u16) -> Buffer {

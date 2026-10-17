@@ -35,7 +35,9 @@ latest full release.
 
 Then open a new terminal and run `corvo-wan-p2p`. Inside the app, `/update`
 installs newer versions, pre-releases only if you're on one (a copy built
-from source updates with `git pull` and `cargo build` instead).
+from source updates with `git pull` and `cargo build` instead). It asks
+first, then a window shows the steps: downloading, checking the download,
+installing. If a step fails, or you quit partway, the old version stays.
 
 Or build from source with Rust ([rustup.rs](https://rustup.rs)):
 
@@ -83,6 +85,10 @@ A green dot next to a contact means they're online. Next to your own messages:
 | `✓` | delivered to their computer |
 | `✓✓` | read |
 
+Each start opens with "corvo" in ASCII art and the version (any key closes
+it; it goes by itself after 2 seconds). The first start after making or
+recovering an account adds a few tips.
+
 The bar at the bottom shows your name and code, whether you're online, how
 the open chat's connection goes (**direct** between the two computers, or
 **via relay**, and how long a round trip takes), how many contacts are
@@ -110,7 +116,7 @@ online, and how many of your messages are still waiting.
 | `/close` | close this chat tab |
 | `/clear` | clear the screen (Ctrl-L) |
 | `/update` | check for a newer version and install it |
-| `/welcome` | show the welcome again |
+| `/about` | the version, where your data lives, the source and the license |
 | `/help` | a short list of the commands and keys |
 | `/quit` | quit (Ctrl-C) |
 

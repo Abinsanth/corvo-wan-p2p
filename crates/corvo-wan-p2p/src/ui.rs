@@ -4,19 +4,22 @@
 
 pub mod account;
 pub mod chat;
-pub mod clip;
 pub mod commands;
 pub mod complete;
+pub mod form;
 pub mod onboarding;
 pub mod people;
+pub mod profile;
 pub mod runner;
 pub mod state;
+pub mod table;
 pub mod update;
 pub mod view;
 pub mod window;
 
 use std::collections::VecDeque;
 use std::io::{Write, stdout};
+use std::ops::ControlFlow;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
@@ -184,13 +187,16 @@ fn to_msg(ev: TermEvent) -> Option<Msg> {
     }
 }
 
-/// What to keep of the input that arrived during a slow step, like
-/// unlocking: only resizes and Ctrl-C. Anything typed ahead would land on
-/// the next screen, maybe unmasked, so a passphrase typed twice would show.
-fn typed_ahead(rx: &mut mpsc::UnboundedReceiver<TermEvent>) -> Vec<Msg> {
+/// What to keep of the input that arrived during a slow step. With `all`,
+/// between an update's stages, all of it: Esc hides the update window and
+/// Ctrl-C quits before the next stage. Otherwise, like after unlocking, only
+/// resizes and Ctrl-C: anything typed ahead would land on the next screen,
+/// maybe unmasked, so a passphrase typed twice would show.
+fn typed_ahead(rx: &mut mpsc::UnboundedReceiver<TermEvent>, all: bool) -> Vec<Msg> {
     let mut kept = Vec::new();
     while let Ok(ev) = rx.try_recv() {
         match ev {
+            _ if all => kept.extend(to_msg(ev)),
             TermEvent::Resize(..) => kept.extend(to_msg(ev)),
             TermEvent::Key(key) if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) => {
                 kept.push(Msg::Key(key))
@@ -201,9 +207,41 @@ fn typed_ahead(rx: &mut mpsc::UnboundedReceiver<TermEvent>) -> Vec<Msg> {
     kept
 }
 
-/// Runs the UI until it quits. `Some` with a message to print if it has to
-/// exit, like when the account is open in another window.
-pub async fn run<W: Write>(mut state: State, mut runner: Runner<W>) -> anyhow::Result<Option<String>> {
+/// How the UI ended, for what to print once the terminal is back.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Ending {
+    /// `/quit` or Ctrl-C.
+    Quit,
+    /// It had to stop, like when the account is open in another window: why.
+    Exit(String),
+    /// The account was deleted: what was done, for after the goodbye.
+    Leave(Vec<String>),
+}
+
+/// Adds `new` to the work queued. Quitting goes first: Ctrl-C during an
+/// update's stage stops it before the next one.
+fn enqueue(queue: &mut VecDeque<Effect>, new: Vec<Effect>) {
+    for effect in new {
+        if effect == Effect::Quit {
+            queue.push_front(effect);
+        } else {
+            queue.push_back(effect);
+        }
+    }
+}
+
+/// What the loop does after `flow`: go on, maybe with a message, or end.
+fn after(flow: Flow) -> ControlFlow<Ending, Option<Msg>> {
+    match flow {
+        Flow::Next(msg) => ControlFlow::Continue(msg),
+        Flow::Quit => ControlFlow::Break(Ending::Quit),
+        Flow::Exit(why) => ControlFlow::Break(Ending::Exit(why)),
+        Flow::Leave(notes) => ControlFlow::Break(Ending::Leave(notes)),
+    }
+}
+
+/// Runs the UI until it ends.
+pub async fn run<W: Write>(mut state: State, mut runner: Runner<W>) -> anyhow::Result<Ending> {
     let result = interact(&mut state, &mut runner).await;
     // After the terminal is back, so leaving looks instant.
     runner.shutdown().await;
@@ -212,7 +250,7 @@ pub async fn run<W: Write>(mut state: State, mut runner: Runner<W>) -> anyhow::R
 
 /// The loop: draw, then carry out one waiting effect or wait for the next
 /// message. Drawing before each effect shows what's slow, like "unlocking…".
-async fn interact<W: Write>(state: &mut State, runner: &mut Runner<W>) -> anyhow::Result<Option<String>> {
+async fn interact<W: Write>(state: &mut State, runner: &mut Runner<W>) -> anyhow::Result<Ending> {
     // Declared in this order so they drop in reverse: the input thread stops
     // before the guard gives the terminal back.
     let _guard = Guard::enter().context("couldn't set up the terminal")?;
@@ -220,17 +258,21 @@ async fn interact<W: Write>(state: &mut State, runner: &mut Runner<W>) -> anyhow
     let (term_tx, mut term_rx) = mpsc::unbounded_channel();
     let _input = InputThread::start(term_tx);
     let size = terminal.size()?;
-    let mut effects: VecDeque<Effect> = update(state, Msg::Resize(size.width, size.height)).into();
+    let mut effects = VecDeque::new();
+    enqueue(&mut effects, update(state, Msg::Resize(size.width, size.height)));
     let mut tick = tokio::time::interval(TICK);
     loop {
         terminal.draw(|frame| view::draw(frame, state))?;
+        // `Some` after a slow step: whether to keep everything typed during it.
         let (msg, slow) = match effects.pop_front() {
             Some(effect) => {
-                let slow = effect.busy().is_some();
-                match runner.apply(effect).await? {
-                    Flow::Next(msg) => (msg, slow),
-                    Flow::Quit => return Ok(None),
-                    Flow::Exit(why) => return Ok(Some(why)),
+                let slow = match effect {
+                    Effect::Install(_) => Some(true),
+                    _ => effect.busy().map(|_| false),
+                };
+                match after(runner.apply(effect).await?) {
+                    ControlFlow::Continue(msg) => (msg, slow),
+                    ControlFlow::Break(ending) => return Ok(ending),
                 }
             }
             None => (
@@ -242,15 +284,15 @@ async fn interact<W: Write>(state: &mut State, runner: &mut Runner<W>) -> anyhow
                 Some(event) = runner.next_event() => Some(Msg::Core(event)),
                 _ = tick.tick() => Some(Msg::Tick),
                 },
-                false,
+                None,
             ),
         };
         if let Some(msg) = msg {
-            effects.extend(update(state, msg));
+            enqueue(&mut effects, update(state, msg));
         }
-        if slow {
-            for msg in typed_ahead(&mut term_rx) {
-                effects.extend(update(state, msg));
+        if let Some(all) = slow {
+            for msg in typed_ahead(&mut term_rx, all) {
+                enqueue(&mut effects, update(state, msg));
             }
         }
     }
@@ -293,6 +335,16 @@ mod tests {
     }
 
     #[test]
+    fn quitting_ends_with_quit_and_a_fatal_error_with_exit() {
+        assert!(matches!(after(Flow::Quit), ControlFlow::Break(Ending::Quit)));
+        let exit = after(Flow::Exit("open elsewhere".into()));
+        assert!(matches!(exit, ControlFlow::Break(Ending::Exit(why)) if why == "open elsewhere"));
+        assert!(matches!(after(Flow::Next(Some(Msg::Tick))), ControlFlow::Continue(Some(Msg::Tick))));
+        let leave = after(Flow::Leave(vec!["deleted".into()]));
+        assert!(matches!(leave, ControlFlow::Break(Ending::Leave(notes)) if notes == ["deleted"]));
+    }
+
+    #[test]
     fn keyboard_flags_report_shifted_characters() {
         use KeyboardEnhancementFlags as F;
         assert!(KEYBOARD_FLAGS.contains(F::DISAMBIGUATE_ESCAPE_CODES));
@@ -312,9 +364,30 @@ mod tests {
         tx.send(TermEvent::Paste("hunter2".into())).unwrap();
         tx.send(TermEvent::Resize(90, 30)).unwrap();
         tx.send(key(KeyCode::Char('c'), KeyModifiers::CONTROL)).unwrap();
-        let kept = typed_ahead(&mut rx);
+        let kept = typed_ahead(&mut rx, false);
         assert!(matches!(kept[..], [Msg::Resize(90, 30), Msg::Key(k)] if k.code == KeyCode::Char('c')), "{kept:?}");
         assert!(rx.try_recv().is_err(), "nothing is left to read");
+    }
+
+    #[test]
+    fn between_update_stages_everything_typed_is_kept() {
+        use ratatui::crossterm::event::KeyEvent;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let key = |code, modifiers| TermEvent::Key(KeyEvent::new(code, modifiers));
+        tx.send(key(KeyCode::Esc, KeyModifiers::NONE)).unwrap();
+        tx.send(key(KeyCode::Char('h'), KeyModifiers::NONE)).unwrap();
+        tx.send(key(KeyCode::Char('c'), KeyModifiers::CONTROL)).unwrap();
+        let kept = typed_ahead(&mut rx, true);
+        assert_eq!(kept.len(), 3, "{kept:?}");
+        assert!(matches!(kept[0], Msg::Key(k) if k.code == KeyCode::Esc), "Esc hides the window");
+    }
+
+    #[test]
+    fn quit_goes_before_work_already_queued() {
+        use crate::selfupdate::Stage;
+        let mut queue: VecDeque<Effect> = VecDeque::from([Effect::Install(Stage::Swap)]);
+        enqueue(&mut queue, vec![Effect::SetTitle("x".into()), Effect::Quit]);
+        assert_eq!(Vec::from(queue), [Effect::Quit, Effect::Install(Stage::Swap), Effect::SetTitle("x".into())]);
     }
 
     #[test]

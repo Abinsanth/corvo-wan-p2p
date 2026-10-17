@@ -3,6 +3,7 @@
 //! depends on terminal crates, so all of it can be tested without a screen.
 
 pub mod chat;
+pub mod codefile;
 pub mod files;
 pub mod identity;
 pub mod names;

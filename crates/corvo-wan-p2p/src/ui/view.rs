@@ -20,7 +20,6 @@ use std::sync::Arc;
 
 use corvo_wan_p2p_core::VERSION;
 use corvo_wan_p2p_core::identity::{Code, is_invisible};
-use corvo_wan_p2p_core::names::YOU;
 use corvo_wan_p2p_core::store::{Mark, Standing};
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
@@ -31,8 +30,10 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use zeroize::Zeroizing;
 
 use super::chat::local;
+use super::form::{self, Form};
 use super::onboarding::Onboarding;
-use super::state::{APP, Line, MAX_INPUT_ROWS, RowKey, Rows, Screen, Secret, State, Tab, Tone};
+use super::profile;
+use super::state::{APP, Line, MAX_INPUT_ROWS, RowKey, Rows, Screen, State, Tab, TabKind, Tone};
 use super::window::{self, Overlay};
 
 /// Smaller than this, only [`TOO_SMALL`] is drawn.
@@ -90,22 +91,45 @@ pub fn input_rows(state: &State) -> usize {
     state.editor.rows().len().clamp(1, MAX_INPUT_ROWS)
 }
 
-/// One line of a tab and how long its head is: the bytes of `text` before
-/// a message's own text (its time and who sent it), 0 for other lines.
-pub type Shown = (Line, usize);
+/// Which side of a chat a line is on: theirs and everything else on the
+/// left, yours on the right.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Side {
+    Left,
+    Right,
+}
+
+/// One line of a tab. `head` is, on the left, the bytes of `text` before a
+/// message's own text (its time), and on the right the bytes after it (its
+/// time and mark); 0 for lines that aren't messages.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Shown {
+    pub line: Line,
+    pub head: usize,
+    pub side: Side,
+}
+
+impl Shown {
+    fn plain(line: Line) -> Shown {
+        Shown { line, head: 0, side: Side::Left }
+    }
+}
 
 /// What a tab shows, and the line its last `/clear` was at. A chat tab's
-/// lines come from its messages: a line for each new day, the time, who
-/// sent it and, for yours, its mark.
+/// lines come from its messages: a line for each new day, then theirs on the
+/// left (`14:02 text`) and yours on the right (`text 14:02 ✓✓`). No names:
+/// the tab says who it is.
 pub fn tab_lines(state: &State, tab: &Tab) -> (Vec<Shown>, usize) {
-    let Some(peer) = tab.peer else {
-        return (tab.lines.iter().map(|l| (l.clone(), 0)).collect(), tab.cleared);
+    let peer = match tab.kind {
+        TabKind::Corvo => return (tab.lines.iter().cloned().map(Shown::plain).collect(), tab.cleared),
+        TabKind::Profile => return (profile::lines(state).into_iter().map(Shown::plain).collect(), 0),
+        TabKind::Chat(peer) => peer,
     };
     let label = state.label(&peer);
     let mut lines = Vec::new();
     if state.standing(&peer) == Some(Standing::Request) {
         let text = format!("{label} isn't a contact yet: /accept adds them, /block stops them");
-        lines.push((Line { text, tone: Tone::Warn }, 0));
+        lines.push(Shown::plain(Line { text, tone: Tone::Warn }));
     }
     let messages = state.chats.get(&peer).map_or(&[][..], |c| &c.messages[..]);
     let mut clear_line = None;
@@ -118,20 +142,26 @@ pub fn tab_lines(state: &State, tab: &Tab) -> (Vec<Shown>, usize) {
         let day = at.map(|t| t.date_naive());
         if day != last_day {
             let text = at.map_or_else(|| "── ? ──".into(), |t| format!("── {} ──", t.format("%a %-d %b")));
-            lines.push((Line { text, tone: Tone::Dim }, 0));
+            lines.push(Shown::plain(Line { text, tone: Tone::Dim }));
             last_day = day;
         }
         let time = at.map_or_else(|| "--:--".into(), |t| t.format("%H:%M").to_string());
-        let (who, line_tone) = if m.mark.is_outgoing() { (YOU, Tone::Own) } else { (label.as_str(), Tone::Plain) };
-        let mark = match m.mark {
-            Mark::Waiting => " ·",
-            Mark::Delivered => " ✓",
-            Mark::Read => " ✓✓",
-            Mark::Received => "",
+        let shown = if m.mark.is_outgoing() {
+            // Two columns for the mark, so the line stays still as it changes.
+            let slot = match m.mark {
+                Mark::Waiting => "· ",
+                Mark::Delivered => "✓ ",
+                _ => "✓✓",
+            };
+            let tail = format!(" {time} {slot}");
+            let line = Line { text: format!("{}{tail}", m.text), tone: Tone::Own };
+            Shown { line, head: tail.len(), side: Side::Right }
+        } else {
+            let head = format!("{time} ");
+            let line = Line { text: format!("{head}{}", m.text), tone: Tone::Plain };
+            Shown { line, head: head.len(), side: Side::Left }
         };
-        let head = format!("{time} {}: ", one_line(who));
-        let head_len = head.len();
-        lines.push((Line { text: format!("{head}{}{mark}", m.text), tone: line_tone }, head_len));
+        lines.push(shown);
     }
     // Never cleared: everything shows, the request line too.
     let clear_line = if tab.cleared == 0 { 0 } else { clear_line.unwrap_or(lines.len()) };
@@ -147,7 +177,7 @@ thread_local! {
 /// The open tab's rows at `width`, and the row its last `/clear` was at.
 /// Built once per change and width, then reused.
 pub fn chat_rows(state: &State, width: u16) -> (Arc<Rows>, usize) {
-    let key = RowKey { tab: state.current, peer: state.tab().peer, width, changes: state.changes };
+    let key = RowKey { tab: state.current, peer: state.tab().peer(), width, changes: state.changes };
     if let Some(hit) = state.rows.get(&key) {
         return hit;
     }
@@ -163,20 +193,41 @@ fn build_rows(state: &State, tab: &Tab, width: u16) -> (Rows, usize) {
     let (lines, cleared) = tab_lines(state, tab);
     let mut rows = Vec::new();
     let mut clear_row = None;
-    for (i, (line, head)) in lines.iter().enumerate() {
+    for (i, shown) in lines.iter().enumerate() {
         if i == cleared {
             clear_row = Some(rows.len());
         }
-        rows.extend(line_rows(&line.text, *head, width.into()).into_iter().map(|r| (r, line.tone)));
+        let tone = shown.line.tone;
+        rows.extend(line_rows(&shown.line.text, shown.head, width.into(), shown.side).into_iter().map(|r| (r, tone)));
     }
     let clear_row = clear_row.unwrap_or(rows.len());
     (rows, clear_row)
 }
 
-/// One line's rows at `width`. After its first `head` bytes, the text wraps
-/// with a hanging indent, so every row of it starts under its first column;
-/// not when the head takes more than half the width.
-fn line_rows(text: &str, head: usize, width: usize) -> Vec<String> {
+/// How wide a message gets in a chat `width` columns wide: about 70% of it,
+/// but at least 30 columns where there's room.
+fn bubble(width: usize) -> usize {
+    (width * 7 / 10).max(width.min(30))
+}
+
+/// One line's rows in a chat `width` columns wide. A message wraps within
+/// [`bubble`]; other lines take the whole width.
+///
+/// On the left, after its first `head` bytes, the text wraps with a hanging
+/// indent, so every row of it starts under its first column (not when the
+/// head takes more than half the room). On the right, the rows are a block
+/// against the right edge, lined up with each other on the left, and the
+/// last `head` bytes (time and mark) follow the text on its last row. Rows on
+/// the right come back padded to `width`.
+fn line_rows(text: &str, head: usize, width: usize, side: Side) -> Vec<String> {
+    match side {
+        Side::Left if head > 0 => left_rows(text, head, bubble(width)),
+        Side::Left => left_rows(text, 0, width),
+        Side::Right => right_rows(text, head, width),
+    }
+}
+
+fn left_rows(text: &str, head: usize, width: usize) -> Vec<String> {
     let indent = text.get(..head).map_or(0, |h| h.width());
     let (lead, body, indent) =
         if head > 0 && indent * 2 <= width { (&text[..head], &text[head..], indent) } else { ("", text, 0) };
@@ -188,6 +239,35 @@ fn line_rows(text: &str, head: usize, width: usize) -> Vec<String> {
         }
     }
     rows
+}
+
+fn right_rows(text: &str, tail: usize, width: usize) -> Vec<String> {
+    let room = bubble(width);
+    let (body, tail) = text.split_at(text.len().saturating_sub(tail));
+    let mut rows: Vec<String> = body.split('\n').flat_map(|piece| wrap(&clean(piece), room)).collect();
+    let last = rows.last_mut().expect("wrap gives a row at least");
+    // The time and mark go after the text, or on a row of their own, flush
+    // with the block's right edge.
+    let alone = last.width() + tail.width() > room;
+    if alone {
+        rows.push(tail.trim_start().to_string());
+    } else {
+        last.push_str(tail);
+    }
+    let block = rows.iter().map(|r| r.width()).max().unwrap_or(0).min(width);
+    let pad = |n: usize| " ".repeat(n);
+    let count = rows.len();
+    rows.into_iter()
+        .enumerate()
+        .map(|(i, r)| {
+            let spare = block.saturating_sub(r.width());
+            if alone && i + 1 == count {
+                format!("{}{}{r}", pad(width - block), pad(spare))
+            } else {
+                format!("{}{r}{}", pad(width - block), pad(spare))
+            }
+        })
+        .collect()
 }
 
 /// (rows to scroll through, rows visible) in the chat area. After a `/clear`
@@ -261,7 +341,11 @@ pub fn wrap(text: &str, width: usize) -> Vec<String> {
     let mut row = String::new();
     let mut row_w = 0;
     for c in text.chars() {
-        let w = c.width().unwrap_or(0);
+        // What it adds to the row as drawn: a variation selector can make the
+        // character before it wider (❤ is one column, ❤️ two).
+        row.push(c);
+        let w = row.width().saturating_sub(row_w);
+        row.pop();
         if row_w + w > width && !row.is_empty() {
             match row.rfind(' ') {
                 // A space that doesn't fit is where the row ends.
@@ -283,7 +367,7 @@ pub fn wrap(text: &str, width: usize) -> Vec<String> {
             continue;
         }
         row.push(c);
-        row_w += w;
+        row_w = row.width();
     }
     rows.push(row);
     rows
@@ -322,10 +406,6 @@ pub fn draw(frame: &mut Frame, state: &State) {
     draw_tabs(frame, state, areas.tabs);
     draw_sidebar(frame, state, areas.sidebar);
     draw_chat(frame, state, areas.chat);
-    if let Some(words) = &state.reveal {
-        let body = Rect::new(0, areas.sidebar.y, area.width, areas.sidebar.height);
-        draw_reveal(frame, words, body);
-    }
     draw_flash(frame, state, areas.flash);
     frame.render_widget(Block::new().borders(Borders::TOP).border_style(dim()), areas.border);
     draw_input(frame, state, areas.input);
@@ -338,6 +418,9 @@ pub fn draw(frame: &mut Frame, state: &State) {
 
 /// A window centred over the screen, scrolled as `update` left it.
 fn draw_overlay(frame: &mut Frame, overlay: &Overlay, area: Rect) {
+    if let Overlay::Form(form) = overlay {
+        return draw_form(frame, form, overlay, area);
+    }
     let rows = window::rows(overlay, (area.width, area.height));
     let height = window::height((area.width, area.height), rows.len()) + 2;
     let width = overlay.width().min(area.width);
@@ -386,7 +469,7 @@ fn draw_onboarding(frame: &mut Frame, state: &State, onboarding: &Onboarding, ar
     let title = format!(" {APP} {VERSION}");
     frame.render_widget(Paragraph::new(title).style(Style::new().add_modifier(Modifier::BOLD)), Rect::new(0, 0, w, 1));
     let body = Rect::new(1, 2, w - 2, h - 5);
-    let guidance_text = onboarding.guidance(state.can_copy);
+    let guidance_text = onboarding.guidance();
     let guidance: Vec<(Cow<str>, Style)> = guidance_text.iter().map(|t| plain(t)).collect();
     let mut notes: Vec<(Cow<str>, Style)> =
         onboarding.notes.iter().map(|n| (Cow::Borrowed(n.text.as_str()), tone(n.tone))).collect();
@@ -441,25 +524,28 @@ fn rows_of(text: &str, width: u16) -> Vec<Cow<'_, str>> {
     }
 }
 
-/// Your 12 words over the chat, from `/phrase`.
-fn draw_reveal(frame: &mut Frame, words: &Secret, area: Rect) {
-    let words: Vec<&str> = words.expose().split_whitespace().collect();
-    let block = Block::bordered().title(" your recovery words ");
-    let inner = block.inner(area);
-    let grid_rows = word_grid(&words, inner.width);
-    let grid: Vec<TextLine> = grid_rows.iter().map(|r| TextLine::from(r.as_str())).collect();
-    let hint = TextLine::styled("press any key to hide them", dim());
-    let fits = |rows: usize| rows <= inner.height.into();
-    let lines = if fits(grid.len() + 4) {
-        [vec![TextLine::from("Your 12 recovery words:"), TextLine::default()], grid, vec![TextLine::default(), hint]]
-            .concat()
-    } else if fits(grid.len() + 1) {
-        [grid, vec![hint]].concat()
-    } else {
-        vec![TextLine::styled(BIGGER_FOR_WORDS, tone(Tone::Warn)), hint]
-    };
-    frame.render_widget(Clear, area);
-    frame.render_widget(Paragraph::new(lines).block(block), area);
+/// A window with fields, centred. Its rows are drawn from where they're kept
+/// (no copies), and wiped after.
+fn draw_form(frame: &mut Frame, form: &Form, overlay: &Overlay, area: Rect) {
+    let width = overlay.width().min(area.width);
+    let inner = usize::from(width.saturating_sub(6));
+    // All the height but the border: the words and what S did need it on a
+    // small terminal.
+    let room = usize::from(area.height.saturating_sub(2)).max(1);
+    let rows = form::rows(form, inner, room);
+    let height = rows.len() as u16 + 2;
+    let at =
+        Rect::new(area.x + (area.width - width) / 2, area.y + area.height.saturating_sub(height) / 2, width, height);
+    let lines: Vec<TextLine> = rows
+        .iter()
+        .map(|(row, t)| TextLine::from(vec![Span::raw("  "), Span::styled(row.as_str(), tone(*t))]))
+        .collect();
+    let mut block = Block::bordered().title(overlay.title());
+    if let Some(hint) = overlay.hint() {
+        block = block.title(TextLine::from(hint).right_aligned());
+    }
+    frame.render_widget(Clear, at);
+    frame.render_widget(Paragraph::new(lines).block(block), at);
 }
 
 fn dim() -> Style {
@@ -518,7 +604,7 @@ fn draw_tabs(frame: &mut Frame, state: &State, area: Rect) {
 
 /// The sidebar's lines, each with the person a click on it opens.
 fn sidebar(state: &State) -> Vec<(TextLine<'static>, Option<Code>)> {
-    let open = state.tab().peer;
+    let open = state.tab().peer();
     let unread = |n: usize| if n > 0 { Span::styled(format!(" ({n})"), tone(Tone::Warn)) } else { Span::raw("") };
     let mut lines = Vec::new();
     for peer in state.people.iter().filter(|p| !p.request) {
@@ -778,7 +864,7 @@ fn status_parts(state: &State) -> Vec<String> {
 mod tests {
     use super::*;
     use crate::ui::onboarding::Onboarding;
-    use crate::ui::state::{Screen, Secret};
+    use crate::ui::state::Screen;
     use crate::ui::update::{Msg, update};
     use corvo_wan_p2p_core::chat::PathInfo;
     use corvo_wan_p2p_core::identity::Seed;
@@ -829,41 +915,101 @@ mod tests {
         (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect()
     }
 
+    fn screen_of(state: &State, w: u16, h: u16) -> String {
+        let buf = render(state, w, h);
+        (0..buf.area.height).map(|y| row(&buf, y)).collect::<Vec<_>>().join("\n")
+    }
+
     #[test]
-    fn the_welcome_window_reads_on_80_by_24_and_scrolls_on_less() {
+    fn the_tips_read_on_80_by_24_under_the_art_and_scroll_on_less() {
         let mut state = State::new("ana".into(), "abcdefgh".into());
-        state.overlay = Some(Overlay::Welcome { scroll: 0 });
-        let all = |buf: &Buffer| (0..buf.area.height).map(|y| row(buf, y)).collect::<Vec<_>>().join("\n");
-        let screen = all(&render(&state, 80, 24));
-        // As approved in #41.
+        state.overlay = Some(Overlay::start(true));
+        let screen = screen_of(&state, 80, 24);
+        // The tips' text as approved in #41.
         for part in [
             "┌─ Welcome to corvo ───",
+            r"│  | (__ | (_) || |    \ V / | (_) |",
             "│  Chat with friends directly, computer to computer.   │",
             "│  • Your 12 words are your account. Never share       │",
             "│              /help any time · Enter to start         │",
         ] {
             assert!(screen.contains(part), "{part:?} missing:\n{screen}");
         }
-        let short = all(&render(&state, 40, 12));
+        assert!(!screen.contains("↓ more"), "it all fits on 80×24:\n{screen}");
+        let short = screen_of(&state, 40, 12);
         assert!(short.contains("Welcome to corvo") && !short.contains("/help any time"), "{short}");
-        let total = window::rows(&Overlay::Welcome { scroll: 0 }, (40, 12)).len();
-        state.overlay =
-            Some(Overlay::Welcome { scroll: (total - usize::from(window::height((40, 12), total))) as u16 });
-        assert!(all(&render(&state, 40, 12)).contains("/help any time"), "scrolled to the end");
-        let bigger = all(&render(&state, 80, 24));
-        assert!(bigger.contains("Chat with friends directly"), "a bigger terminal shows it all:\n{bigger}");
+        let total = window::rows(&Overlay::start(true), (40, 12)).len();
+        let end = (total - usize::from(window::height((40, 12), total))) as u16;
+        state.overlay = Some(Overlay::Start { first_run: true, ticks_left: window::START_TICKS, scroll: end });
+        assert!(screen_of(&state, 40, 12).contains("/help any time"), "scrolled to the end");
     }
 
     #[test]
-    fn the_help_window_shows_groups_keys_and_marks() {
+    fn the_start_window_fits_40_by_12() {
+        let mut state = State::new("ana".into(), "abcdefgh".into());
+        state.overlay = Some(Overlay::start(false));
+        let screen = screen_of(&state, 40, 12);
+        for row in window::ART {
+            assert!(screen.contains(row), "{row:?} missing:\n{screen}");
+        }
+        assert!(screen.contains(&format!("corvo-wan-p2p v{}", corvo_wan_p2p_core::VERSION)), "{screen}");
+        assert!(!screen.contains("↓ more"), "{screen}");
+    }
+
+    #[test]
+    fn the_about_window_shows_version_data_folder_and_source() {
+        let mut state = State::new("ana".into(), "abcdefgh".into());
+        state.overlay = Some(Overlay::About { data_dir: "~/.config/corvo-wan-p2p".into(), scroll: 0 });
+        let screen = screen_of(&state, 80, 24);
+        for part in [
+            "┌─ About ",
+            " Esc closes ─┐",
+            &format!("│  corvo-wan-p2p v{}", corvo_wan_p2p_core::VERSION),
+            "│  Your data: ~/.config/corvo-wan-p2p",
+            "│  Source:    github.com/Abinsanth/corvo-wan-p2p",
+            "│  License MIT",
+        ] {
+            assert!(screen.contains(part), "{part:?} missing:\n{screen}");
+        }
+        let small = screen_of(&state, 40, 12);
+        assert!(small.contains("About") && small.contains("corvo-wan-p2p v"), "{small}");
+    }
+
+    #[test]
+    fn the_update_window_fits_40_by_12() {
+        use crate::selfupdate::Stage;
+        use crate::ui::window::UpdateView;
+        let mut state = State::new("ana".into(), "abcdefgh".into());
+        let view = UpdateView { version: "9.0.0".into(), stage: Stage::Check, failed: None, scroll: 0 };
+        state.overlay = Some(Overlay::Update(view.clone()));
+        let screen = screen_of(&state, 40, 12);
+        for part in ["Update", "Updating to v9.0.0", "✓ downloading", "› checking the download", "  installing"] {
+            assert!(screen.contains(part), "{part:?} missing:\n{screen}");
+        }
+        let why =
+            "can't replace /home/ana/.local/bin/corvo-wan-p2p: permission denied. Reinstall with: curl -fsSL x | sh";
+        state.overlay = Some(Overlay::Update(UpdateView { failed: Some(why.into()), ..view }));
+        let failed = screen_of(&state, 40, 12);
+        assert!(failed.contains("✗ checking the download") && failed.contains("↓ more"), "{failed}");
+    }
+
+    #[test]
+    fn the_help_window_shows_groups_and_keys_without_marks() {
         let mut state = State::new("ana".into(), "abcdefgh".into());
         state.overlay = Some(Overlay::Help { scroll: 0 });
         let buf = render(&state, 100, 50);
         let screen = (0..buf.area.height).map(|y| row(&buf, y)).collect::<Vec<_>>().join("\n");
-        for part in ["┌─ Help ─", " Esc closes ─┐", "│  Friends", "    /add <code>", "│  Keys", "    ✓✓ ", "read"]
-        {
+        for part in [
+            "┌─ Help ─",
+            " Esc closes ─┐",
+            "│  You        /profile          name, passphrase, 12 words",
+            "│  Friends    /code             your code",
+            "│             /add <code>       add a friend",
+            "│  Keys       Tab               complete",
+        ] {
             assert!(screen.contains(part), "{part:?} missing:\n{screen}");
         }
+        assert!(!screen.contains("✓✓") && !screen.contains("Marks"), "{screen}");
     }
 
     #[test]
@@ -877,12 +1023,12 @@ mod tests {
         };
         let top = screen(&state);
         assert!(top.contains("↓ more"), "{top}");
-        assert!(!top.contains("Marks"), "the end is out of sight on 80×24");
+        assert!(!top.contains("what you typed before"), "the end is out of sight on 80×24");
         state.overlay = Some(Overlay::Help { scroll: u16::MAX });
         let end = screen(&state);
-        assert!(end.contains("Marks") && !end.contains("↓ more"), "{end}");
-        state.overlay = Some(Overlay::Welcome { scroll: 0 });
-        assert!(!screen(&state).contains("↓ more"), "the welcome fits");
+        assert!(end.contains("what you typed before") && !end.contains("↓ more"), "{end}");
+        state.overlay = Some(Overlay::start(false));
+        assert!(!screen(&state).contains("↓ more"), "the start window fits");
     }
 
     fn render(state: &State, w: u16, h: u16) -> Buffer {
@@ -979,7 +1125,7 @@ mod tests {
     }
 
     fn rahul(state: &State) -> Code {
-        state.tabs[1].peer.unwrap()
+        state.tabs[1].peer().unwrap()
     }
 
     #[test]
@@ -1010,7 +1156,8 @@ mod tests {
         let last = screen.iter().rposition(|r| r.contains("lines and")).expect("the newest line is shown");
         assert!(screen[last - 1].contains("two"));
         assert!(!screen.iter().any(|r| r.contains('\u{202E}') || r.contains('\x1b')));
-        assert!(screen[1].contains("rahul"), "the open chat's name is in the sidebar");
+        assert!(screen.iter().any(|r| r.contains("● rahul") || r.contains("○ rahul")), "the name is in the sidebar");
+        assert!(screen[0].contains(" rahul "), "and on the tab");
     }
 
     #[test]
@@ -1130,15 +1277,106 @@ mod tests {
         update(&mut state, Msg::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
         assert!(!screen(&render(&state, 80, 24)).contains("hunter2"));
 
-        let mut state = busy_state();
-        for (command, questions) in [("/passphrase", 3), ("/phrase", 1), ("/phrase copy", 1)] {
-            send(&mut state, command);
-            for _ in 0..questions {
-                typed(&mut state, secret);
-                assert!(!screen(&render(&state, 80, 24)).contains("hunter2"), "{command}");
-                update(&mut state, Msg::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
-                assert!(!screen(&render(&state, 80, 24)).contains("hunter2"), "{command}");
+        for item in [1, 2] {
+            let mut state = busy_state();
+            send(&mut state, "/profile");
+            for _ in 0..item {
+                update(&mut state, Msg::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)));
             }
+            update(&mut state, Msg::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
+            for _ in 0..3 {
+                typed(&mut state, secret);
+                let shown = screen(&render(&state, 80, 24));
+                assert!(!shown.contains("hunter2") && shown.contains("••••"), "item {item}:\n{shown}");
+                update(&mut state, Msg::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)));
+            }
+            update(&mut state, Msg::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
+            assert!(!screen(&render(&state, 80, 24)).contains("hunter2"), "item {item}");
+        }
+    }
+
+    /// The words window, showing `seed`'s words.
+    fn words_window(seed: &Seed) -> State {
+        use crate::ui::form::FormKind;
+        use crate::ui::state::Secret;
+        let mut state = busy_state();
+        state.open_profile();
+        let mut form = Form::words();
+        form.kind =
+            FormKind::Words { passphrase: Some(Secret::new("pw".into())), words: Some(Secret::new(seed.phrase())) };
+        form.fields.clear();
+        state.overlay = Some(Overlay::Form(form));
+        state
+    }
+
+    #[test]
+    fn the_profile_tab_fits_40_by_12() {
+        let mut state = busy_state();
+        state.code = Some(Seed::generate().code());
+        state.open_profile();
+        let all = screen(&render(&state, 80, 24));
+        let parts = [
+            " profile ",
+            "Name: ana",
+            "Code:",
+            "corvo1",
+            "› Change name",
+            "  Change passphrase",
+            "  Show 12 words",
+            "  Delete account",
+        ];
+        for part in parts {
+            assert!(all.contains(part), "{part:?}:\n{all}");
+        }
+        // On 40×12 the menu shows, and PgUp brings the name and code into view.
+        let small = screen(&render(&state, 40, 12));
+        for part in [" profile ", "› Change name", "  Delete account", "↑/↓ choose"] {
+            assert!(small.contains(part), "{part:?}:\n{small}");
+        }
+        state.size = (40, 12);
+        update(&mut state, Msg::Key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE)));
+        assert!(screen(&render(&state, 40, 12)).contains("Name: ana"));
+        update(&mut state, Msg::Key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE)));
+        update(&mut state, Msg::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)));
+        assert!(screen(&render(&state, 40, 12)).contains("› Change passphrase"));
+        update(&mut state, Msg::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
+        let shown = screen(&render(&state, 40, 12));
+        for part in ["Change passphrase", "› Current", "  New", "  Again", "Esc closes"] {
+            assert!(shown.contains(part), "{part:?}:\n{shown}");
+        }
+    }
+
+    #[test]
+    fn the_delete_account_window_fits_40_by_12() {
+        use crate::ui::update::Outcome;
+        let mut state = busy_state();
+        state.open_profile();
+        let key = |state: &mut State, code| update(state, Msg::Key(KeyEvent::new(code, KeyModifiers::NONE)));
+        for _ in 0..3 {
+            key(&mut state, KeyCode::Down);
+        }
+        let menu = render(&state, 80, 24);
+        let shown = screen(&menu);
+        let (y, line) = shown.lines().enumerate().find(|(_, l)| l.contains("› Delete account")).expect("it shows");
+        let x = line[..line.find("Delete").unwrap()].chars().count();
+        assert_eq!(menu[(x as u16, y as u16)].fg, Color::Red, "in red");
+        key(&mut state, KeyCode::Enter);
+        let warn = screen(&render(&state, 40, 12));
+        for part in ["Delete account", "This deletes your account", "code file.", "messages.", "Enter goes on"] {
+            assert!(warn.contains(part), "{part:?}:\n{warn}");
+        }
+        key(&mut state, KeyCode::Enter);
+        typed(&mut state, "pw");
+        let asked = screen(&render(&state, 40, 12));
+        assert!(asked.contains("› Passphrase  ••") && !asked.contains("pw"), "{asked}");
+        key(&mut state, KeyCode::Enter);
+        update(&mut state, Msg::Done(Outcome::PassphraseChecked(Ok(true))));
+        typed(&mut state, "delete");
+        assert!(screen(&render(&state, 40, 12)).contains("› Type  delete"));
+        key(&mut state, KeyCode::Enter);
+        let last = screen(&render(&state, 40, 12));
+        for part in ["Uninstall the app too? y/n", "y or n · Esc cancels"] {
+            assert!(last.contains(part), "{part:?}:\n{last}");
         }
     }
 
@@ -1158,27 +1396,30 @@ mod tests {
         send(&mut state, "");
         assert!(!shows_words(&render(&state, 80, 24), &seed), "hidden while typing them back");
 
-        let mut state = busy_state();
-        state.reveal = Some(Secret::new(seed.phrase()));
+        let mut state = words_window(&seed);
         assert!(shows_all_words(&render(&state, 80, 24), &seed));
-        assert!(screen(&render(&state, 80, 24)).contains("press any key"));
-        update(&mut state, Msg::Key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE)));
-        assert!(!shows_words(&render(&state, 80, 24), &seed), "gone after a key");
+        assert!(screen(&render(&state, 80, 24)).contains("S saves them"));
+        update(&mut state, Msg::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+        assert!(!shows_words(&render(&state, 80, 24), &seed), "gone with the window");
     }
 
     #[test]
-    fn the_words_are_never_cut_off() {
+    fn the_words_window_is_never_cut_off() {
         let mut onboarding = State::onboarding(Onboarding::start(false, false));
         for answer in ["n", "ana", "pw", "pw"] {
             send(&mut onboarding, answer);
         }
         let Screen::Onboarding(o) = &onboarding.screen else { panic!() };
         let seed = Seed::from_phrase(&o.words().unwrap().join(" ")).unwrap();
-        let mut main = busy_state();
-        main.reveal = Some(Secret::new(seed.phrase()));
+        let main = words_window(&seed);
+        let mut saved = words_window(&seed);
+        if let Some(Overlay::Form(form)) = &mut saved.overlay {
+            let text = "saved in /home/ana/corvo-wan-p2p-recovery.txt".into();
+            form.note = Some(Line { text, tone: Tone::Good });
+        }
         for w in MIN_WIDTH..=120 {
             for h in MIN_HEIGHT..=40 {
-                for state in [&onboarding, &main] {
+                for state in [&onboarding, &main, &saved] {
                     let buf = render(state, w, h);
                     assert!(
                         shows_all_words(&buf, &seed) || screen(&buf).contains(BIGGER_FOR_WORDS),
@@ -1186,6 +1427,9 @@ mod tests {
                         screen(&buf)
                     );
                 }
+                // What S did shows with the words, at every size.
+                let shown = screen(&render(&saved, w, h));
+                assert!(shown.contains("saved in") && shown.contains("corvo-wan-p2p-recovery"), "{w}×{h}:\n{shown}");
             }
         }
     }
@@ -1197,14 +1441,16 @@ mod tests {
         send(&mut onboarding, "ana");
         send(&mut onboarding, "pw");
         send(&mut onboarding, "pw");
-        let mut main = busy_state();
-        main.reveal = Some(Secret::new(Seed::generate().phrase()));
-        send(&mut main, "/phrase");
-        typed(&mut main, "日本語");
+        let main = words_window(&Seed::generate());
+        let mut name = busy_state();
+        send(&mut name, "/profile");
+        update(&mut name, Msg::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
+        typed(&mut name, &"日本語".repeat(20));
         for w in 1..=120 {
             for h in 1..=40 {
                 render(&onboarding, w, h);
                 render(&main, w, h);
+                render(&name, w, h);
             }
         }
     }
@@ -1218,27 +1464,133 @@ mod tests {
         screen(&render(state, 80, 24))
     }
 
-    #[test]
-    fn messages_show_time_sender_and_marks() {
+    fn mine(id: usize, text: &str, mark: Mark) -> StoredMessage {
+        StoredMessage { mark, ..received(id, text) }
+    }
+
+    /// The chat area's rows at `w`×`h` with `messages` from or to rahul, each
+    /// as wide as the chat area.
+    fn chat_area(messages: Vec<StoredMessage>, w: u16, h: u16) -> Vec<String> {
         let mut state = busy_state();
         let rahul = rahul(&state);
-        let t = 1_760_000_100_000;
-        let mine = |id: &str, text: &str, mark| StoredMessage { id: id.into(), sent_at: t, text: text.into(), mark };
-        let chat = state.chats.get_mut(&rahul).unwrap();
-        chat.messages = vec![
-            StoredMessage { id: "a".into(), sent_at: t, text: "hi".into(), mark: Mark::Received },
-            mine("b", "waiting", Mark::Waiting),
-            mine("c", "delivered", Mark::Delivered),
-            mine("d", "read", Mark::Read),
-        ];
-        let screen = chat_screen(&mut state);
-        let at = hhmm(t);
-        assert!(screen.contains(&format!("{at} rahul: hi")), "{screen}");
-        assert!(screen.contains(&format!("{at} you: waiting ·")));
-        assert!(screen.contains(&format!("{at} you: delivered ✓")));
-        assert!(screen.contains(&format!("{at} you: read ✓✓")));
-        let day = crate::ui::chat::local(t).unwrap().format("%a %-d %b").to_string();
-        assert!(screen.contains(&format!("── {day} ──")), "a line for the day");
+        state.chats.get_mut(&rahul).unwrap().messages = messages;
+        state.select_tab(1);
+        let buf = render(&state, w, h);
+        let chat = areas((w, h), 1).unwrap().chat;
+        // A wide character takes two cells; the second one isn't a column of text.
+        let row = |y| {
+            let mut text = String::new();
+            let mut x = chat.x;
+            while x < chat.right() {
+                let symbol = buf[(x, y)].symbol();
+                text.push_str(symbol);
+                x += symbol.width().max(1) as u16;
+            }
+            text
+        };
+        (chat.y..chat.bottom()).map(row).collect()
+    }
+
+    fn time() -> String {
+        hhmm(1_760_000_000_001)
+    }
+
+    #[test]
+    fn theirs_are_on_the_left_with_the_time_first() {
+        let rows = chat_area(vec![received(1, "hey, you there?")], 80, 24);
+        let row = rows.iter().find(|r| r.contains("hey")).expect("drawn");
+        assert!(row.starts_with(&format!("{} hey, you there?", time())), "{row:?}");
+        let day = crate::ui::chat::local(1_760_000_000_001).unwrap().format("%a %-d %b").to_string();
+        assert!(rows.iter().any(|r| r.contains(&format!("── {day} ──"))), "the day line stays");
+    }
+
+    #[test]
+    fn yours_are_on_the_right_with_time_and_mark_last() {
+        let rows = chat_area(vec![mine(1, "yes, just got in", Mark::Read)], 80, 24);
+        let row = rows.iter().find(|r| r.contains("yes")).expect("drawn");
+        assert!(row.ends_with(&format!("yes, just got in {} ✓✓", time())), "{row:?}");
+        assert!(row.starts_with("     "), "on the right: {row:?}");
+        let rows = chat_area(vec![mine(1, "sure", Mark::Delivered)], 80, 24);
+        let row = rows.iter().find(|r| r.contains("sure")).unwrap();
+        assert!(row.ends_with(&format!("sure {} ✓ ", time())), "the mark's slot is two columns: {row:?}");
+    }
+
+    #[test]
+    fn the_mark_slot_keeps_the_line_still() {
+        let ends: Vec<(usize, usize)> = [Mark::Waiting, Mark::Delivered, Mark::Read]
+            .into_iter()
+            .map(|mark| {
+                let rows = chat_area(vec![mine(1, "on my way", mark)], 80, 24);
+                let row = rows.iter().find(|r| r.contains("on my way")).unwrap().clone();
+                let start = row.find("on my way").map(|at| row[..at].width()).unwrap();
+                (start, start + format!("on my way {}", time()).width())
+            })
+            .collect();
+        assert!(ends.windows(2).all(|w| w[0] == w[1]), "{ends:?}");
+    }
+
+    #[test]
+    fn a_long_message_of_yours_wraps_as_a_block_on_the_right() {
+        let long = "word ".repeat(30);
+        let rows = chat_area(vec![mine(1, long.trim_end(), Mark::Delivered)], 80, 24);
+        let width = rows[0].width();
+        let bubble = (width * 7 / 10).max(width.min(30));
+        let block: Vec<&String> = rows.iter().filter(|r| r.contains("word")).collect();
+        assert!(block.len() >= 3, "it wraps: {rows:#?}");
+        let starts: Vec<usize> = block.iter().map(|r| r.len() - r.trim_start().len()).collect();
+        assert!(starts.windows(2).all(|w| w[0] == w[1]), "the rows line up on the left: {block:#?}");
+        assert!(starts[0] >= width - bubble, "within about 70% of the width: {block:#?}");
+        assert!(block.last().unwrap().trim_end().ends_with(&format!("{} ✓", time())), "{block:#?}");
+        assert_eq!(block.iter().map(|r| r.matches("word").count()).sum::<usize>(), 30, "nothing is lost");
+        let theirs = chat_area(vec![received(1, long.trim_end())], 80, 24);
+        assert!(theirs.iter().filter(|r| r.contains("word")).all(|r| r.trim_end().width() <= bubble), "{theirs:#?}");
+    }
+
+    #[test]
+    fn your_wide_and_long_messages_stay_inside_the_chat() {
+        let texts = ["日本語のメッセージ😀".repeat(8), "x".repeat(200), "a 😀😀😀😀 b".repeat(10)];
+        for (w, h) in [(40, 12), (80, 24), (57, 20)] {
+            for text in &texts {
+                for message in [mine(1, text, Mark::Read), received(1, text)] {
+                    let rows = chat_area(vec![message], w, h);
+                    let width = areas((w, h), 1).unwrap().chat.width as usize;
+                    assert!(rows.iter().all(|r| r.width() <= width), "{w}×{h}: {rows:#?}");
+                    // The chat follows its end, so the end of the text shows, whole.
+                    let shown: String = rows.concat().chars().filter(|c| !c.is_whitespace()).collect();
+                    let letters: Vec<char> = text.chars().filter(|c| !c.is_whitespace()).collect();
+                    let end: String = letters[letters.len() - 6..].iter().collect();
+                    assert!(shown.contains(&end), "{w}×{h}: {end:?} in {rows:#?}");
+                }
+            }
+        }
+        let rows = chat_area(vec![mine(1, &"x".repeat(200), Mark::Read)], 80, 24);
+        let last = rows.iter().rfind(|r| !r.trim().is_empty()).unwrap();
+        assert!(last.ends_with(&format!("{} ✓✓", time())), "the time and mark end the block: {rows:#?}");
+        let block: Vec<&String> = rows.iter().filter(|r| r.contains('x')).collect();
+        let edge = |r: &String| r.trim_end().width();
+        assert_eq!(edge(last), edge(block[0]), "flush with the block's right edge: {rows:#?}");
+    }
+
+    #[test]
+    fn rows_on_either_side_are_never_wider_than_drawn() {
+        let texts = ["ok ❤️ ".repeat(12), "日本語のメッセージ😀".repeat(5), "x".repeat(90), "a\nb".into()];
+        for width in [25, 26, 27, 31, 41, 59] {
+            for text in &texts {
+                let tail = format!(" 14:02 {}", "✓ ");
+                let rows = line_rows(&format!("{text}{tail}"), tail.len(), width, Side::Right);
+                assert!(rows.iter().all(|r| r.width() == width), "{width}: right rows are padded to it: {rows:#?}");
+                assert!(rows.last().unwrap().trim_end().ends_with("14:02 ✓"), "{width}: {rows:#?}");
+                let left = line_rows(&format!("14:02 {text}"), 6, width, Side::Left);
+                assert!(left.iter().all(|r| r.width() <= bubble(width)), "{width}: {left:#?}");
+            }
+        }
+    }
+
+    #[test]
+    fn no_names_are_drawn_in_a_chat() {
+        let rows = chat_area(vec![received(1, "hi"), mine(2, "hello", Mark::Read)], 80, 24);
+        let all = rows.join("\n");
+        assert!(!all.contains("rahul:") && !all.contains("you:"), "{all}");
     }
 
     #[test]
@@ -1258,10 +1610,13 @@ mod tests {
         assert!(label.starts_with("You·"), "{label}");
         let buf = render(&state, 80, 24);
         let all = screen(&buf);
-        assert!(all.contains(&format!("{label}: theirs")), "{all}");
+        assert!(all.contains("theirs") && !all.contains(&format!("{label}:")), "{all}");
         let y_of = |text: &str| (0..24).find(|&y| row(&buf, y).contains(text)).unwrap();
-        let chat_x = areas((80, 24), 1).unwrap().chat.x;
-        let (mine, theirs) = (buf[(chat_x, y_of("you: mine"))].style(), buf[(chat_x, y_of("theirs"))].style());
+        let chat = areas((80, 24), 1).unwrap().chat;
+        let x_of = |y: u16, text: &str| (chat.x..chat.right()).find(|&x| buf[(x, y)].symbol() == &text[..1]).unwrap();
+        let (y_mine, y_theirs) = (y_of(" mine "), y_of("theirs"));
+        let mine = buf[(x_of(y_mine, "m"), y_mine)].style();
+        let theirs = buf[(x_of(y_theirs, "t"), y_theirs)].style();
         assert_eq!(mine.fg, tone(Tone::Own).fg, "your own lines have their own style");
         assert_ne!(theirs.fg, mine.fg);
     }
@@ -1300,7 +1655,7 @@ mod tests {
         let column = |r: &str, text: &str| r.find(text).map(|at| r[..at].chars().count());
         let first = rows.iter().find(|r| r.contains("first line")).unwrap();
         let text_at = column(first, "first line").unwrap();
-        assert!(first.contains("rahul: first line"));
+        assert!(!first.contains("rahul:"), "no names");
         let second = rows.iter().find(|r| r.contains("second line")).unwrap();
         assert_eq!(column(second, "second line"), Some(text_at), "after a line break:\n{}", rows.join("\n"));
         let wrapped: Vec<&String> = rows.iter().filter(|r| r.contains("word")).collect();
@@ -1318,7 +1673,7 @@ mod tests {
         let rahul = rahul(&state);
         state.chats.get_mut(&rahul).unwrap().messages = vec![received(1, "\x1b[2Jboom \u{202E}evil\x1b]0;title\x07")];
         let screen = chat_screen(&mut state);
-        assert!(screen.contains("rahul: boom evil"), "{screen}");
+        assert!(screen.contains(&format!("{} boom evil", hhmm(1_760_000_000_001))), "{screen}");
         assert!(!screen.contains('\x1b') && !screen.contains('\u{202E}'));
     }
 
@@ -1346,7 +1701,8 @@ mod tests {
         let label = state.label(&bob);
         assert!(label.starts_with("bob·"));
         let screen = screen(&render(&state, 80, 24));
-        assert!(screen.contains(&format!("{label}: hello")));
+        assert!(screen.lines().next().unwrap().contains(&format!(" {label} ")), "the label is on the tab:\n{screen}");
+        assert!(screen.contains("hello") && !screen.contains(&format!("{label}:")));
         assert!(screen.contains("/accept"), "a request's chat says how to answer:\n{screen}");
     }
 

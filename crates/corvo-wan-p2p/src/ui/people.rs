@@ -1,17 +1,23 @@
 //! The commands about people: `/code`, `/add`, `/chat`, `/contacts`,
 //! `/requests`, `/accept`, `/block`, `/unblock`, `/blocked`, `/remove`,
-//! `/info`, `/name`, and `/update` for now.
+//! `/info`, and what came of changing your name.
+
+use std::path::PathBuf;
 
 use corvo_wan_p2p_core::identity::Code;
 use corvo_wan_p2p_core::names;
 use corvo_wan_p2p_core::store::{Mark, Person, Standing};
 
 use super::account::Pending;
-use super::chat::day_and_time;
-use super::clip::{MAYBE, NO_COPY};
+use super::chat::{day_and_time, local};
 use super::commands::Cmd;
 use super::state::{State, Tone};
+use super::table::{cut, table};
 use super::update::Effect;
+use super::view::areas;
+
+/// The widest a name gets in a table.
+const NAME_WIDTH: usize = 16;
 
 /// What `/add`, `/accept`, `/block`, `/unblock` and `/remove` ask the engine to do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,17 +42,12 @@ pub fn command(state: &mut State, cmd: Cmd, effects: &mut Vec<Effect>) {
         Cmd::Code => {
             let Some(code) = state.code else { return };
             state.select_tab(0);
-            state.say(Tone::Plain, format!("your code: {code}"));
-            let copy = if state.can_copy {
-                format!("sent to your clipboard, {MAYBE}.")
-            } else {
-                format!("{NO_COPY}: select it above to copy it.")
-            };
-            state.say(
-                Tone::Plain,
-                format!("{copy} Send it to friends any way you like; they add you with /add and your code."),
-            );
-            effects.push(Effect::Copy(code.to_string()));
+            state.say(Tone::Dim, "Your code");
+            for row in code_box(&code.to_string(), room(state)) {
+                state.say(Tone::Plain, row);
+            }
+            state.say(Tone::Plain, "Send it to a friend so they can /add you.");
+            effects.push(Effect::ShowCode);
         }
         Cmd::Add(code) if Some(code) == state.code => {
             state.say(Tone::Bad, "that's your own code: send it to friends, and /add theirs")
@@ -69,30 +70,25 @@ pub fn command(state: &mut State, cmd: Cmd, effects: &mut Vec<Effect>) {
         Cmd::Contacts => effects.push(Effect::Refresh(Show::Contacts)),
         Cmd::Requests => {
             state.select_tab(0);
-            let requests: Vec<String> = state
-                .people
-                .iter()
-                .filter(|p| p.request)
-                .map(|p| if p.unread > 0 { format!("{} ({} unread)", p.label, p.unread) } else { p.label.clone() })
-                .collect();
-            if requests.is_empty() {
+            let rows = requests(state);
+            if rows.is_empty() {
                 state.say(Tone::Plain, "no requests");
             } else {
-                state.say(
-                    Tone::Plain,
-                    format!("requests: {}. /chat <name> to read, /accept to add", requests.join(", ")),
-                );
+                say_table(state, &["NAME", "UNREAD", "CODE"], &rows);
+                state.say(Tone::Plain, "/chat <name> to read · /accept <name> to add");
             }
         }
         Cmd::Blocked => {
             state.select_tab(0);
-            let mut blocked: Vec<String> =
-                state.known.iter().filter(|p| p.standing == Standing::Blocked).map(|p| state.label(&p.code)).collect();
-            blocked.sort_by_key(|l| l.to_lowercase());
-            if blocked.is_empty() {
+            let mut blocked: Vec<&Person> = state.known.iter().filter(|p| p.standing == Standing::Blocked).collect();
+            blocked.sort_by_key(|p| state.label(&p.code).to_lowercase());
+            let rows: Vec<Vec<String>> =
+                blocked.iter().map(|p| vec![cut(&state.label(&p.code), NAME_WIDTH), p.code.short()]).collect();
+            if rows.is_empty() {
                 state.say(Tone::Plain, "you haven't blocked anyone");
             } else {
-                state.say(Tone::Plain, format!("blocked: {}", blocked.join(", ")));
+                say_table(state, &["NAME", "CODE"], &rows);
+                state.say(Tone::Plain, "/unblock <name> to let them back");
             }
         }
         Cmd::Accept(name) => {
@@ -146,8 +142,64 @@ pub fn command(state: &mut State, cmd: Cmd, effects: &mut Vec<Effect>) {
                 effects.push(Effect::Refresh(Show::Info(code)));
             }
         }
-        Cmd::Name(name) => effects.push(Effect::SetName(name)),
         _ => {}
+    }
+}
+
+/// How wide the corvo tab is at the terminal's size now, if it's drawn.
+fn room(state: &State) -> Option<usize> {
+    areas(state.size, 1).map(|a| usize::from(a.chat.width))
+}
+
+/// `code` in a box, split over as many rows as it takes to fit in `room`
+/// columns (one if `room` isn't known).
+fn code_box(code: &str, room: Option<usize>) -> Vec<String> {
+    const FRAME: usize = 6;
+    let chars: Vec<char> = code.chars().collect();
+    let fits = room.map_or(chars.len(), |room| room.saturating_sub(FRAME).max(8));
+    let parts = chars.len().div_ceil(fits).max(1);
+    let wide = chars.len().div_ceil(parts);
+    let rule = "─".repeat(wide + 4);
+    let mut rows = vec![format!("┌{rule}┐")];
+    for part in chars.chunks(wide) {
+        let part: String = part.iter().collect();
+        rows.push(format!("│  {part:<wide$}  │"));
+    }
+    rows.push(format!("└{rule}┘"));
+    rows
+}
+
+/// Requests A to Z: name, unread messages, short code.
+fn requests(state: &State) -> Vec<Vec<String>> {
+    let mut requests: Vec<_> = state.people.iter().filter(|p| p.request).collect();
+    requests.sort_by_key(|p| p.label.to_lowercase());
+    requests.iter().map(|p| vec![cut(&p.label, NAME_WIDTH), p.unread.to_string(), p.code.short()]).collect()
+}
+
+/// A table in the corvo tab, its heading dim.
+fn say_table(state: &mut State, head: &[&str], rows: &[Vec<String>]) {
+    let mut lines = table(head, rows).into_iter();
+    if let Some(heading) = lines.next() {
+        state.say(Tone::Dim, heading);
+    }
+    for line in lines {
+        state.say(Tone::Plain, line);
+    }
+}
+
+/// What came of [`Effect::ShowCode`]: where the code file is, or else
+/// whether to save it.
+pub fn code_shown(state: &mut State, saved: Option<PathBuf>) {
+    match saved {
+        Some(path) => state.say(Tone::Plain, format!("it's saved in {}", path.display())),
+        None => state.pending = Some(Pending::SaveCode),
+    }
+}
+
+pub fn code_written(state: &mut State, result: Result<PathBuf, String>) {
+    match result {
+        Ok(path) => state.say(Tone::Good, format!("saved in {}: it holds only your code", path.display())),
+        Err(why) => state.say(Tone::Bad, format!("couldn't save it: {why}")),
     }
 }
 
@@ -246,15 +298,28 @@ pub fn refreshed(state: &mut State, show: Show, result: Result<Vec<Person>, Stri
     state.select_tab(0);
     match show {
         Show::Contacts => {
+            let now = chrono::Utc::now().timestamp_millis();
             let mut contacts: Vec<&Person> = state.known.iter().filter(|p| p.standing == Standing::Contact).collect();
             contacts.sort_by_key(|p| state.label(&p.code).to_lowercase());
-            let lines: Vec<String> =
-                contacts.iter().map(|p| format!("{} {}", state.label(&p.code), seen(state, p))).collect();
-            if lines.is_empty() {
-                state.say(Tone::Plain, "no contacts yet: /add <code> adds a friend");
+            let rows: Vec<Vec<String>> = contacts
+                .iter()
+                .map(|p| vec![cut(&state.label(&p.code), NAME_WIDTH), status(state, p, now), p.code.short()])
+                .collect();
+            let requests = requests(state);
+            if rows.is_empty() && requests.is_empty() {
+                return state.say(Tone::Plain, "no contacts yet: /add <code> adds a friend");
             }
-            for line in lines {
-                state.say(Tone::Plain, line);
+            if rows.is_empty() {
+                state.say(Tone::Plain, "no contacts yet");
+            } else {
+                say_table(state, &["NAME", "STATUS", "CODE"], &rows);
+            }
+            if requests.is_empty() {
+                state.say(Tone::Plain, "/chat <name> to open a chat · /info <name> for more");
+            } else {
+                state.say(Tone::Plain, "");
+                say_table(state, &["REQUESTS", "UNREAD", "CODE"], &requests);
+                state.say(Tone::Plain, "/chat <name> to open a chat · /accept <name> to add");
             }
         }
         Show::Info(code) => {
@@ -272,6 +337,26 @@ pub fn refreshed(state: &mut State, show: Show, result: Result<Vec<Person>, Stri
             state.say(Tone::Plain, format!("  name: {name}"));
             state.say(Tone::Plain, format!("  code: {code}"));
         }
+    }
+}
+
+/// "● online", "○ seen …" or "○ not seen yet", as of `now`.
+fn status(state: &State, person: &Person, now: i64) -> String {
+    match (state.connected.contains(&person.code), person.last_seen) {
+        (true, _) => "● online".into(),
+        (false, Some(at)) => format!("○ seen {}", ago(at, now)),
+        (false, None) => "○ not seen yet".into(),
+    }
+}
+
+/// How long before `now` `at` was: `2h ago` within a day, else the day,
+/// like `14 Oct`. Both are Unix milliseconds.
+fn ago(at: i64, now: i64) -> String {
+    match (now - at).max(0) / 60_000 {
+        0 => "just now".into(),
+        minutes @ 1..60 => format!("{minutes}m ago"),
+        minutes @ 60..1440 => format!("{}h ago", minutes / 60),
+        _ => local(at).map_or_else(|| "--".into(), |t| t.format("%-d %b").to_string()),
     }
 }
 
@@ -310,6 +395,7 @@ mod tests {
     use corvo_wan_p2p_core::identity::Seed;
     use corvo_wan_p2p_core::store::{Mark, StoredMessage};
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use unicode_width::UnicodeWidthStr;
 
     struct People {
         rahul: Code,
@@ -368,13 +454,60 @@ mod tests {
         Effect::Act { code, act }
     }
 
+    /// What the box around the code holds, joined.
+    fn boxed(lines: &[String]) -> String {
+        lines.iter().filter_map(|l| l.strip_prefix("│")).map(|l| l.trim_end_matches('│').trim()).collect()
+    }
+
     #[test]
-    fn code_shows_and_copies_your_code() {
+    fn code_shows_a_box_and_asks_to_save_when_there_is_no_file() {
+        for size in [(0, 0), (80, 24), (40, 12)] {
+            let (mut s, _) = state();
+            s.size = size;
+            let mine = s.code.unwrap().to_string();
+            assert_eq!(send(&mut s, "/code"), vec![Effect::ShowCode]);
+            let lines = said(&s);
+            assert_eq!(lines[0], "Your code");
+            assert!(lines[1].starts_with('┌') && lines[1].ends_with('┐'));
+            assert_eq!(boxed(&lines), mine, "{size:?}: {lines:#?}");
+            let widths: Vec<usize> = lines[1..lines.len() - 1].iter().map(|l| l.width()).collect();
+            assert!(widths.windows(2).all(|w| w[0] == w[1]), "{size:?}: the box is square: {lines:#?}");
+            if let Some(room) = room(&s) {
+                assert!(widths[0] <= room, "{size:?}: fits in {room}");
+            }
+            assert_eq!(last(&s), "Send it to a friend so they can /add you.");
+            assert_eq!(s.ask(), None, "nothing asked until the runner says whether the file is there");
+            done(&mut s, Outcome::CodeShown { saved: None });
+            assert_eq!(s.ask().unwrap().label, "save it to ~/corvo-wan-p2p-code.txt? y/n: ");
+        }
+    }
+
+    #[test]
+    fn code_says_where_the_file_is_when_it_exists() {
         let (mut s, _) = state();
-        let mine = s.code.unwrap().to_string();
-        let effects = send(&mut s, "/code");
-        assert!(effects.contains(&Effect::Copy(mine.clone())));
-        assert!(said(&s).iter().any(|l| l.contains(&mine)));
+        send(&mut s, "/code");
+        done(&mut s, Outcome::CodeShown { saved: Some(PathBuf::from("/home/ana/corvo-wan-p2p-code.txt")) });
+        assert_eq!(s.ask(), None);
+        assert_eq!(last(&s), "it's saved in /home/ana/corvo-wan-p2p-code.txt");
+    }
+
+    #[test]
+    fn saving_the_code_writes_the_file() {
+        let (mut s, _) = state();
+        send(&mut s, "/code");
+        done(&mut s, Outcome::CodeShown { saved: None });
+        assert!(send(&mut s, "maybe").is_empty());
+        assert_eq!(last(&s), "type y or n");
+        assert_eq!(send(&mut s, "y"), vec![Effect::WriteCode]);
+        assert_eq!(s.ask(), None);
+        done(&mut s, Outcome::CodeWritten(Ok(PathBuf::from("/home/ana/corvo-wan-p2p-code.txt"))));
+        assert!(last(&s).starts_with("saved in /home/ana/corvo-wan-p2p-code.txt"));
+        assert_eq!(last_line_tone(&s), Tone::Good);
+
+        send(&mut s, "/code");
+        done(&mut s, Outcome::CodeShown { saved: None });
+        assert!(send(&mut s, "n").is_empty());
+        assert_eq!(last(&s), "not saved; /code asks again");
     }
 
     #[test]
@@ -429,34 +562,98 @@ mod tests {
         assert_eq!(s.open_peer(), Some(p.bob), "nothing else opened");
     }
 
-    #[test]
-    fn contacts_lists_them_with_online_or_last_seen() {
-        let (mut s, p) = state();
-        assert!(send(&mut s, "/contacts").contains(&Effect::Refresh(Show::Contacts)));
-        let mut people = s.known.clone();
-        people.push(Person {
-            code: Seed::generate().code(),
-            name: "maria".into(),
-            last_seen: Some(1),
-            standing: Standing::Contact,
-        });
-        update(&mut s, Msg::Core(corvo_wan_p2p_core::chat::Event::Online(p.rahul)));
-        done(&mut s, Outcome::Refreshed { show: Show::Contacts, result: Ok(people) });
-        let lines = said(&s);
-        assert!(lines.iter().any(|l| l.contains("rahul") && l.contains("online")));
-        assert!(lines.iter().any(|l| l.contains("maria") && l.contains("last seen")));
-        assert!(!lines.iter().any(|l| l.contains("bob") || l.contains("eve")), "only contacts");
+    /// The lines said since `from`, with their tones.
+    fn said_since(state: &State, from: usize) -> Vec<(String, Tone)> {
+        state.tabs[0].lines[from..].iter().map(|l| (l.text.clone(), l.tone)).collect()
     }
 
     #[test]
-    fn requests_and_blocked_are_listed() {
+    fn contacts_print_a_table_sorted_a_to_z_with_requests_after() {
+        let (mut s, p) = state();
+        assert!(send(&mut s, "/contacts").contains(&Effect::Refresh(Show::Contacts)));
+        let mut people = s.known.clone();
+        let maria = Seed::generate().code();
+        let long = Seed::generate().code();
+        let an_hour_ago = chrono::Utc::now().timestamp_millis() - 2 * 3_600_000 - 60_000;
+        people.push(Person {
+            code: maria,
+            name: "Maria".into(),
+            last_seen: Some(an_hour_ago),
+            standing: Standing::Contact,
+        });
+        people.push(person(long, "zelda the very long named one", Standing::Contact));
+        update(&mut s, Msg::Core(corvo_wan_p2p_core::chat::Event::Online(p.rahul)));
+        let from = s.tabs[0].lines.len();
+        done(&mut s, Outcome::Refreshed { show: Show::Contacts, result: Ok(people) });
+        let lines = said_since(&s, from);
+        let text: Vec<&str> = lines.iter().map(|(t, _)| t.as_str()).collect();
+        let short = |c: Code| c.short();
+        let expected = [
+            "NAME             STATUS          CODE".to_string(),
+            format!("Maria            ○ seen 2h ago   {}", short(maria)),
+            format!("rahul            ● online        {}", short(p.rahul)),
+            format!("zelda the very…  ○ not seen yet  {}", short(long)),
+        ];
+        assert_eq!(text[..4], expected.iter().map(String::as_str).collect::<Vec<_>>()[..], "{text:#?}");
+        assert_eq!(lines[0].1, Tone::Dim, "the heading is dim");
+        assert!(lines[1..4].iter().all(|(_, tone)| *tone == Tone::Plain));
+        assert_eq!(text[4], "");
+        assert_eq!(text[5], "REQUESTS  UNREAD  CODE");
+        assert_eq!(text[6], format!("bob       0       {}", short(p.bob)));
+        assert_eq!(text[7], "/chat <name> to open a chat · /accept <name> to add");
+        assert_eq!(text.len(), 8, "eve is blocked, not listed: {text:#?}");
+    }
+
+    #[test]
+    fn requests_and_blocked_print_tables_with_a_hint() {
         let (mut s, p) = state();
         s.chats.entry(p.bob).or_default().unread = 2;
         s.refresh_sidebar();
+        let from = s.tabs[0].lines.len();
         send(&mut s, "/requests");
-        assert!(last(&s).contains("bob") && last(&s).contains('2'));
+        let text: Vec<String> = said_since(&s, from).into_iter().map(|(t, _)| t).collect();
+        assert_eq!(
+            text,
+            [
+                "NAME  UNREAD  CODE".to_string(),
+                format!("bob   2       {}", p.bob.short()),
+                "/chat <name> to read · /accept <name> to add".into()
+            ]
+        );
+        let from = s.tabs[0].lines.len();
         send(&mut s, "/blocked");
-        assert!(last(&s).contains("eve"));
+        let text: Vec<String> = said_since(&s, from).into_iter().map(|(t, _)| t).collect();
+        assert_eq!(
+            text,
+            ["NAME  CODE".to_string(), format!("eve   {}", p.eve.short()), "/unblock <name> to let them back".into()]
+        );
+    }
+
+    #[test]
+    fn an_empty_list_prints_one_line() {
+        let mut s = State::new("ana".into(), "abcdefgh".into());
+        s.code = Some(Seed::generate().code());
+        for (line, says) in [("/requests", "no requests"), ("/blocked", "you haven't blocked anyone")] {
+            let from = s.tabs[0].lines.len();
+            send(&mut s, line);
+            assert_eq!(said_since(&s, from), [(says.to_string(), Tone::Plain)], "{line}");
+        }
+        let from = s.tabs[0].lines.len();
+        send(&mut s, "/contacts");
+        done(&mut s, Outcome::Refreshed { show: Show::Contacts, result: Ok(Vec::new()) });
+        assert_eq!(said_since(&s, from).len(), 1);
+        assert_eq!(last(&s), "no contacts yet: /add <code> adds a friend");
+    }
+
+    #[test]
+    fn seen_says_how_long_ago_within_a_day() {
+        let now = 1_760_000_000_000;
+        assert_eq!(ago(now - 10_000, now), "just now");
+        assert_eq!(ago(now - 5 * 60_000, now), "5m ago");
+        assert_eq!(ago(now - 2 * 3_600_000, now), "2h ago");
+        assert_eq!(ago(now - 23 * 3_600_000, now), "23h ago");
+        let days_ago = now - 3 * 86_400_000;
+        assert_eq!(ago(days_ago, now), local(days_ago).unwrap().format("%-d %b").to_string());
     }
 
     #[test]
@@ -483,7 +680,7 @@ mod tests {
         assert!(send(&mut s, "/block").contains(&act(p.rahul, Act::Block)));
         let people = after(&s, p.rahul, Some(Standing::Blocked));
         done(&mut s, Outcome::Acted { code: p.rahul, act: Act::Block, result: Ok(()), people: Some(people) });
-        assert!(!s.tabs.iter().any(|t| t.peer == Some(p.rahul)));
+        assert!(!s.tabs.iter().any(|t| t.peer() == Some(p.rahul)));
         assert!(s.on_corvo());
         assert!(last(&s).contains("blocked rahul"));
     }
@@ -532,7 +729,7 @@ mod tests {
         let people = after(&s, p.rahul, None);
         let removed = Act::Remove { history: true };
         done(&mut s, Outcome::Acted { code: p.rahul, act: removed, result: Ok(()), people: Some(people) });
-        assert!(!s.tabs.iter().any(|t| t.peer == Some(p.rahul)));
+        assert!(!s.tabs.iter().any(|t| t.peer() == Some(p.rahul)));
         assert!(!s.chats.contains_key(&p.rahul), "the history is gone");
         assert!(last(&s).contains("removed rahul"));
     }
@@ -566,15 +763,6 @@ mod tests {
         let lines = said(&s);
         assert!(lines.iter().any(|l| l.contains(&p.bob.to_string())));
         assert!(lines.iter().any(|l| l.contains("request")));
-    }
-
-    #[test]
-    fn name_changes_yours() {
-        let (mut s, _) = state();
-        assert!(send(&mut s, "/name Ana Maria").contains(&Effect::SetName("Ana Maria".into())));
-        done(&mut s, Outcome::Named(Ok("Ana Maria".into())));
-        assert_eq!(s.name, "Ana Maria");
-        assert!(last(&s).contains("Ana Maria"));
     }
 
     #[test]

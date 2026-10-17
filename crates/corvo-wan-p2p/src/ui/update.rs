@@ -15,12 +15,15 @@ use zeroize::Zeroizing;
 
 use super::account::{self, PhraseDone, PhraseUse};
 use super::chat::{self, Loaded};
-use super::commands::{Cmd, Input, may_hold_a_secret, parse};
+use super::commands::{Cmd, Input, parse, usage};
 use super::complete;
+use super::form;
 use super::people::{self, Act, Show};
+use super::profile;
 use super::state::{PATH_TICKS, Screen, Secret, State, Tone, WHEEL_STEP};
 use super::view::{areas, chat_page, input_rows, popup_area, sidebar_rows, sidebar_scrolled, sidebar_showing, tab_at};
 use super::window::{self, Overlay};
+use crate::selfupdate::Stage;
 
 #[derive(Debug)]
 pub enum Msg {
@@ -45,8 +48,6 @@ pub enum Effect {
     /// Leave, and print this once the terminal is back to normal.
     Exit(String),
     SetTitle(String),
-    /// Put this on the clipboard (OSC 52).
-    Copy(String),
     /// Unlock the account and start the engine.
     Unlock(Secret),
     /// Make the account. The engine starts later, with [`Effect::Start`].
@@ -101,8 +102,19 @@ pub enum Effect {
     CheckUpdate {
         yes: bool,
     },
-    /// Install the release the last check found.
-    InstallUpdate,
+    /// A stage of installing the release the last check found.
+    Install(Stage),
+    /// Whether the code file is there.
+    ShowCode,
+    /// Write the code file.
+    WriteCode,
+    /// Whether this is your passphrase, before deleting your account.
+    CheckPassphrase(Secret),
+    /// Stop the engine, delete everything the app keeps and leave; with
+    /// `uninstall`, the program too.
+    DeleteAccount {
+        uninstall: bool,
+    },
 }
 
 impl Effect {
@@ -114,9 +126,10 @@ impl Effect {
             Effect::Start => "starting…",
             Effect::Wipe => "deleting…",
             Effect::ChangePassphrase { .. } => "changing your passphrase…",
-            Effect::Phrase { .. } => "checking your passphrase…",
+            Effect::Phrase { .. } | Effect::CheckPassphrase(_) => "checking your passphrase…",
+            Effect::DeleteAccount { .. } => "deleting your account…",
             Effect::CheckUpdate { .. } => "checking for updates…",
-            Effect::InstallUpdate => "updating…",
+            Effect::Install(_) => "updating…",
             _ => return None,
         })
     }
@@ -140,6 +153,8 @@ pub enum Outcome {
     RecoveryFile(Option<PathBuf>),
     RecoveryWritten(Result<PathBuf, String>),
     PassphraseChanged(Result<(), String>),
+    /// Whether the passphrase typed is yours.
+    PassphraseChecked(Result<bool, String>),
     Phrase(Result<PhraseDone, String>),
     Loaded(Result<Loaded, String>),
     /// Older messages, and how many of them couldn't be read.
@@ -177,10 +192,18 @@ pub enum Outcome {
         yes: bool,
         result: Result<Option<String>, String>,
     },
-    /// The version now installed.
-    Updated(Result<String, String>),
+    /// How a stage of installing went.
+    InstallStep {
+        stage: Stage,
+        result: Result<(), String>,
+    },
     /// `/update` after an update: this version is installed and waits for a restart.
     UpdatedAlready(String),
+    /// `saved` is where the code file is, if it's there.
+    CodeShown {
+        saved: Option<PathBuf>,
+    },
+    CodeWritten(Result<PathBuf, String>),
     /// Something that leaves the app unusable, like the engine not starting.
     Fatal(String),
 }
@@ -270,9 +293,11 @@ pub fn update(state: &mut State, msg: Msg) -> Vec<Effect> {
         state.focused = true;
     }
     match msg {
-        // A key while the words are up only hides them.
-        Msg::Key(key) if state.reveal.is_some() && key.kind != KeyEventKind::Release => state.reveal = None,
         // A window takes every key but Ctrl-C.
+        Msg::Key(key) if matches!(state.overlay, Some(Overlay::Form(_))) => match action_for(key) {
+            Some(Action::Quit) => on_action(state, Action::Quit, &mut effects),
+            _ => effects.extend(form::key(state, key)),
+        },
         Msg::Key(key) if state.overlay.is_some() => match action_for(key) {
             Some(Action::Quit) => on_action(state, Action::Quit, &mut effects),
             _ if key.kind != KeyEventKind::Release => window::key(state, key),
@@ -283,6 +308,7 @@ pub fn update(state: &mut State, msg: Msg) -> Vec<Effect> {
             MouseEventKind::ScrollDown => window::scroll_by(state, WHEEL_STEP as isize),
             _ => {}
         },
+        Msg::Paste(text) if matches!(state.overlay, Some(Overlay::Form(_))) => form::paste(state, text),
         Msg::Paste(_) if state.overlay.is_some() => {}
         Msg::Key(key) => {
             if state.ask().is_some() {
@@ -291,10 +317,6 @@ pub fn update(state: &mut State, msg: Msg) -> Vec<Effect> {
             if let Some(action) = action_for(key) {
                 on_action(state, action, &mut effects);
             }
-        }
-        Msg::Paste(text) if state.reveal.is_some() => {
-            drop(Zeroizing::new(text));
-            state.reveal = None;
         }
         Msg::Paste(text) if state.ask().is_some() => {
             state.editor.make_room_for_answer();
@@ -320,6 +342,7 @@ pub fn update(state: &mut State, msg: Msg) -> Vec<Effect> {
         Msg::Focus(focused) => state.focused = focused,
         Msg::Tick => {
             state.ticks = state.ticks.wrapping_add(1);
+            window::tick(state);
             if state.ticks.is_multiple_of(PATH_TICKS)
                 && matches!(state.screen, Screen::Main)
                 && let Some(peer) = state.open_peer()
@@ -455,6 +478,21 @@ fn on_action(state: &mut State, action: Action, effects: &mut Vec<Effect>) {
 
 fn on_key(state: &mut State, action: Action, effects: &mut Vec<Effect>) {
     let asking = state.ask().is_some();
+    // In the Profile tab, ↑/↓ choose from its menu and Enter opens it;
+    // commands typed there work as anywhere.
+    if state.on_profile() && !asking {
+        let empty = state.editor.is_empty();
+        match action {
+            Action::Up => return profile::step(state, -1),
+            Action::Down => return profile::step(state, 1),
+            Action::Send if empty => return profile::open(state),
+            Action::Esc if empty => {
+                state.close_tab();
+                return;
+            }
+            _ => {}
+        }
+    }
     let editor = &mut state.editor;
     match action {
         Action::Send => {
@@ -464,10 +502,7 @@ fn on_key(state: &mut State, action: Action, effects: &mut Vec<Effect>) {
             } else if asking {
                 effects.extend(account::answer(state, Secret::new(line)));
             } else {
-                let line = Zeroizing::new(line);
-                if !may_hold_a_secret(&line) {
-                    state.history.push(&line);
-                }
+                state.history.push(&line);
                 on_line(state, &line, effects);
             }
         }
@@ -521,8 +556,9 @@ fn on_key(state: &mut State, action: Action, effects: &mut Vec<Effect>) {
 fn on_line(state: &mut State, line: &str, effects: &mut Vec<Effect>) {
     match parse(line) {
         Input::Empty => {}
-        Input::Text(_) if state.on_corvo() => {
-            state.say(Tone::Bad, "this is the corvo tab: switch to a chat (Shift-Tab) to send messages")
+        Input::Text(_) if state.open_peer().is_none() => {
+            let tab = if state.on_profile() { "your profile" } else { "the corvo tab" };
+            state.say(Tone::Bad, format!("this is {tab}: switch to a chat (Shift-Tab) to send messages"))
         }
         Input::Text(text) => {
             if let Some(to) = state.open_peer() {
@@ -530,7 +566,20 @@ fn on_line(state: &mut State, line: &str, effects: &mut Vec<Effect>) {
             }
         }
         Input::Wrong(why) => state.say(Tone::Bad, why),
+        Input::Usage(name) => usage_card(state, name),
         Input::Cmd(cmd) => on_command(state, cmd, effects),
+    }
+}
+
+/// How the command called `name` is typed, what it does and an example, in
+/// the corvo tab.
+fn usage_card(state: &mut State, name: &str) {
+    let Some(card) = usage(name) else { return };
+    state.select_tab(0);
+    state.say(Tone::Plain, card.usage);
+    state.say(Tone::Dim, card.what);
+    if let Some(example) = card.example {
+        state.say(Tone::Dim, format!("e.g.  {example}"));
     }
 }
 
@@ -538,9 +587,15 @@ fn on_command(state: &mut State, cmd: Cmd, effects: &mut Vec<Effect>) {
     match cmd {
         Cmd::Help => state.overlay = Some(Overlay::Help { scroll: 0 }),
         Cmd::Clear => state.clear_tab(),
-        Cmd::Welcome => state.overlay = Some(Overlay::Welcome { scroll: 0 }),
-        cmd @ (Cmd::Passphrase | Cmd::Phrase | Cmd::PhraseSave | Cmd::PhraseCopy) => account::begin(state, cmd),
+        Cmd::About => {
+            let data_dir = state.data_dir.clone().unwrap_or_else(|| "(unknown)".into());
+            state.overlay = Some(Overlay::About { data_dir, scroll: 0 });
+        }
+        Cmd::Profile => state.open_profile(),
         Cmd::Quit => effects.push(Effect::Quit),
+        Cmd::Update { .. } if state.installing.is_some() => {
+            state.say(Tone::Plain, "already updating: wait for it to finish")
+        }
         Cmd::Update { yes } => effects.push(Effect::CheckUpdate { yes }),
         Cmd::Close => {
             if !state.close_tab() {
@@ -554,11 +609,9 @@ fn on_command(state: &mut State, cmd: Cmd, effects: &mut Vec<Effect>) {
 fn on_done(state: &mut State, outcome: Outcome, effects: &mut Vec<Effect>) {
     match outcome {
         Outcome::Started { name, code, recovery_file } => {
-            let welcome = matches!(&state.screen, Screen::Onboarding(o) if o.made_account());
+            let first_run = matches!(&state.screen, Screen::Onboarding(o) if o.made_account());
             state.screen = Screen::Main;
-            if welcome {
-                state.overlay = Some(Overlay::Welcome { scroll: 0 });
-            }
+            state.overlay = Some(Overlay::start(first_run));
             state.short_code = code.short();
             state.code = Some(code);
             state.say(Tone::Good, format!("welcome, {name}. Your code is {code}"));
@@ -580,8 +633,13 @@ fn on_done(state: &mut State, outcome: Outcome, effects: &mut Vec<Effect>) {
         Outcome::LoadedOlder { peer, result } => chat::loaded_older(state, peer, result),
         Outcome::Sent { to, text, result } => chat::sent(state, to, text, result),
         Outcome::Acted { code, act, result, people } => people::acted(state, code, act, result, people),
-        Outcome::Named(result) => people::named(state, result),
+        outcome @ (Outcome::Named(_)
+        | Outcome::PassphraseChanged(_)
+        | Outcome::Phrase(_)
+        | Outcome::PassphraseChecked(_)) => effects.extend(form::done(state, outcome)),
         Outcome::Refreshed { show, result } => people::refreshed(state, show, result),
+        Outcome::CodeShown { saved } => people::code_shown(state, saved),
+        Outcome::CodeWritten(result) => people::code_written(state, result),
         other => match &mut state.screen {
             Screen::Onboarding(onboarding) => effects.extend(onboarding.done(other)),
             Screen::Main => effects.extend(account::done(state, other)),
@@ -608,7 +666,7 @@ mod tests {
         };
         assert!(asked(&mut s).is_empty(), "nothing on the corvo tab");
         s.select_tab(1);
-        let rahul = s.tabs[1].peer.unwrap();
+        let rahul = s.tabs[1].peer().unwrap();
         assert_eq!(asked(&mut s), [Effect::AskPath(rahul)]);
         let info = Some(PathInfo { direct: true, rtt: std::time::Duration::from_millis(5) });
         update(&mut s, Msg::Done(Outcome::Path { peer: rahul, info }));
@@ -652,6 +710,183 @@ mod tests {
 
     fn last_corvo(state: &State) -> &Line {
         state.tabs[0].lines.last().expect("the corvo tab has lines")
+    }
+
+    /// Ana with chats open with rahul and maria, on 80×24, on the Profile tab.
+    fn on_profile() -> State {
+        let mut s = state();
+        s.size = (80, 24);
+        let people: Vec<Person> = [1, 2]
+            .map(|i| Person {
+                code: s.tabs[i].peer().unwrap(),
+                name: s.tabs[i].title.clone(),
+                last_seen: None,
+                standing: corvo_wan_p2p_core::store::Standing::Contact,
+            })
+            .into();
+        s.set_people(people);
+        send(&mut s, "/profile");
+        assert!(s.on_profile());
+        s
+    }
+
+    fn has_profile(s: &State) -> bool {
+        s.tabs.iter().any(|t| t.kind == crate::ui::state::TabKind::Profile)
+    }
+
+    fn click_at(s: &mut State, column: u16, row: u16) {
+        let kind = MouseEventKind::Down(MouseButton::Left);
+        update(s, Msg::Mouse(MouseEvent { kind, column, row, modifiers: KeyModifiers::NONE }));
+    }
+
+    #[test]
+    fn leaving_the_profile_tab_closes_it() {
+        let mut s = on_profile();
+        update(&mut s, key(KeyCode::BackTab, KeyModifiers::SHIFT));
+        assert!(!has_profile(&s), "Shift-Tab");
+        assert_eq!(s.tab().title, "rahul", "the next tab, as anywhere");
+
+        let mut s = on_profile();
+        alt(&mut s, KeyCode::Char('1'));
+        assert!(!has_profile(&s) && s.on_corvo(), "Alt-1");
+
+        let mut s = on_profile();
+        alt(&mut s, KeyCode::Right);
+        assert!(!has_profile(&s));
+        assert_eq!(s.tab().title, "rahul", "Alt-→ goes to the tab after it");
+
+        let mut s = on_profile();
+        let maria = (0..80).find(|&x| tab_at(&s, x) == Some(3)).expect("maria's tab is drawn");
+        click_at(&mut s, maria, 0);
+        assert!(!has_profile(&s));
+        assert_eq!(s.tab().title, "maria", "a click on a tab");
+
+        let mut s = on_profile();
+        let rahul = s.tabs[2].peer().unwrap();
+        let row = sidebar_rows(&s).iter().position(|r| *r == Some(rahul)).expect("rahul is in the sidebar");
+        let top = areas(s.size, 1).unwrap().sidebar.y;
+        click_at(&mut s, 2, top + row as u16);
+        assert!(!has_profile(&s));
+        assert_eq!(s.open_peer(), Some(rahul), "a click in the sidebar");
+    }
+
+    #[test]
+    fn esc_closes_the_profile_tab() {
+        let mut s = on_profile();
+        type_text(&mut s, "half typed");
+        press(&mut s, KeyCode::Esc);
+        assert!(s.on_profile(), "Esc first clears what's typed");
+        assert_eq!(s.editor.text(), "");
+        press(&mut s, KeyCode::Esc);
+        assert!(!has_profile(&s) && s.on_corvo());
+    }
+
+    #[test]
+    fn an_incoming_message_does_not_close_the_profile_tab() {
+        let mut s = on_profile();
+        let stranger = Seed::generate().code();
+        s.set_people(
+            [
+                s.known.clone(),
+                vec![Person {
+                    code: stranger,
+                    name: "zed".into(),
+                    last_seen: None,
+                    standing: corvo_wan_p2p_core::store::Standing::Contact,
+                }],
+            ]
+            .concat(),
+        );
+        let text = "hi".to_string();
+        update(&mut s, Msg::Core(Event::Received { from: stranger, id: "01".into(), sent_at: 1, text }));
+        assert!(s.tabs.iter().any(|t| t.peer() == Some(stranger)), "their chat opened");
+        assert!(s.on_profile(), "behind the Profile tab, which stays");
+    }
+
+    #[test]
+    fn up_down_move_the_menu_and_enter_opens_it() {
+        let mut s = on_profile();
+        send(&mut s, "/help");
+        press(&mut s, KeyCode::Esc);
+        press(&mut s, KeyCode::Up);
+        assert_eq!(s.profile_at, 0, "stays on the menu");
+        assert_eq!(s.editor.text(), "", "not the history");
+        for _ in 0..4 {
+            press(&mut s, KeyCode::Down);
+        }
+        assert_eq!(s.profile_at, 3, "stops at the last item");
+        press(&mut s, KeyCode::Enter);
+        assert!(matches!(&s.overlay, Some(Overlay::Form(f)) if f.title() == "─ Delete account "));
+    }
+
+    #[test]
+    fn commands_typed_in_the_profile_tab_still_work() {
+        let mut s = on_profile();
+        send(&mut s, "/help");
+        assert!(matches!(s.overlay, Some(Overlay::Help { .. })));
+        press(&mut s, KeyCode::Esc);
+        assert!(s.on_profile());
+        send(&mut s, "/chat maria");
+        assert_eq!(s.tab().title, "maria");
+        assert!(!has_profile(&s), "left for maria's chat");
+        send(&mut s, "/profile");
+        send(&mut s, "hello");
+        assert!(s.on_profile());
+        assert_eq!(last_corvo(&s).text, "this is your profile: switch to a chat (Shift-Tab) to send messages");
+    }
+
+    #[test]
+    fn a_usage_card_prints_three_lines_in_the_corvo_tab() {
+        let mut s = state();
+        s.select_tab(1);
+        let from = s.tabs[0].lines.len();
+        assert!(send(&mut s, "/chat").is_empty());
+        assert!(s.on_corvo(), "the corvo tab shows it");
+        let card: Vec<(&str, Tone)> = s.tabs[0].lines[from..].iter().map(|l| (l.text.as_str(), l.tone)).collect();
+        assert_eq!(
+            card,
+            [
+                ("/chat <name>", Tone::Plain),
+                ("Opens a chat with a contact or a request.", Tone::Dim),
+                ("e.g.  /chat rahul", Tone::Dim),
+            ]
+        );
+        assert_eq!(s.flash, None, "a card isn't an error");
+        let from = s.tabs[0].lines.len();
+        send(&mut s, "/clear now");
+        assert_eq!(s.tabs[0].lines.len() - from, 2, "no example for a command that takes nothing");
+    }
+
+    #[test]
+    fn nothing_mentions_the_clipboard() {
+        use crate::ui::commands::HELP;
+        use crate::ui::onboarding::Onboarding;
+        let mut texts: Vec<String> = HELP
+            .iter()
+            .flat_map(|(_, commands)| commands.iter())
+            .map(|(usage, what)| format!("{usage} {what}"))
+            .collect();
+        let mut s = state();
+        s.code = Some(Seed::generate().code());
+        send(&mut s, "/code");
+        update(&mut s, Msg::Done(Outcome::CodeShown { saved: None }));
+        send(&mut s, "y");
+        update(&mut s, Msg::Done(Outcome::CodeWritten(Ok("/h/corvo-wan-p2p-code.txt".into()))));
+        texts.extend(s.tabs[0].lines.iter().map(|l| l.text.clone()));
+        texts.extend(s.ask().map(|a| a.label));
+        for recovered in [false, true] {
+            texts.extend(Onboarding::at_code(Seed::generate().code(), recovered).guidance());
+        }
+        for name in crate::ui::commands::COMMANDS {
+            if let Input::Usage(name) = parse(&format!("/{name} x y z")) {
+                let card = usage(name).unwrap();
+                texts.extend([card.usage, card.what].map(String::from));
+            }
+        }
+        let copying: Vec<&String> =
+            texts.iter().filter(|t| t.to_lowercase().contains("clipboard") || t.contains("copied")).collect();
+        assert!(copying.is_empty(), "{copying:#?}");
+        assert!(texts.iter().any(|t| t == "Your code:"), "onboarding just shows it");
     }
 
     #[test]
@@ -770,7 +1005,7 @@ mod tests {
         send(&mut s, "/clear");
         assert_eq!(s.tabs[0].cleared, 1);
         alt(&mut s, KeyCode::Char('2'));
-        let peer = s.tabs[1].peer.unwrap();
+        let peer = s.tabs[1].peer().unwrap();
         s.chats.entry(peer).or_default().messages.push(corvo_wan_p2p_core::store::StoredMessage {
             id: "01".into(),
             sent_at: 0,
@@ -862,44 +1097,10 @@ mod tests {
     }
 
     #[test]
-    fn a_passphrase_typed_after_the_command_is_not_kept() {
-        let mut s = state();
-        send(&mut s, "/blocked");
-        for line in
-            ["/passphrase old-secret new-secret", "/PASSPHRASE old-secret", "  /phrase hunter2", "/phrase  copy now"]
-        {
-            send(&mut s, line);
-            assert!(!last_corvo(&s).text.contains("secret") && !last_corvo(&s).text.contains("hunter2"));
-        }
-        assert_eq!(s.ask(), None, "nothing is asked");
-        assert!(s.tabs[0].lines.iter().any(|l| l.text == "type /passphrase alone; it asks for them hidden"));
-        assert_eq!(
-            last_corvo(&s).text,
-            "type /phrase alone, or /phrase save or /phrase copy; it asks for your passphrase hidden"
-        );
-        let mut kept = Vec::new();
-        while let Some(entry) = s.history.prev("") {
-            kept.push(entry);
-        }
-        assert_eq!(kept, vec!["/blocked"], "only the line without a passphrase in it");
-    }
-
-    #[test]
-    fn an_unsent_passphrase_line_is_not_kept_as_a_draft() {
-        let mut s = state();
-        send(&mut s, "/blocked");
-        type_text(&mut s, "/passphrase old-secret new-secret");
-        press(&mut s, KeyCode::Up);
-        assert_eq!(s.editor.text(), "/blocked");
-        press(&mut s, KeyCode::Down);
-        assert_eq!(s.editor.text(), "", "the line with a passphrase in it wasn't kept");
-    }
-
-    #[test]
     fn editor_does_not_reallocate_while_typing_an_answer() {
         let mut s = state();
-        send(&mut s, "/passphrase");
-        for question in 0..3 {
+        s.pending = Some(account::Pending::Update { version: "9.0.0".into() });
+        for question in 0..1 {
             press(&mut s, KeyCode::Char('x'));
             let (at, room) = (s.editor.text().as_ptr(), s.editor.capacity());
             type_text(&mut s, &"y".repeat(300));
@@ -915,7 +1116,6 @@ mod tests {
         use zeroize::Zeroizing;
         let pasted: Zeroizing<String> = one_line_answer("my pass\r\nphrase\n".into());
         assert_eq!(pasted.as_str(), "my pass phrase");
-        let _: Zeroizing<String> = crate::ui::clip::osc52("words");
         let _: Vec<Zeroizing<String>> = crate::ui::view::word_grid(&["abandon", "ability"], 80);
         let _: Zeroizing<String> = crate::ui::onboarding::lowered(&Secret::new(" Pass ".into()));
         assert_eq!(crate::ui::onboarding::lowered(&Secret::new(" Pass ".into())).as_str(), "pass");

@@ -186,6 +186,7 @@ enum Command {
     Path(Code, Reply<Option<PathInfo>>),
     ChangePassphrase { old: Zeroizing<String>, new: Zeroizing<String>, reply: Reply<()> },
     Phrase(Zeroizing<String>, Reply<Seed>),
+    CheckPassphrase(Zeroizing<String>, Reply<bool>),
     Shutdown,
 }
 
@@ -391,6 +392,11 @@ impl Client {
     pub async fn phrase(&self, passphrase: &str) -> Result<Seed, ChatError> {
         let passphrase = Zeroizing::new(passphrase.to_string());
         self.ask(|r| Command::Phrase(passphrase, r)).await
+    }
+
+    /// Whether `passphrase` is yours, before something that can't be undone.
+    pub async fn check_passphrase(&self, passphrase: Zeroizing<String>) -> Result<bool, ChatError> {
+        self.ask(|r| Command::CheckPassphrase(passphrase, r)).await
     }
 
     /// Closes every connection and stops. The store is released when this returns.
@@ -599,6 +605,12 @@ impl Core {
                 let seed = self.store.profile().map(|p| p.seed);
                 self.blocking(move || {
                     let _ = reply.send(check_passphrase(&passphrase, &typed).and_then(|()| Ok(seed?)));
+                });
+            }
+            Command::CheckPassphrase(typed, reply) => {
+                let passphrase = self.store.passphrase();
+                self.blocking(move || {
+                    let _ = reply.send(passphrase.check(&typed).map_err(ChatError::from));
                 });
             }
             Command::Shutdown => {}

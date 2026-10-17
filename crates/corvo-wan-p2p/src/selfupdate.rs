@@ -141,10 +141,53 @@ pub async fn check_with(urls: &Urls, current: &Version, asset: &str) -> Result<O
     Ok(newest_above(current, parse_releases(&json)?, asset))
 }
 
-/// Puts `release`'s `asset` in place of `target`: downloads into a temp folder
-/// beside it (so the last rename is on one filesystem), checks the SHA-256,
-/// unpacks, runs the new binary (with `verify`) to see it works here, then
-/// swaps it in. Any failure leaves `target` as it was.
+/// An update's steps, in order: each is done between redraws, so the screen
+/// can say which one is under way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stage {
+    /// Download the release and its checksum.
+    Fetch,
+    /// Check the checksum, unpack, and run the new binary.
+    Check,
+    /// Put it in place of the running one.
+    Swap,
+}
+
+impl Stage {
+    /// The stage after this one, if there is one.
+    pub fn next(self) -> Option<Stage> {
+        match self {
+            Stage::Fetch => Some(Stage::Check),
+            Stage::Check => Some(Stage::Swap),
+            Stage::Swap => None,
+        }
+    }
+}
+
+/// A release downloaded into a temp folder beside the binary it replaces (so
+/// the last rename is on one filesystem). Dropping it removes the folder, so
+/// an update stopped between stages leaves nothing behind but the old binary.
+#[derive(Debug)]
+pub struct Fetched {
+    dir: PathBuf,
+    /// Held while the folder is in use, so another update's sweep leaves it alone.
+    lock: Option<std::fs::File>,
+    archive: PathBuf,
+    sums: PathBuf,
+}
+
+impl Drop for Fetched {
+    fn drop(&mut self) {
+        // Closed first: Windows can't delete a file that's open.
+        drop(self.lock.take());
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// Puts `release`'s `asset` in place of `target`: fetches it, checks it (and,
+/// with `verify`, runs it to see it works here), then swaps it in. Any failure
+/// leaves `target` as it was. The app runs the stages one at a time.
+#[cfg(test)]
 pub async fn install_with(
     urls: &Urls,
     release: &Release,
@@ -152,6 +195,14 @@ pub async fn install_with(
     target: &Path,
     verify: bool,
 ) -> Result<(), String> {
+    let fetched = fetch(urls, release, asset, target).await?;
+    check(&fetched, &release.version, verify).await?;
+    swap(fetched, target)
+}
+
+/// Downloads `release`'s `asset` and its checksum into a new temp folder
+/// beside `target`, first clearing what cut-short updates left there.
+pub async fn fetch(urls: &Urls, release: &Release, asset: &str, target: &Path) -> Result<Fetched, String> {
     let dir = target.parent().ok_or_else(|| cant_replace(target, "it has no parent folder"))?;
     sweep_leftovers(dir);
     let tmp = dir.join(format!("{TMP_PREFIX}{}", std::process::id()));
@@ -169,32 +220,22 @@ pub async fn install_with(
             return Err(cant_replace(target, &reason));
         }
     };
-    let result = install_in(&tmp, urls, release, asset, target, verify).await;
-    // Closed first: Windows can't delete a file that's open.
-    drop(lock);
-    let _ = std::fs::remove_dir_all(&tmp);
-    result
-}
-
-async fn install_in(
-    tmp: &Path,
-    urls: &Urls,
-    release: &Release,
-    asset: &str,
-    target: &Path,
-    verify: bool,
-) -> Result<(), String> {
+    let fetched =
+        Fetched { archive: tmp.join(asset), sums: tmp.join(format!("{asset}.sha256")), dir: tmp, lock: Some(lock) };
     let version = &release.version;
     let url = format!("{}/{}/{asset}", urls.download, release.tag);
-    let archive = tmp.join(asset);
-    let sums = tmp.join(format!("{asset}.sha256"));
     let failed = |e: String| format!("couldn't download v{version}: {e}");
-    download(&url, &archive).await.map_err(failed)?;
-    download(&format!("{url}.sha256"), &sums).await.map_err(failed)?;
+    download(&url, &fetched.archive).await.map_err(failed)?;
+    download(&format!("{url}.sha256"), &fetched.sums).await.map_err(failed)?;
+    Ok(fetched)
+}
 
-    let expected = std::fs::read_to_string(&sums).unwrap_or_default();
+/// Checks the download against its checksum, unpacks it and, with `verify`,
+/// runs the new binary to see it says `version`. Then saves it to disk.
+pub async fn check(fetched: &Fetched, version: &Version, verify: bool) -> Result<(), String> {
+    let expected = std::fs::read_to_string(&fetched.sums).unwrap_or_default();
     let expected = expected.split_whitespace().next().unwrap_or_default().to_lowercase();
-    let bytes = std::fs::read(&archive).map_err(|e| e.to_string())?;
+    let bytes = std::fs::read(&fetched.archive).map_err(|e| e.to_string())?;
     let actual: String = Sha256::digest(&bytes).iter().map(|b| format!("{b:02x}")).collect();
     if expected != actual {
         return Err("the download didn't match its checksum; nothing changed".into());
@@ -203,9 +244,9 @@ async fn install_in(
     let status = tokio::process::Command::new(tar_program())
         .kill_on_drop(true)
         .arg("-xf")
-        .arg(&archive)
+        .arg(&fetched.archive)
         .arg("-C")
-        .arg(tmp)
+        .arg(&fetched.dir)
         .status()
         .await;
     match status {
@@ -214,7 +255,7 @@ async fn install_in(
         Err(e) if e.kind() == ErrorKind::NotFound => return Err("/update needs tar, which isn't installed".into()),
         Err(e) => return Err(format!("couldn't run tar: {e}")),
     }
-    let new = tmp.join(BIN_NAME);
+    let new = fetched.dir.join(BIN_NAME);
     if !new.is_file() {
         return Err("the download didn't contain corvo-wan-p2p; nothing changed".into());
     }
@@ -229,8 +270,12 @@ async fn install_in(
     // On disk before the swap, and the swap itself after it, in case the power goes.
     // Windows flushes only through a handle that can write.
     let synced = std::fs::OpenOptions::new().write(true).open(&new).and_then(|f| f.sync_all());
-    synced.map_err(|e| format!("couldn't save the new version: {e}; nothing changed"))?;
-    swap_in(&new, target).map_err(|e| cant_replace(target, &e.to_string()))?;
+    synced.map_err(|e| format!("couldn't save the new version: {e}; nothing changed"))
+}
+
+/// Puts the checked binary in place of `target`, then removes the temp folder.
+pub fn swap(fetched: Fetched, target: &Path) -> Result<(), String> {
+    swap_in(&fetched.dir.join(BIN_NAME), target).map_err(|e| cant_replace(target, &e.to_string()))?;
     #[cfg(unix)]
     if let Some(dir) = target.parent() {
         let _ = std::fs::File::open(dir).and_then(|d| d.sync_all());
@@ -613,6 +658,42 @@ mod tests {
         let found = check_with(&urls, &v("0.1.0"), &asset).await.unwrap().unwrap();
         let err = install_with(&urls, &found, &asset, &target, true).await.unwrap_err();
         assert_eq!(err, "the new version doesn't run here; nothing changed");
+        assert_eq!(fs::read_to_string(&target).unwrap(), "old");
+    }
+
+    #[tokio::test]
+    async fn the_stages_install_like_install_with() {
+        let (site, bin) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (urls, asset) = publish(site.path(), true);
+        let target = bin.path().join(BIN_NAME);
+        fs::write(&target, "old").unwrap();
+        let found = check_with(&urls, &v("0.1.0"), &asset).await.unwrap().unwrap();
+        let fetched = fetch(&urls, &found, &asset, &target).await.unwrap();
+        assert_eq!(fs::read_to_string(&target).unwrap(), "old", "fetching changes nothing");
+        check(&fetched, &found.version, VERIFY).await.unwrap();
+        assert_eq!(fs::read_to_string(&target).unwrap(), "old", "nor does checking");
+        swap(fetched, &target).unwrap();
+        let new = fs::read_to_string(site.path().join("staging").join(BIN_NAME)).unwrap();
+        assert_eq!(fs::read_to_string(&target).unwrap(), new);
+        let temp = fs::read_dir(bin.path())
+            .unwrap()
+            .flatten()
+            .any(|e| e.file_name().to_string_lossy().starts_with(TMP_PREFIX));
+        assert!(!temp, "the temp folder is gone");
+    }
+
+    #[tokio::test]
+    async fn dropping_fetched_removes_the_temp_folder() {
+        let (site, bin) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (urls, asset) = publish(site.path(), true);
+        let target = bin.path().join(BIN_NAME);
+        fs::write(&target, "old").unwrap();
+        let found = check_with(&urls, &v("0.1.0"), &asset).await.unwrap().unwrap();
+        let fetched = fetch(&urls, &found, &asset, &target).await.unwrap();
+        let temp = fetched.dir.clone();
+        assert!(temp.join(&asset).is_file(), "downloaded into it");
+        drop(fetched);
+        assert!(!temp.exists());
         assert_eq!(fs::read_to_string(&target).unwrap(), "old");
     }
 

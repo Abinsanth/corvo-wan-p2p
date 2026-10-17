@@ -5,7 +5,7 @@ app to app, end-to-end encrypted, with no server holding their messages. Share
 your code with a friend, they add it, and you chat. Messages wait on your
 machine until you're both online.
 
-**Status:** `v0.1.1`.
+**Status:** `v0.2.0`.
 
 ## Install
 
@@ -35,7 +35,9 @@ latest full release.
 
 Then open a new terminal and run `corvo-wan-p2p`. Inside the app, `/update`
 installs newer versions, pre-releases only if you're on one (a copy built
-from source updates with `git pull` and `cargo build` instead).
+from source updates with `git pull` and `cargo build` instead). It asks
+first, then a window shows the steps: downloading, checking the download,
+installing. If a step fails, or you quit partway, the old version stays.
 
 Or build from source with Rust ([rustup.rs](https://rustup.rs)):
 
@@ -60,7 +62,9 @@ account or **recover** one:
    somewhere safe (a password manager, paper), then delete that file. The app
    reminds you at each start until you do.
 3. Your **code** (`corvo1…`, 64 characters) is shown. Send it to a friend any
-   way you like. If one character of a code is mistyped, the app always
+   way you like. `/code` shows it again and offers to save it to
+   `~/corvo-wan-p2p-code.txt`, which holds only the code, so it's easy to copy
+   from there. If one character of a code is mistyped, the app always
    notices. (Codes from the test versions before `0.1.0-rc.3` started with
    `corvo:` and no longer work; contacts you already have stay.)
 
@@ -73,13 +77,20 @@ To chat:
 3. Messages are delivered whenever you're both online. Until then they wait on
    the sender's computer and go out on their own when you reconnect.
 
-A green dot next to a contact means they're online. Next to your own messages:
+In a chat, their messages are on the left (`14:02 hey`) and yours on the
+right (`see you soon 14:03 ✓✓`); the tab says who it is. A green dot next to
+a contact means they're online. After your own messages:
 
 | Mark | Meaning |
 |---|---|
 | `·` | waiting: not delivered yet |
 | `✓` | delivered to their computer |
 | `✓✓` | read |
+
+Each start opens with "corvo" in ASCII art and the version (any key closes
+it; it goes by itself after 2 seconds). The first start after making or
+recovering an account adds a few tips. Quitting leaves a small goodbye in
+the terminal.
 
 The bar at the bottom shows your name and code, whether you're online, how
 the open chat's connection goes (**direct** between the two computers, or
@@ -90,34 +101,79 @@ online, and how many of your messages are still waiting.
 
 | Command | What it does |
 |---|---|
-| `/code` | show your code and send it to your clipboard, if your terminal allows it |
+| `/profile` | your name and code, and a menu to change your name or passphrase, see your 12 words or delete your account |
+| `/code` | show your code in a box, and offer to save it to `~/corvo-wan-p2p-code.txt` |
 | `/add <code>` | add a friend by their code and open a chat |
-| `/chat <name>` | open a chat (Tab completes names) |
-| `/contacts` | your contacts, who's online, last seen |
-| `/requests` | people who messaged you but aren't contacts yet |
+| `/contacts` | a table of your contacts A–Z (online or last seen), then your requests |
+| `/requests` | a table of people who messaged you but aren't contacts yet |
+| `/blocked` | a table of the people you've blocked |
 | `/accept [name]` | accept a request (the one in this tab if no name) |
 | `/block [name]` | block a request or contact (this tab if no name) |
 | `/unblock <name>` | unblock someone |
-| `/blocked` | list blocked people |
 | `/remove <name>` | delete a contact (asks whether to delete the history too) |
 | `/info <name>` | their code, name, online / last seen |
-| `/name <new name>` | change your display name |
-| `/passphrase` | change your passphrase |
-| `/phrase` | show your 12 words again (asks your passphrase first) |
-| `/phrase save` | write them to `~/corvo-wan-p2p-recovery.txt` again |
-| `/phrase copy` | send them to your clipboard, if your terminal allows it (not in Terminal.app) |
+| `/chat <name>` | open a chat (Tab completes names) |
 | `/close` | close this chat tab |
 | `/clear` | clear the screen (Ctrl-L) |
 | `/update` | check for a newer version and install it |
-| `/welcome` | show the welcome again |
-| `/help` | a window with every command, the keys and the marks |
-| `/quit` | quit (Ctrl-C) |
+| `/about` | the version, where your data lives, the source and the license |
+| `/help`, `/h` | a short list of the commands and keys |
+| `/quit`, `/q` | quit (Ctrl-C) |
 
-Start a message with `//` to send text that begins with `/`.
+Keys: **Tab** completes, **Shift-Tab** or **Alt-1..9** switch tabs,
+**Alt+Enter** starts a new line, **PgUp/PgDn** scroll, and **↑/↓** bring back
+what you typed before.
+
+A command typed without what it needs, or with the wrong words, shows how
+it's typed, what it does and an example. Start a message with `//` to send
+text that begins with `/`.
 
 Someone you block can't reach you, and you look offline to them. If you
 unblock them and they write again, they come back as a request. A stranger's
 request holds at most 20 messages until you accept it.
+
+## Your profile
+
+`/profile` opens a **Profile** tab right after the corvo tab. It shows your
+name and code, and a menu:
+
+```
+› Change name
+  Change passphrase
+  Show 12 words
+  Delete account
+```
+
+↑/↓ choose and Enter opens the item in a window:
+
+- **Change name:** your name now, and a field for the new one. Enter saves it.
+- **Change passphrase:** the current one, the new one and the new one again,
+  all hidden.
+- **Show 12 words:** asks your passphrase, then shows the words. `S` saves
+  them to `~/corvo-wan-p2p-recovery.txt`, or says where that file already is.
+  Closing the window wipes the words from memory.
+- **Delete account** (in red): see below.
+
+Esc closes a window, and Esc again closes the tab. Moving to another tab
+closes it too. What you type in these windows never goes into the input
+history.
+
+### Delete account
+
+Removes your account from this computer completely. The window says what goes,
+then asks your passphrase, then asks you to type `delete`, then asks
+"Uninstall the app too? y/n". Esc stops it at any step.
+
+It deletes everything the app keeps: the data folder (keys, messages,
+contacts, logs), the recovery file and the code file. Your friends keep their
+copies of your messages, and your 12 words still bring back the same code
+(with no history) if you kept them somewhere else.
+
+With `y` it also deletes the program. On Windows, or for a copy you built from
+source, it prints what to delete instead. The app then quits and says what was
+done, or what's left and where if something couldn't be deleted. The PATH line
+the installer added stays; remove it yourself if you like (see
+[Uninstall](#uninstall)).
 
 ## One code per computer
 
@@ -157,25 +213,31 @@ requests; accept them again.
   `CORVO_WAN_P2P_LOG=debug` for more while looking into a problem (still
   only the app's own notes). Past 1 MB it starts over, keeping one old file.
 - **The recovery file** holds your 12 words in plain text. Delete it once
-  you've copied them. `/phrase copy` sends the words to your clipboard if your terminal allows it,
-  and clipboard history apps may keep them there.
+  you've copied them. The app never puts anything on your clipboard.
+- **The code file**, `~/corvo-wan-p2p-code.txt`, is only there if you let
+  `/code` save it. It holds just your code, which isn't secret.
 
 ## Uninstall
 
-Delete the program, then, to also forget your account and chats on this
-computer, its data folder. Keep your 12 words if you want the account back
-later.
+The easy way: `/profile`, **Delete account**, and answer `y` to "Uninstall
+the app too?". That deletes your account, its files and the program (see
+[Delete account](#delete-account)). Then delete the PATH line, below.
+
+By hand: delete the program, then, to also forget your account and chats on
+this computer, its data folder and the code and recovery files in your home
+folder, if they're there. Keep your 12 words if you want the account back later.
 
 ```bash
 rm ~/.local/bin/corvo-wan-p2p
 rm -rf ~/.config/corvo-wan-p2p
+rm -f ~/corvo-wan-p2p-code.txt ~/corvo-wan-p2p-recovery.txt
 ```
 
 Also delete the two lines the installer added to `~/.zshrc` (or your bash
 profile), under `# added by the corvo-wan-p2p installer`.
 
-On Windows, delete `%LOCALAPPDATA%\Programs\corvo-wan-p2p` and
-`%APPDATA%\corvo-wan-p2p`.
+On Windows, delete `%LOCALAPPDATA%\Programs\corvo-wan-p2p`,
+`%APPDATA%\corvo-wan-p2p` and the two files in `%USERPROFILE%`.
 
 ## Development
 

@@ -2,29 +2,34 @@
 //! the terminal. What came of each goes back to `update` as [`Msg::Done`].
 
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
 use corvo_wan_p2p_core::chat::{ChatError, Client, Config, Event};
 use corvo_wan_p2p_core::identity::{Code, Seed};
 use corvo_wan_p2p_core::net::internet_endpoint;
-use corvo_wan_p2p_core::recovery;
 use corvo_wan_p2p_core::store::{Mark, Standing, Store, StoreError, StoredMessage};
+use corvo_wan_p2p_core::{codefile, recovery};
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::SetTitle;
 
 use super::account::{PhraseDone, PhraseUse};
 use super::chat::{History, Loaded};
-use super::clip::osc52;
 use super::people::Act;
 use super::state::{CHAT_LEN, Secret};
 use super::update::{Effect, Msg, Outcome};
-use crate::selfupdate::{self, Release, Urls};
+use crate::selfupdate::{self, Fetched, Release, Stage, Urls};
 use semver::Version;
 
 /// For commands that need the engine, before it has started.
 const NOT_STARTED: &str = "the chat engine hasn't started";
+const NOTHING_TO_INSTALL: &str = "nothing to install: /update looks for a newer version first";
+/// After uninstalling: what the installer did that stays.
+#[cfg(not(windows))]
+const PATH_STAYS: &str = "the PATH line the installer added to your shell profile stays; remove it if you like";
+#[cfg(windows)]
+const PATH_STAYS: &str = "the folder the installer added to your PATH stays there; remove it if you like";
 
 /// How the engine reaches other people.
 pub enum Net {
@@ -43,6 +48,8 @@ pub enum Flow {
     Quit,
     /// Leave, printing this.
     Exit(String),
+    /// The account is deleted: leave, printing the goodbye and these.
+    Leave(Vec<String>),
 }
 
 /// Where `/update` looks, and what it found.
@@ -57,6 +64,9 @@ struct Updates {
     verify: bool,
     /// The release the last check found.
     found: Option<Release>,
+    /// The release being installed, and its download, between stages.
+    /// Dropping the download removes its temp folder.
+    installing: Option<(Release, Option<Fetched>)>,
     /// The version installed since this app started, which a restart runs.
     installed: Option<Version>,
 }
@@ -66,7 +76,7 @@ pub struct Runner<W: Write> {
     home: Option<PathBuf>,
     config: Config,
     net: Net,
-    /// The terminal: window titles and the clipboard are written here.
+    /// The terminal: window titles are written here.
     out: W,
     /// An account just made, until the engine starts on it.
     store: Option<Store>,
@@ -84,6 +94,7 @@ impl<W: Write> Runner<W> {
             asset: selfupdate::asset_name(os, arch).ok_or_else(|| selfupdate::no_build(os, arch)),
             verify: true,
             found: None,
+            installing: None,
             installed: None,
         };
         Runner { dir, home, config, net, out, store: None, client: None, updates }
@@ -93,7 +104,15 @@ impl<W: Write> Runner<W> {
     #[cfg(test)]
     fn with_updates(mut self, urls: Urls, asset: String, target: PathBuf) -> Self {
         let verify = selfupdate::testing::VERIFY;
-        self.updates = Updates { urls, target: Ok(target), asset: Ok(asset), verify, found: None, installed: None };
+        self.updates = Updates {
+            urls,
+            target: Ok(target),
+            asset: Ok(asset),
+            verify,
+            found: None,
+            installing: None,
+            installed: None,
+        };
         self
     }
 
@@ -110,10 +129,43 @@ impl<W: Write> Runner<W> {
         Ok(version)
     }
 
-    async fn install_update(&mut self, release: &Release) -> Result<(), String> {
+    /// Uninstalls `exe` in place of the running app.
+    #[cfg(test)]
+    fn with_exe(mut self, exe: PathBuf) -> Self {
+        self.updates.target = Ok(exe);
+        self
+    }
+
+    /// Does one `stage` of installing the release the last check found. A
+    /// failure drops the download, which leaves the old version in place.
+    async fn install(&mut self, stage: Stage) -> Result<(), String> {
+        let result = self.try_install(stage).await;
+        if result.is_err() {
+            self.updates.installing = None;
+        }
+        result
+    }
+
+    async fn try_install(&mut self, stage: Stage) -> Result<(), String> {
         let (target, asset) = (self.updates.target.clone()?, self.updates.asset.clone()?);
-        selfupdate::install_with(&self.updates.urls, release, &asset, &target, self.updates.verify).await?;
-        self.updates.installed = Some(release.version.clone());
+        let updates = &mut self.updates;
+        match (stage, &mut updates.installing) {
+            (Stage::Fetch, _) => {
+                let release = updates.found.take().ok_or(NOTHING_TO_INSTALL)?;
+                let fetched = selfupdate::fetch(&updates.urls, &release, &asset, &target).await?;
+                updates.installing = Some((release, Some(fetched)));
+            }
+            (Stage::Check, Some((release, Some(fetched)))) => {
+                selfupdate::check(fetched, &release.version, updates.verify).await?;
+            }
+            (Stage::Swap, Some((release, fetched @ Some(_)))) => {
+                let version = release.version.clone();
+                selfupdate::swap(fetched.take().expect("matched Some"), &target)?;
+                updates.installing = None;
+                updates.installed = Some(version);
+            }
+            _ => return Err(NOTHING_TO_INSTALL.into()),
+        }
         Ok(())
     }
 
@@ -125,10 +177,6 @@ impl<W: Write> Runner<W> {
             Effect::Exit(why) => return Ok(Flow::Exit(why)),
             Effect::SetTitle(title) => {
                 execute!(self.out, SetTitle(title))?;
-                return Ok(Flow::Next(None));
-            }
-            Effect::Copy(text) => {
-                self.copy(&text)?;
                 return Ok(Flow::Next(None));
             }
             Effect::Unlock(passphrase) => {
@@ -212,10 +260,14 @@ impl<W: Write> Runner<W> {
                 Some(version) => Outcome::UpdatedAlready(version.to_string()),
                 None => Outcome::UpdateChecked { yes, result: self.check_update().await },
             },
-            Effect::InstallUpdate => Outcome::Updated(match self.updates.found.take() {
-                Some(release) => self.install_update(&release).await.map(|()| release.version.to_string()),
-                None => Err("nothing to install: /update looks for a newer version first".into()),
+            Effect::Install(stage) => Outcome::InstallStep { stage, result: self.install(stage).await },
+            Effect::ShowCode => Outcome::CodeShown { saved: self.code_file() },
+            Effect::WriteCode => self.write_code(),
+            Effect::CheckPassphrase(passphrase) => Outcome::PassphraseChecked(match self.client() {
+                Ok(client) => client.check_passphrase(passphrase.into_inner()).await.map_err(|e| e.to_string()),
+                Err(e) => Err(e),
             }),
+            Effect::DeleteAccount { uninstall } => return self.delete_account(uninstall).await,
             Effect::Refresh(show) => Outcome::Refreshed {
                 show,
                 result: match self.client() {
@@ -225,6 +277,49 @@ impl<W: Write> Runner<W> {
             },
         };
         Ok(Flow::Next(Some(Msg::Done(outcome))))
+    }
+
+    /// Deletes everything the app keeps, after stopping the engine so the
+    /// store lets go of its files; with `uninstall`, the program too. Leaves
+    /// with what was done, or with what's left, by path, if something
+    /// wouldn't go (the program then stays).
+    async fn delete_account(&mut self, uninstall: bool) -> anyhow::Result<Flow> {
+        self.shutdown().await;
+        let (dir, home) = (self.dir.clone(), self.home.clone());
+        let left = blocking(move || delete_files(&dir, home.as_deref())).await?;
+        if !left.is_empty() {
+            let mut notes = vec!["your account couldn't be deleted completely; still there:".to_string()];
+            notes.extend(left);
+            if uninstall {
+                notes.push("the app wasn't uninstalled".into());
+            }
+            return Ok(Flow::Exit(notes.join("\n")));
+        }
+        let mut notes = vec!["your account is deleted from this computer".to_string()];
+        if uninstall {
+            notes.push(self.uninstall());
+            notes.push(PATH_STAYS.into());
+        }
+        Ok(Flow::Leave(notes))
+    }
+
+    /// Deletes the running program, or says how to.
+    fn uninstall(&self) -> String {
+        let exe = match &self.updates.target {
+            Ok(exe) => exe,
+            Err(why) => return format!("{why}; delete the corvo-wan-p2p program yourself"),
+        };
+        if selfupdate::is_built_from_source(exe) {
+            return "built from source: delete the folder you built it in".into();
+        }
+        // Windows won't delete a program that's running.
+        if cfg!(windows) {
+            return format!("to uninstall, run: del \"{}\"", exe.display());
+        }
+        match std::fs::remove_file(exe) {
+            Ok(()) => format!("uninstalled: removed {}", exe.display()),
+            Err(e) => format!("couldn't remove {} ({e}); to uninstall, run: rm \"{}\"", exe.display(), exe.display()),
+        }
     }
 
     /// The engine's next event; waits forever until it's started.
@@ -272,12 +367,6 @@ impl<W: Write> Runner<W> {
         done.map_err(|e| e.to_string())
     }
 
-    fn copy(&mut self, text: &str) -> std::io::Result<()> {
-        let sequence = osc52(text);
-        self.out.write_all(sequence.as_bytes())?;
-        self.out.flush()
-    }
-
     /// Starts the engine on `store`; anything that stops it is fatal.
     async fn start(&mut self, store: Store) -> Outcome {
         match self.try_start(store).await {
@@ -304,6 +393,36 @@ impl<W: Write> Runner<W> {
         Ok(Outcome::Started { name: profile.name, code, recovery_file: self.recovery_file() })
     }
 
+    /// Where the code file is, if it's there and holds this account's code:
+    /// one left by an account deleted with `--recover` doesn't count.
+    fn code_file(&self) -> Option<PathBuf> {
+        let (home, client) = (self.home.as_deref()?, self.client.as_ref()?);
+        let path = codefile::path(home);
+        let text = std::fs::read_to_string(&path).ok()?;
+        (text.trim() == client.me().to_string()).then_some(path)
+    }
+
+    /// Writes the code file, replacing one with another code in it; one with
+    /// this code that's there already is reported as there.
+    fn write_code(&self) -> Outcome {
+        let Some(home) = self.home.as_deref() else {
+            return Outcome::CodeWritten(Err("couldn't find your home folder".into()));
+        };
+        let Some(client) = &self.client else { return Outcome::CodeWritten(Err(NOT_STARTED.into())) };
+        if self.code_file().is_none()
+            && let Err(e) = codefile::remove(home)
+        {
+            return Outcome::CodeWritten(Err(e.to_string()));
+        }
+        match codefile::write(home, &client.me()) {
+            Ok(path) => Outcome::CodeWritten(Ok(path)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                Outcome::CodeShown { saved: Some(codefile::path(home)) }
+            }
+            Err(e) => Outcome::CodeWritten(Err(e.to_string())),
+        }
+    }
+
     /// Where the recovery file is, if it's there.
     fn recovery_file(&self) -> Option<PathBuf> {
         self.home.as_deref().map(recovery::path).filter(|p| p.exists())
@@ -321,16 +440,33 @@ impl<W: Write> Runner<W> {
         let words = Secret::new(seed.phrase());
         match then {
             PhraseUse::Show => Ok(PhraseDone::Shown(words)),
-            PhraseUse::Copy => {
-                self.copy(words.expose()).map_err(|e| format!("couldn't copy them: {e}"))?;
-                Ok(PhraseDone::Copied)
-            }
             PhraseUse::Save { overwrite } => match self.recovery_file() {
                 Some(path) if !overwrite => Ok(PhraseDone::Exists(path)),
                 _ => self.write_recovery(&seed, overwrite).map(PhraseDone::Saved),
             },
         }
     }
+}
+
+/// Deletes the data folder `dir`, the recovery file and the code file. What
+/// wouldn't go, one line each: where it is and why.
+fn delete_files(dir: &Path, home: Option<&Path>) -> Vec<String> {
+    let mut left = Vec::new();
+    // The log lets go of its file first: Windows won't delete an open one.
+    crate::logging::forget(dir);
+    if let Err(e) = Store::delete_all(dir) {
+        left.push(format!("  {} ({e})", dir.display()));
+    }
+    // Without a home folder, neither file was ever written.
+    if let Some(home) = home {
+        if let Err(e) = recovery::remove(home) {
+            left.push(format!("  {} ({e})", recovery::path(home).display()));
+        }
+        if let Err(e) = codefile::remove(home) {
+            left.push(format!("  {} ({e})", codefile::path(home).display()));
+        }
+    }
+    left
 }
 
 /// Now, in Unix milliseconds.
@@ -361,7 +497,6 @@ pub fn date(unix_secs: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ui::clip::osc52;
     use crate::ui::onboarding::Onboarding;
     use crate::ui::state::{Screen, State};
     use crate::ui::update::update;
@@ -380,6 +515,8 @@ mod tests {
     struct App {
         state: State,
         runner: Runner<Vec<u8>>,
+        /// What it printed on leaving after Delete account.
+        left: Option<Vec<String>>,
     }
 
     impl App {
@@ -394,7 +531,7 @@ mod tests {
             let state = State::onboarding(Onboarding::start(Store::exists(&dir), recover));
             let net = Net::Local(lookup.clone());
             let runner = Runner::new(dir, Some(home.path().to_path_buf()), FAST, net, Vec::new());
-            App { state, runner }
+            App { state, runner, left: None }
         }
 
         /// An account called `name` with passphrase `pw`, made straight in the
@@ -410,6 +547,7 @@ mod tests {
             let mut app = App::open_on(data, home, false, lookup);
             assert_eq!(app.send("pw").await, None);
             assert!(matches!(app.state.screen, Screen::Main));
+            app.close_the_start_window().await;
             app
         }
 
@@ -439,6 +577,10 @@ mod tests {
                     Flow::Next(None) => {}
                     Flow::Quit => return None,
                     Flow::Exit(why) => return Some(why),
+                    Flow::Leave(notes) => {
+                        self.left = Some(notes);
+                        return None;
+                    }
                 }
             }
             None
@@ -455,6 +597,54 @@ mod tests {
             match &self.state.screen {
                 Screen::Onboarding(o) => o,
                 Screen::Main => panic!("onboarding is over"),
+            }
+        }
+
+        async fn press(&mut self, code: KeyCode) {
+            self.handle(Msg::Key(KeyEvent::new(code, KeyModifiers::NONE))).await;
+        }
+
+        /// Opens the Profile tab's window for menu item `item` (0 is the first).
+        async fn open_profile_item(&mut self, item: usize) {
+            self.send("/profile").await;
+            for _ in 0..crate::ui::profile::MENU.len() {
+                self.press(KeyCode::Up).await;
+            }
+            for _ in 0..item {
+                self.press(KeyCode::Down).await;
+            }
+            self.press(KeyCode::Enter).await;
+            assert!(matches!(self.state.overlay, Some(Overlay::Form(_))), "the window opens");
+        }
+
+        /// Deletes the account from the Profile tab, answering `uninstall`
+        /// (y or n). `Some` with the message if the app exits.
+        async fn delete_account(&mut self, uninstall: char) -> Option<String> {
+            self.open_profile_item(3).await;
+            self.press(KeyCode::Enter).await;
+            self.fill(&["pw"]).await;
+            self.fill(&["delete"]).await;
+            self.handle(Msg::Key(KeyEvent::new(KeyCode::Char(uninstall), KeyModifiers::NONE))).await
+        }
+
+        /// Types `fields` into the open window, Tab between them, then Enter.
+        async fn fill(&mut self, fields: &[&str]) {
+            for (i, field) in fields.iter().enumerate() {
+                if i > 0 {
+                    self.press(KeyCode::Tab).await;
+                }
+                for c in field.chars() {
+                    self.press(KeyCode::Char(c)).await;
+                }
+            }
+            self.press(KeyCode::Enter).await;
+        }
+
+        /// What the open window says under its fields.
+        fn note(&self) -> String {
+            match &self.state.overlay {
+                Some(Overlay::Form(form)) => form.note.as_ref().map(|n| n.text.clone()).unwrap_or_default(),
+                other => panic!("no window: {other:?}"),
             }
         }
 
@@ -481,11 +671,19 @@ mod tests {
             seed
         }
 
-        /// Enter at the code starts the app; the welcome shows, and Enter closes it.
+        /// Enter at the code starts the app; the start window shows the tips,
+        /// and Enter closes it.
         async fn start(&mut self) {
             self.send("").await;
-            assert!(matches!(self.state.overlay, Some(Overlay::Welcome { .. })), "the welcome shows");
+            assert_eq!(self.state.overlay, Some(Overlay::start(true)), "the tips show");
             self.send("").await;
+            assert_eq!(self.state.overlay, None);
+        }
+
+        /// After an unlock: the start window shows, and any key closes it.
+        async fn close_the_start_window(&mut self) {
+            assert_eq!(self.state.overlay, Some(Overlay::start(false)), "the art shows");
+            self.handle(Msg::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))).await;
             assert_eq!(self.state.overlay, None);
         }
     }
@@ -500,7 +698,7 @@ mod tests {
             assert!(file.contains(&format!("{:>2}. {word}", i + 1)));
         }
         assert!(file.contains(&seed.code().to_string()));
-        assert!(app.written().contains(osc52(&seed.code().to_string()).as_str()), "the code is copied");
+        assert!(!app.written().contains("\x1b]52"), "nothing is sent to the clipboard");
         assert_eq!(app.send("").await, None);
         assert!(matches!(app.state.screen, Screen::Main));
         assert_eq!(app.state.code, Some(seed.code()));
@@ -522,14 +720,14 @@ mod tests {
         let mut app = App::open(&data, &home, false);
         app.make_account().await;
         app.start().await;
-        for answer in ["/passphrase", "wrong", "new", "new"] {
-            app.send(answer).await;
-        }
-        assert_eq!(app.said().last().unwrap(), "wrong passphrase; nothing changed");
-        for answer in ["/passphrase", "pw", "new", "new"] {
-            app.send(answer).await;
-        }
-        assert!(app.said().last().unwrap().starts_with("passphrase changed"));
+        app.open_profile_item(1).await;
+        app.fill(&["wrong", "new", "new"]).await;
+        assert_eq!(app.note(), "wrong passphrase; nothing changed");
+        app.press(KeyCode::Char('x')).await;
+        assert_eq!(app.state.overlay, None);
+        app.open_profile_item(1).await;
+        app.fill(&["pw", "new", "new"]).await;
+        assert_eq!(app.note(), "done: use the new one from now on");
         app.runner.shutdown().await;
 
         let mut app = App::open(&data, &home, false);
@@ -541,54 +739,65 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn phrase_shows_saves_and_copies_the_words() {
+    async fn the_words_window_shows_and_saves_the_words() {
         let (data, home) = (TempDir::new().unwrap(), TempDir::new().unwrap());
         let mut app = App::open(&data, &home, false);
         let seed = app.make_account().await;
         app.start().await;
-        app.send("/phrase").await;
-        app.send("nope").await;
-        assert_eq!(app.state.reveal, None);
-        assert_eq!(app.said().last().unwrap(), "wrong passphrase");
-        app.send("/phrase").await;
-        app.send("pw").await;
-        assert_eq!(app.state.reveal.as_ref().map(|w| w.expose().to_string()), Some(seed.phrase()));
-        app.handle(Msg::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE))).await;
-        assert_eq!(app.state.reveal, None);
-
-        app.send("/phrase copy").await;
-        app.send("pw").await;
-        assert!(app.written().contains(osc52(&seed.phrase()).as_str()));
-
+        let words = |app: &App| match &app.state.overlay {
+            Some(Overlay::Form(form)) => form.words_shown().map(|w| w.expose().to_string()),
+            _ => None,
+        };
+        app.open_profile_item(2).await;
+        app.fill(&["nope"]).await;
+        assert_eq!(app.note(), "wrong passphrase");
+        assert_eq!(words(&app), None);
+        app.fill(&["pw"]).await;
+        assert_eq!(words(&app), Some(seed.phrase()));
+        let file = recovery::path(home.path());
+        app.press(KeyCode::Char('s')).await;
+        assert_eq!(app.note(), format!("already saved in {}", file.display()), "made with the account");
         recovery::remove(home.path()).unwrap();
-        app.send("/phrase save").await;
-        app.send("pw").await;
-        assert!(recovery::exists(home.path()));
-        app.send("/phrase save").await;
-        app.send("pw").await;
-        assert_eq!(app.state.ask().unwrap().label, "replace it? y/n: ");
-        app.send("y").await;
-        assert!(app.said().last().unwrap().starts_with("your words are saved in"));
+        app.press(KeyCode::Char('s')).await;
+        assert_eq!(app.note(), format!("saved in {}", file.display()));
+        assert!(std::fs::read_to_string(&file).unwrap().contains(&format!(" 1. {}", seed.words()[0])));
+        app.press(KeyCode::Esc).await;
+        assert_eq!(app.state.overlay, None);
+        assert!(app.state.on_profile());
         app.runner.shutdown().await;
     }
 
     #[tokio::test]
-    async fn phrase_save_checks_the_passphrase_before_asking_to_replace() {
+    async fn code_offers_the_code_file_then_says_where_it_is() {
         let (data, home) = (TempDir::new().unwrap(), TempDir::new().unwrap());
         let mut app = App::open(&data, &home, false);
-        app.make_account().await;
+        let seed = app.make_account().await;
         app.start().await;
-        let file = recovery::path(home.path());
-        let before = std::fs::read_to_string(&file).unwrap();
-        app.send("/phrase save").await;
-        app.send("nope").await;
-        assert_eq!(app.state.ask(), None, "no question after a wrong passphrase");
-        assert_eq!(app.said().last().unwrap(), "wrong passphrase");
-        app.send("/phrase save").await;
-        app.send("pw").await;
-        assert_eq!(app.state.ask().unwrap().label, "replace it? y/n: ");
-        app.send("n").await;
-        assert_eq!(std::fs::read_to_string(&file).unwrap(), before, "kept");
+        app.send("/code").await;
+        assert_eq!(app.state.ask().unwrap().label, "save it to ~/corvo-wan-p2p-code.txt? y/n: ");
+        app.send("y").await;
+        let file = codefile::path(home.path());
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), format!("{}\n", seed.code()));
+        assert!(app.said().last().unwrap().starts_with(&format!("saved in {}", file.display())));
+        app.send("/code").await;
+        assert_eq!(app.state.ask(), None, "not asked again");
+        assert_eq!(app.said().last().unwrap(), &format!("it's saved in {}", file.display()));
+        app.runner.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_code_file_from_another_account_is_not_shown_as_yours() {
+        let (data, home) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        let other = Seed::generate().code();
+        codefile::write(home.path(), &other).unwrap();
+        let mut app = App::open(&data, &home, false);
+        let seed = app.make_account().await;
+        app.start().await;
+        app.send("/code").await;
+        assert_eq!(app.state.ask().unwrap().label, "save it to ~/corvo-wan-p2p-code.txt? y/n: ");
+        app.send("y").await;
+        let file = codefile::path(home.path());
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), format!("{}\n", seed.code()), "replaced with yours");
         app.runner.shutdown().await;
     }
 
@@ -652,6 +861,89 @@ mod tests {
         assert!(!dir.join(crate::logging::LOG_FILE).exists());
         assert!(!dir.join("corvo-wan-p2p.log.old").exists());
         app.runner.shutdown().await;
+    }
+
+    /// An account named ana with the code and recovery files in `home`, and
+    /// a program at `exe` to uninstall.
+    async fn with_files(data: &TempDir, home: &TempDir, exe: &Path) -> App {
+        let app = App::person(data, home, &MemoryLookup::new(), "ana").await;
+        codefile::write(home.path(), &app.code()).unwrap();
+        recovery::write(home.path(), &Seed::generate(), "2026-10-17", false).unwrap();
+        std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+        std::fs::write(exe, "the app").unwrap();
+        App { runner: app.runner.with_exe(exe.to_path_buf()), ..app }
+    }
+
+    #[tokio::test]
+    async fn deleting_the_account_removes_the_folder_and_both_files() {
+        let (data, home, bin) = (TempDir::new().unwrap(), TempDir::new().unwrap(), TempDir::new().unwrap());
+        let exe = bin.path().join("corvo-wan-p2p");
+        let mut app = with_files(&data, &home, &exe).await;
+        let dir = data.path().join("corvo-wan-p2p");
+        std::fs::write(dir.join(crate::logging::LOG_FILE), "a log line\n").unwrap();
+        assert_eq!(app.delete_account('y').await, None);
+        let notes = app.left.clone().expect("it leaves");
+        assert!(!dir.exists(), "the data folder is gone");
+        assert_eq!(std::fs::read_dir(data.path()).unwrap().count(), 0);
+        assert_eq!(std::fs::read_dir(home.path()).unwrap().count(), 0, "both files are gone");
+        assert_eq!(notes[0], "your account is deleted from this computer");
+        if cfg!(windows) {
+            assert!(exe.exists());
+            assert_eq!(notes[1], format!("to uninstall, run: del \"{}\"", exe.display()));
+        } else {
+            assert!(!exe.exists(), "uninstalled");
+            assert_eq!(notes[1], format!("uninstalled: removed {}", exe.display()));
+        }
+        assert_eq!(notes[2], PATH_STAYS);
+        assert_eq!(notes.len(), 3);
+
+        let app = App::open(&data, &home, false);
+        assert_ne!(app.state.ask().unwrap().label, "passphrase: ", "a new start makes a new account");
+    }
+
+    #[tokio::test]
+    async fn deleting_without_uninstalling_keeps_the_app() {
+        let (data, home, bin) = (TempDir::new().unwrap(), TempDir::new().unwrap(), TempDir::new().unwrap());
+        let exe = bin.path().join("corvo-wan-p2p");
+        let mut app = with_files(&data, &home, &exe).await;
+        assert_eq!(app.delete_account('n').await, None);
+        assert_eq!(app.left, Some(vec!["your account is deleted from this computer".to_string()]));
+        assert!(exe.exists());
+        assert!(!data.path().join("corvo-wan-p2p").exists());
+    }
+
+    #[tokio::test]
+    async fn a_failed_delete_says_what_is_left() {
+        let (data, home, bin) = (TempDir::new().unwrap(), TempDir::new().unwrap(), TempDir::new().unwrap());
+        let exe = bin.path().join("corvo-wan-p2p");
+        let mut app = with_files(&data, &home, &exe).await;
+        // A folder where the code file goes won't delete as a file.
+        let code_file = codefile::path(home.path());
+        std::fs::remove_file(&code_file).unwrap();
+        std::fs::create_dir(&code_file).unwrap();
+        std::fs::write(code_file.join("inside"), "x").unwrap();
+        let exit = app.delete_account('y').await.expect("it exits with what's left");
+        let lines: Vec<&str> = exit.lines().collect();
+        assert_eq!(lines[0], "your account couldn't be deleted completely; still there:");
+        assert!(lines[1].starts_with(&format!("  {} (", code_file.display())), "{exit}");
+        assert_eq!(lines[2], "the app wasn't uninstalled");
+        assert_eq!(lines.len(), 3, "{exit}");
+        assert!(exe.exists());
+        assert!(!data.path().join("corvo-wan-p2p").exists(), "the rest went");
+        assert!(!recovery::path(home.path()).exists());
+        assert!(app.left.is_none(), "never says it's all gone");
+    }
+
+    #[tokio::test]
+    async fn uninstall_from_source_is_refused_with_a_note() {
+        let (data, home, bin) = (TempDir::new().unwrap(), TempDir::new().unwrap(), TempDir::new().unwrap());
+        let exe = bin.path().join("target").join("debug").join("corvo-wan-p2p");
+        let mut app = with_files(&data, &home, &exe).await;
+        assert_eq!(app.delete_account('y').await, None);
+        let notes = app.left.clone().expect("it leaves");
+        assert_eq!(notes[1], "built from source: delete the folder you built it in");
+        assert!(exe.exists(), "the build is left alone");
+        assert!(!data.path().join("corvo-wan-p2p").exists());
     }
 
     #[test]
@@ -762,7 +1054,9 @@ mod tests {
         ana.send("y").await;
         assert_eq!(ana.state.standing(&friend), None);
         assert!(!ana.state.chats.contains_key(&friend));
-        ana.send("/name Ana M").await;
+        ana.open_profile_item(0).await;
+        ana.fill(&["Ana M"]).await;
+        assert_eq!(ana.state.overlay, None, "the window closes once it's saved");
         assert_eq!(ana.state.name, "Ana M");
         ana.send("/contacts").await;
         assert_eq!(ana.said().last().unwrap(), "no contacts yet: /add <code> adds a friend");
@@ -771,6 +1065,32 @@ mod tests {
         ana.runner.shutdown().await;
         let ana = App::restart(&data, &home, &lookup).await;
         assert_eq!(ana.state.name, "Ana M", "the new name was saved");
+    }
+
+    #[tokio::test]
+    async fn quitting_between_update_stages_leaves_the_old_program() {
+        let (data, home, site, bin) =
+            (TempDir::new().unwrap(), TempDir::new().unwrap(), TempDir::new().unwrap(), TempDir::new().unwrap());
+        let lookup = MemoryLookup::new();
+        let mut app = App::person(&data, &home, &lookup, "ana").await;
+        let (urls, asset) = crate::selfupdate::testing::publish(site.path(), true);
+        let target = bin.path().join("corvo-wan-p2p");
+        std::fs::write(&target, "old").unwrap();
+        app.runner = app.runner.with_updates(urls, asset, target.clone());
+        app.send("/update").await;
+        assert_eq!(app.state.ask().unwrap().label, "update now? y/n: ");
+        // The loop carries out one stage at a time; quit after the first two.
+        for stage in [Stage::Fetch, Stage::Check] {
+            let flow = app.runner.apply(Effect::Install(stage)).await.unwrap();
+            assert!(matches!(flow, Flow::Next(Some(Msg::Done(Outcome::InstallStep { result: Ok(()), .. })))));
+        }
+        let left = || std::fs::read_dir(bin.path()).unwrap().count();
+        assert_eq!(left(), 2, "the program and the update's temp folder");
+        assert!(matches!(app.runner.apply(Effect::Quit).await.unwrap(), Flow::Quit));
+        app.runner.shutdown().await;
+        drop(app);
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "old", "the old program is still there");
+        assert_eq!(left(), 1, "and nothing else");
     }
 
     #[tokio::test]

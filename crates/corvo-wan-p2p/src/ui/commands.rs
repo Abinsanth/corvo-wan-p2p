@@ -161,17 +161,17 @@ const USAGES: &[(&str, Usage)] = &[
     ),
     ("info", card("/info <name>", "Shows a contact's code, name and when they were last seen.", Some("/info rahul"))),
     ("name", card("/name <new name>", "Changes the name your friends see.", Some("/name Ana Maria"))),
-    ("passphrase", card("/passphrase", "Changes your passphrase. Type it alone: it asks for them hidden.", None)),
+    ("passphrase", card("/passphrase", "Changes your passphrase, asking for the old and new ones hidden.", None)),
     (
         "phrase",
         card(
             "/phrase [save]",
-            "Shows your 12 words, or saves them to a file. It asks for your passphrase hidden.",
+            "Shows your 12 words, or saves them to a file, after asking for your passphrase hidden.",
             Some("/phrase save"),
         ),
     ),
     ("close", card("/close", "Closes this chat tab.", None)),
-    ("clear", card("/clear", "Clears the screen. Ctrl-L does too.", None)),
+    ("clear", card("/clear", "Clears the screen, like Ctrl-L.", None)),
     (
         "update",
         card(
@@ -182,7 +182,7 @@ const USAGES: &[(&str, Usage)] = &[
     ),
     ("welcome", card("/welcome", "Shows the welcome again.", None)),
     ("help", card("/help  /h", "Lists the commands and keys.", None)),
-    ("quit", card("/quit  /q", "Quits the app. Ctrl-C does too.", None)),
+    ("quit", card("/quit  /q", "Quits the app, like Ctrl-C.", None)),
 ];
 
 /// The card for the command called `name`, alias or not.
@@ -398,7 +398,8 @@ mod tests {
             let card = usage(name).unwrap_or_else(|| panic!("/{name} has no usage"));
             let slash = format!("/{name}");
             assert!(card.usage.split_whitespace().any(|w| w == slash), "/{name}: {card:?}");
-            assert!(card.what.ends_with('.'), "/{name}: one sentence");
+            let one = card.what.ends_with('.') && !card.what.contains(". ");
+            assert!(one, "/{name}: one sentence: {:?}", card.what);
             assert!(card.example.is_none_or(|e| e.starts_with(&slash)), "/{name}: {card:?}");
         }
         assert_eq!(usage("h"), usage("help"), "aliases share it");

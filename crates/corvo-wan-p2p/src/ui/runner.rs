@@ -211,9 +211,7 @@ impl<W: Write> Runner<W> {
                 Some(release) => self.install_update(&release).await.map(|()| release.version.to_string()),
                 None => Err("nothing to install: /update looks for a newer version first".into()),
             }),
-            Effect::ShowCode => {
-                Outcome::CodeShown { saved: self.home.as_deref().map(codefile::path).filter(|p| p.exists()) }
-            }
+            Effect::ShowCode => Outcome::CodeShown { saved: self.code_file() },
             Effect::WriteCode => self.write_code(),
             Effect::Refresh(show) => Outcome::Refreshed {
                 show,
@@ -297,12 +295,27 @@ impl<W: Write> Runner<W> {
         Ok(Outcome::Started { name: profile.name, code, recovery_file: self.recovery_file() })
     }
 
-    /// Writes the code file; one that's there already is reported as there.
+    /// Where the code file is, if it's there and holds this account's code:
+    /// one left by an account deleted with `--recover` doesn't count.
+    fn code_file(&self) -> Option<PathBuf> {
+        let (home, client) = (self.home.as_deref()?, self.client.as_ref()?);
+        let path = codefile::path(home);
+        let text = std::fs::read_to_string(&path).ok()?;
+        (text.trim() == client.me().to_string()).then_some(path)
+    }
+
+    /// Writes the code file, replacing one with another code in it; one with
+    /// this code that's there already is reported as there.
     fn write_code(&self) -> Outcome {
         let Some(home) = self.home.as_deref() else {
             return Outcome::CodeWritten(Err("couldn't find your home folder".into()));
         };
         let Some(client) = &self.client else { return Outcome::CodeWritten(Err(NOT_STARTED.into())) };
+        if self.code_file().is_none()
+            && let Err(e) = codefile::remove(home)
+        {
+            return Outcome::CodeWritten(Err(e.to_string()));
+        }
         match codefile::write(home, &client.me()) {
             Ok(path) => Outcome::CodeWritten(Ok(path)),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -586,6 +599,22 @@ mod tests {
         app.send("/code").await;
         assert_eq!(app.state.ask(), None, "not asked again");
         assert_eq!(app.said().last().unwrap(), &format!("it's saved in {}", file.display()));
+        app.runner.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_code_file_from_another_account_is_not_shown_as_yours() {
+        let (data, home) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        let other = Seed::generate().code();
+        codefile::write(home.path(), &other).unwrap();
+        let mut app = App::open(&data, &home, false);
+        let seed = app.make_account().await;
+        app.start().await;
+        app.send("/code").await;
+        assert_eq!(app.state.ask().unwrap().label, "save it to ~/corvo-wan-p2p-code.txt? y/n: ");
+        app.send("y").await;
+        let file = codefile::path(home.path());
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), format!("{}\n", seed.code()), "replaced with yours");
         app.runner.shutdown().await;
     }
 

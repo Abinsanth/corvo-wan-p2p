@@ -29,7 +29,7 @@ const WELCOME: &[&str] = &[
     "Chat with friends directly, computer to computer.",
     "",
     "• Your code is your address. Share it freely:",
-    "  /code shows it and saves it to a file.",
+    "  /code shows it and can save it to a file.",
     "• Your 12 words are your account. Never share",
     "  them, and keep a copy off this computer.",
     "• To add a friend: /add <their code>, then say hi.",

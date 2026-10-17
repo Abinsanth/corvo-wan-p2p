@@ -1315,14 +1315,22 @@ mod tests {
         state.code = Some(Seed::generate().code());
         state.open_profile();
         let all = screen(&render(&state, 80, 24));
-        for part in
-            [" profile ", "Name: ana", "Code:", "corvo1", "› Change name", "  Change passphrase", "  Show 12 words"]
-        {
+        let parts = [
+            " profile ",
+            "Name: ana",
+            "Code:",
+            "corvo1",
+            "› Change name",
+            "  Change passphrase",
+            "  Show 12 words",
+            "  Delete account",
+        ];
+        for part in parts {
             assert!(all.contains(part), "{part:?}:\n{all}");
         }
         // On 40×12 the menu shows, and PgUp brings the name and code into view.
         let small = screen(&render(&state, 40, 12));
-        for part in [" profile ", "› Change name", "  Show 12 words", "↑/↓ choose"] {
+        for part in [" profile ", "› Change name", "  Delete account", "↑/↓ choose"] {
             assert!(small.contains(part), "{part:?}:\n{small}");
         }
         state.size = (40, 12);
@@ -1335,6 +1343,40 @@ mod tests {
         let shown = screen(&render(&state, 40, 12));
         for part in ["Change passphrase", "› Current", "  New", "  Again", "Esc closes"] {
             assert!(shown.contains(part), "{part:?}:\n{shown}");
+        }
+    }
+
+    #[test]
+    fn the_delete_account_window_fits_40_by_12() {
+        use crate::ui::update::Outcome;
+        let mut state = busy_state();
+        state.open_profile();
+        let key = |state: &mut State, code| update(state, Msg::Key(KeyEvent::new(code, KeyModifiers::NONE)));
+        for _ in 0..3 {
+            key(&mut state, KeyCode::Down);
+        }
+        let menu = render(&state, 80, 24);
+        let shown = screen(&menu);
+        let (y, line) = shown.lines().enumerate().find(|(_, l)| l.contains("› Delete account")).expect("it shows");
+        let x = line[..line.find("Delete").unwrap()].chars().count();
+        assert_eq!(menu[(x as u16, y as u16)].fg, Color::Red, "in red");
+        key(&mut state, KeyCode::Enter);
+        let warn = screen(&render(&state, 40, 12));
+        for part in ["Delete account", "This deletes your account", "code file.", "messages.", "Enter goes on"] {
+            assert!(warn.contains(part), "{part:?}:\n{warn}");
+        }
+        key(&mut state, KeyCode::Enter);
+        typed(&mut state, "pw");
+        let asked = screen(&render(&state, 40, 12));
+        assert!(asked.contains("› Passphrase  ••") && !asked.contains("pw"), "{asked}");
+        key(&mut state, KeyCode::Enter);
+        update(&mut state, Msg::Done(Outcome::PassphraseChecked(Ok(true))));
+        typed(&mut state, "delete");
+        assert!(screen(&render(&state, 40, 12)).contains("› Type  delete"));
+        key(&mut state, KeyCode::Enter);
+        let last = screen(&render(&state, 40, 12));
+        for part in ["Uninstall the app too? y/n", "y or n · Esc cancels"] {
+            assert!(last.contains(part), "{part:?}:\n{last}");
         }
     }
 

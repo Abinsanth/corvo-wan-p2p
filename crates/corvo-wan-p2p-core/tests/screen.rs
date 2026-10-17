@@ -11,6 +11,7 @@ use corvo_wan_p2p_core::chat::{ChatError, Event, MAX_REQUEST_RENAMES};
 use corvo_wan_p2p_core::proto::{Frame, PROTO_VERSION, write_frame};
 use corvo_wan_p2p_core::store::{Store, StoreError};
 use iroh::address_lookup::MemoryLookup;
+use zeroize::Zeroizing;
 
 const QUIET: Duration = Duration::from_millis(500);
 
@@ -36,6 +37,14 @@ async fn the_words_are_given_only_for_the_right_passphrase() {
     let a = Peer::start(&lookup, "abin").await;
     assert!(matches!(a.client.phrase("wrong").await, Err(ChatError::WrongPassphrase)));
     assert_eq!(a.client.phrase("pass").await.unwrap().code(), a.code);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_passphrase_check_says_whether_it_is_yours() {
+    let lookup = MemoryLookup::new();
+    let a = Peer::start(&lookup, "abin").await;
+    assert!(!a.client.check_passphrase(Zeroizing::new("wrong".into())).await.unwrap());
+    assert!(a.client.check_passphrase(Zeroizing::new("pass".into())).await.unwrap());
 }
 
 #[tokio::test(flavor = "multi_thread")]

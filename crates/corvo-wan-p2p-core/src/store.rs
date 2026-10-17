@@ -274,6 +274,31 @@ impl Store {
         remove_db_files(dir)
     }
 
+    /// Deletes the data folder `dir` with everything in it (Delete account):
+    /// the account, the logs, the lock and anything else there. Refused while
+    /// another app has the account open. The lock goes last, since Windows
+    /// won't delete a file that's open.
+    pub fn delete_all(dir: &Path) -> Result<(), StoreError> {
+        if !dir.exists() {
+            return Ok(());
+        }
+        let lock = take_lock(dir)?;
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            if entry.file_name() == LOCK_FILE {
+                continue;
+            }
+            if entry.file_type()?.is_dir() {
+                fs::remove_dir_all(entry.path())?;
+            } else {
+                fs::remove_file(entry.path())?;
+            }
+        }
+        drop(lock);
+        fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
     fn seal(&self, place: &[u8], plain: &[u8]) -> Vec<u8> {
         crypt::seal(&self.field_key, place, plain)
     }

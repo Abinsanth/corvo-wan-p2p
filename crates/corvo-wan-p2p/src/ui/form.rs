@@ -1,5 +1,5 @@
 //! Windows with fields, opened from the Profile tab: change your name, change
-//! your passphrase, show your 12 words. What's typed goes into the window,
+//! your passphrase, show your 12 words, delete your account. What's typed goes into the window,
 //! never the input box or its history, and a window's secrets are wiped when
 //! it closes (`state.overlay = None` drops them).
 
@@ -23,6 +23,13 @@ const MAX_FIELD: usize = 1024;
 
 /// Where the words are saved, as the words window says.
 const RECOVERY_FILE: &str = "~/corvo-wan-p2p-recovery.txt";
+
+/// What Delete account deletes, and what it can't.
+const DELETE_GOES: &str = "This deletes your account from this computer: your keys, messages, contacts and logs, \
+                           the recovery file and the code file.";
+const DELETE_STAYS: &str = "It can't delete your friends' copies of your messages.";
+/// What has to be typed to go on.
+const DELETE_WORD: &str = "delete";
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct Field {
@@ -72,6 +79,21 @@ pub enum FormKind {
         passphrase: Option<Secret>,
         words: Option<Secret>,
     },
+    DeleteAccount {
+        step: DeleteStep,
+    },
+}
+
+/// Delete account's steps, in order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeleteStep {
+    /// What goes and what stays.
+    Warn,
+    Passphrase,
+    /// Type `delete`.
+    Confirm,
+    /// Uninstall the app too? y/n
+    Uninstall,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -107,12 +129,42 @@ impl Form {
         Form::new(FormKind::Words { passphrase: None, words: None }, vec![Field::typed("Passphrase", true)])
     }
 
+    /// A warning first, with no fields; each step brings its own.
+    pub fn delete_account() -> Form {
+        Form::new(FormKind::DeleteAccount { step: DeleteStep::Warn }, Vec::new())
+    }
+
     pub fn title(&self) -> &'static str {
         match self.kind {
             FormKind::Name => "─ Change name ",
             FormKind::Passphrase => "─ Change passphrase ",
             FormKind::Words { .. } => "─ Your 12 words ",
+            FormKind::DeleteAccount { .. } => "─ Delete account ",
         }
+    }
+
+    /// What the window says above its fields.
+    fn text(&self) -> Vec<(&'static str, Tone)> {
+        match self.kind {
+            FormKind::DeleteAccount { step: DeleteStep::Warn } => {
+                vec![(DELETE_GOES, Tone::Warn), (DELETE_STAYS, Tone::Plain)]
+            }
+            FormKind::DeleteAccount { step: DeleteStep::Passphrase } => {
+                vec![("Your passphrase, to be sure it's you:", Tone::Plain)]
+            }
+            FormKind::DeleteAccount { step: DeleteStep::Confirm } => {
+                vec![("Type delete to delete your account:", Tone::Plain)]
+            }
+            FormKind::DeleteAccount { step: DeleteStep::Uninstall } => {
+                vec![("Uninstall the app too? y/n", Tone::Plain)]
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// Delete account's last step: y or n.
+    fn asks_uninstall(&self) -> bool {
+        self.kind == FormKind::DeleteAccount { step: DeleteStep::Uninstall }
     }
 
     /// The words, once your passphrase checked out.
@@ -127,10 +179,14 @@ impl Form {
     fn hint(&self) -> &'static str {
         match (&self.kind, self.done) {
             (_, true) => "any key closes",
+            // Too late to stop: the app leaves once it's done.
+            (FormKind::DeleteAccount { step: DeleteStep::Uninstall }, _) if self.waiting => "then the app quits",
             (FormKind::Name, _) => "Enter saves · Esc cancels",
             (FormKind::Passphrase, _) => "Tab next · Enter changes it · Esc cancels",
             (FormKind::Words { words: Some(_), .. }, _) => "S saves them · Esc closes",
             (FormKind::Words { .. }, _) => "Enter shows them · Esc cancels",
+            (FormKind::DeleteAccount { step: DeleteStep::Uninstall }, _) => "y or n · Esc cancels",
+            (FormKind::DeleteAccount { .. }, _) => "Enter goes on · Esc cancels",
         }
     }
 
@@ -148,6 +204,9 @@ impl Form {
 
     /// Enter: checks what was typed and asks the engine to do it.
     fn submit(&mut self) -> Vec<Effect> {
+        if let FormKind::DeleteAccount { step } = self.kind {
+            return self.delete_step(step);
+        }
         match &mut self.kind {
             FormKind::Name => match clean_name(&self.fields[1].value) {
                 Ok(name) => {
@@ -189,7 +248,46 @@ impl Form {
                 self.say(Tone::Dim, "checking…");
                 vec![Effect::Phrase { passphrase: typed, then: PhraseUse::Show }]
             }
+            FormKind::DeleteAccount { .. } => Vec::new(),
         }
+    }
+
+    /// Enter in the Delete account window: the next step, once this one's done.
+    fn delete_step(&mut self, step: DeleteStep) -> Vec<Effect> {
+        match step {
+            DeleteStep::Warn => self.go_to(DeleteStep::Passphrase, Some(Field::typed("Passphrase", true))),
+            DeleteStep::Passphrase if self.fields[0].value.is_empty() => self.say(Tone::Bad, "type your passphrase"),
+            DeleteStep::Passphrase => {
+                let typed = self.fields[0].take();
+                self.waiting = true;
+                self.say(Tone::Dim, "checking…");
+                return vec![Effect::CheckPassphrase(typed)];
+            }
+            DeleteStep::Confirm if self.fields[0].value.as_str() == DELETE_WORD => {
+                self.go_to(DeleteStep::Uninstall, None)
+            }
+            DeleteStep::Confirm => {
+                self.fields[0].take();
+                self.say(Tone::Bad, "that isn't delete: type delete, or Esc to keep your account");
+            }
+            DeleteStep::Uninstall => {}
+        }
+        Vec::new()
+    }
+
+    /// On to Delete account's `step`, with its field if it has one.
+    fn go_to(&mut self, step: DeleteStep, field: Option<Field>) {
+        self.kind = FormKind::DeleteAccount { step };
+        self.fields = field.into_iter().collect();
+        self.focus = 0;
+        self.note = None;
+    }
+
+    /// y or n at Delete account's last step: everything goes now.
+    fn uninstall(&mut self, uninstall: bool) -> Vec<Effect> {
+        self.waiting = true;
+        self.say(Tone::Dim, "deleting…");
+        vec![Effect::DeleteAccount { uninstall }]
     }
 
     /// `S` while the words show: saves them with the passphrase kept.
@@ -218,17 +316,24 @@ pub fn key(state: &mut State, key: KeyEvent) -> Vec<Effect> {
         KeyCode::Char('s' | 'S') if words_shown && !ctrl && !alt => return form.save(),
         KeyCode::Enter if words_shown => state.overlay = None,
         _ if words_shown => {}
+        KeyCode::Char('y' | 'Y') if form.asks_uninstall() && !ctrl && !alt => return form.uninstall(true),
+        KeyCode::Char('n' | 'N') if form.asks_uninstall() && !ctrl && !alt => return form.uninstall(false),
         KeyCode::Enter => return form.submit(),
         KeyCode::Tab | KeyCode::Down => form.step_focus(1),
         KeyCode::BackTab | KeyCode::Up => form.step_focus(-1),
         KeyCode::Backspace => {
-            let field = &mut form.fields[form.focus];
-            if !field.read_only {
+            if let Some(field) = form.fields.get_mut(form.focus)
+                && !field.read_only
+            {
                 field.value.pop();
             }
         }
         // Windows reports AltGr chords, like @ on a German keyboard, as Ctrl+Alt.
-        KeyCode::Char(c) if !(ctrl ^ alt) => form.fields[form.focus].push(c),
+        KeyCode::Char(c) if !(ctrl ^ alt) => {
+            if let Some(field) = form.fields.get_mut(form.focus) {
+                field.push(c);
+            }
+        }
         _ => {}
     }
     Vec::new()
@@ -243,7 +348,7 @@ pub fn paste(state: &mut State, text: String) {
     if form.waiting || form.done || form.words_shown().is_some() {
         return;
     }
-    let field = &mut form.fields[form.focus];
+    let Some(field) = form.fields.get_mut(form.focus) else { return };
     for c in text.chars() {
         field.push(c);
     }
@@ -308,6 +413,18 @@ pub fn done(state: &mut State, outcome: Outcome) -> Vec<Effect> {
                 // Anything else, the words with it, is dropped here.
             }
         },
+        Outcome::PassphraseChecked(result) => {
+            let checking = |k: &FormKind| *k == FormKind::DeleteAccount { step: DeleteStep::Passphrase };
+            // A window closed meanwhile has nothing to go on with.
+            if let Some(form) = waiting(&mut state.overlay, checking) {
+                form.waiting = false;
+                match result {
+                    Ok(true) => form.go_to(DeleteStep::Confirm, Some(Field::typed("Type", false))),
+                    Ok(false) => form.say(Tone::Bad, "wrong passphrase"),
+                    Err(why) => form.say(Tone::Bad, why),
+                }
+            }
+        }
         _ => {}
     }
     Vec::new()
@@ -329,6 +446,9 @@ fn waiting(overlay: &mut Option<Overlay>, kind: fn(&FormKind) -> bool) -> Option
 /// wrapped, what happened and the keys; a blank row and the warning go
 /// first when there's no room for everything.
 pub fn rows(form: &Form, inner: usize, room: usize) -> Vec<(Zeroizing<String>, Tone)> {
+    let wrapped = |text: &str, tone: Tone| -> Vec<(Zeroizing<String>, Tone)> {
+        wrap(text, inner).into_iter().map(|r| (Zeroizing::new(r), tone)).collect()
+    };
     let mut rows = Vec::new();
     if let Some(words) = form.words_shown() {
         let words: Vec<&str> = words.expose().split_whitespace().collect();
@@ -337,14 +457,14 @@ pub fn rows(form: &Form, inner: usize, room: usize) -> Vec<(Zeroizing<String>, T
             return vec![(Zeroizing::new(BIGGER_FOR_WORDS.into()), Tone::Warn)];
         }
     } else {
+        for (text, tone) in form.text() {
+            rows.extend(wrapped(text, tone));
+        }
         let width = form.fields.iter().map(|f| f.label.width()).max().unwrap_or(0);
         for (i, field) in form.fields.iter().enumerate() {
             rows.push((field_row(field, i == form.focus, width, inner), Tone::Plain));
         }
     }
-    let wrapped = |text: &str, tone: Tone| -> Vec<(Zeroizing<String>, Tone)> {
-        wrap(text, inner).into_iter().map(|r| (Zeroizing::new(r), tone)).collect()
-    };
     let blank = vec![(Zeroizing::new(String::new()), Tone::Plain)];
     let warning = match form.words_shown() {
         Some(_) => wrapped(&format!("Never share these. S saves them to {RECOVERY_FILE}"), Tone::Warn),
@@ -627,6 +747,104 @@ mod tests {
             assert!(rows.iter().all(|r| r.width() <= inner), "{inner}: {rows:#?}");
             assert!(rows.concat().contains("corvo-wan-p2p-recovery.txt"), "the whole path shows: {rows:#?}");
         }
+    }
+
+    fn step(state: &State) -> DeleteStep {
+        match form(state).kind {
+            FormKind::DeleteAccount { step } => step,
+            ref other => panic!("not Delete account: {other:?}"),
+        }
+    }
+
+    /// Delete account, at the step that asks for the word `delete`.
+    fn at_confirm() -> State {
+        let mut s = open(3);
+        press(&mut s, KeyCode::Enter);
+        type_text(&mut s, "pw");
+        press(&mut s, KeyCode::Enter);
+        done(&mut s, Outcome::PassphraseChecked(Ok(true)));
+        assert_eq!(step(&s), DeleteStep::Confirm);
+        s
+    }
+
+    #[test]
+    fn delete_account_walks_warn_passphrase_confirm_uninstall() {
+        let mut s = open(3);
+        assert_eq!(form(&s).title(), "─ Delete account ");
+        let warning = shown(&s).join(" ");
+        for part in ["keys, messages, contacts and logs", "recovery file", "code file", "friends' copies"] {
+            assert!(warning.contains(part), "{part:?}: {warning}");
+        }
+        assert!(press(&mut s, KeyCode::Char('x')).is_empty(), "nothing to type yet");
+        press(&mut s, KeyCode::Enter);
+        assert_eq!(step(&s), DeleteStep::Passphrase);
+        type_text(&mut s, "pw");
+        assert!(shown(&s).iter().any(|r| r == "› Passphrase  ••"), "{:?}", shown(&s));
+        assert_eq!(press(&mut s, KeyCode::Enter), vec![Effect::CheckPassphrase(secret("pw"))]);
+        assert_eq!(note(&s), "checking…");
+        assert!(form(&s).fields[0].value.is_empty(), "the passphrase isn't kept");
+        done(&mut s, Outcome::PassphraseChecked(Ok(true)));
+        assert_eq!(step(&s), DeleteStep::Confirm);
+        type_text(&mut s, "delete");
+        assert!(press(&mut s, KeyCode::Enter).is_empty());
+        assert_eq!(step(&s), DeleteStep::Uninstall);
+        assert!(shown(&s).iter().any(|r| r == "Uninstall the app too? y/n"));
+        assert!(press(&mut s, KeyCode::Enter).is_empty(), "y or n, nothing else");
+        assert_eq!(press(&mut s, KeyCode::Char('y')), vec![Effect::DeleteAccount { uninstall: true }]);
+        assert_eq!(note(&s), "deleting…");
+        assert!(shown(&s).last().unwrap().contains("then the app quits"), "Esc no longer stops it");
+
+        let mut s = at_confirm();
+        type_text(&mut s, "delete");
+        press(&mut s, KeyCode::Enter);
+        assert_eq!(press(&mut s, KeyCode::Char('N')), vec![Effect::DeleteAccount { uninstall: false }]);
+
+        let mut s = at_confirm();
+        press(&mut s, KeyCode::Esc);
+        assert_eq!(s.overlay, None, "Esc keeps the account at any step");
+    }
+
+    #[test]
+    fn a_wrong_passphrase_stays_on_that_step() {
+        let mut s = open(3);
+        press(&mut s, KeyCode::Enter);
+        assert!(press(&mut s, KeyCode::Enter).is_empty());
+        assert_eq!(note(&s), "type your passphrase");
+        type_text(&mut s, "nope");
+        press(&mut s, KeyCode::Enter);
+        done(&mut s, Outcome::PassphraseChecked(Ok(false)));
+        assert_eq!(step(&s), DeleteStep::Passphrase);
+        assert_eq!(note(&s), "wrong passphrase");
+        assert!(!form(&s).waiting, "it can be typed again");
+        type_text(&mut s, "pw");
+        assert_eq!(press(&mut s, KeyCode::Enter), vec![Effect::CheckPassphrase(secret("pw"))]);
+        done(&mut s, Outcome::PassphraseChecked(Err("the chat engine hasn't started".into())));
+        assert_eq!(step(&s), DeleteStep::Passphrase);
+
+        // Arriving after the window closed, it goes nowhere.
+        let mut s = open(3);
+        press(&mut s, KeyCode::Enter);
+        type_text(&mut s, "pw");
+        press(&mut s, KeyCode::Enter);
+        press(&mut s, KeyCode::Esc);
+        done(&mut s, Outcome::PassphraseChecked(Ok(true)));
+        assert_eq!(s.overlay, None);
+    }
+
+    #[test]
+    fn only_the_word_delete_confirms() {
+        for typed in ["Delete", "delete ", "yes", "del", ""] {
+            let mut s = at_confirm();
+            type_text(&mut s, typed);
+            assert!(press(&mut s, KeyCode::Enter).is_empty());
+            assert_eq!(step(&s), DeleteStep::Confirm, "{typed:?}");
+            assert!(note(&s).starts_with("that isn't delete"), "{typed:?}");
+            assert!(form(&s).fields[0].value.is_empty(), "cleared to type again");
+        }
+        let mut s = at_confirm();
+        update(&mut s, Msg::Paste("delete\n".into()));
+        press(&mut s, KeyCode::Enter);
+        assert_eq!(step(&s), DeleteStep::Uninstall, "a pasted line ending isn't part of it");
     }
 
     fn form_debug() -> Form {

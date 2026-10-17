@@ -100,7 +100,7 @@ online, and how many of your messages are still waiting.
 
 | Command | What it does |
 |---|---|
-| `/profile` | your name and code, and a menu to change your name or passphrase or see your 12 words |
+| `/profile` | your name and code, and a menu to change your name or passphrase, see your 12 words or delete your account |
 | `/code` | show your code in a box, and offer to save it to `~/corvo-wan-p2p-code.txt` |
 | `/add <code>` | add a friend by their code and open a chat |
 | `/contacts` | a table of your contacts A–Z (online or last seen), then your requests |
@@ -136,6 +136,7 @@ name and code, and a menu:
 › Change name
   Change passphrase
   Show 12 words
+  Delete account
 ```
 
 ↑/↓ choose and Enter opens the item in a window:
@@ -146,10 +147,28 @@ name and code, and a menu:
 - **Show 12 words:** asks your passphrase, then shows the words. `S` saves
   them to `~/corvo-wan-p2p-recovery.txt`, or says where that file already is.
   Closing the window wipes the words from memory.
+- **Delete account** (in red): see below.
 
 Esc closes a window, and Esc again closes the tab. Moving to another tab
 closes it too. What you type in these windows never goes into the input
 history.
+
+### Delete account
+
+Removes your account from this computer completely. The window says what goes,
+then asks your passphrase, then asks you to type `delete`, then asks
+"Uninstall the app too? y/n". Esc stops it at any step.
+
+It deletes everything the app keeps: the data folder (keys, messages,
+contacts, logs), the recovery file and the code file. Your friends keep their
+copies of your messages, and your 12 words still bring back the same code
+(with no history) if you kept them somewhere else.
+
+With `y` it also deletes the program. On Windows, or for a copy you built from
+source, it prints what to delete instead. The app then quits and says what was
+done, or what's left and where if something couldn't be deleted. The PATH line
+the installer added stays; remove it yourself if you like (see
+[Uninstall](#uninstall)).
 
 ## One code per computer
 
@@ -195,9 +214,13 @@ requests; accept them again.
 
 ## Uninstall
 
-Delete the program, then, to also forget your account and chats on this
-computer, its data folder and the code and recovery files in your home folder,
-if they're there. Keep your 12 words if you want the account back later.
+The easy way: `/profile`, **Delete account**, and answer `y` to "Uninstall
+the app too?". That deletes your account, its files and the program (see
+[Delete account](#delete-account)). Then delete the PATH line, below.
+
+By hand: delete the program, then, to also forget your account and chats on
+this computer, its data folder and the code and recovery files in your home
+folder, if they're there. Keep your 12 words if you want the account back later.
 
 ```bash
 rm ~/.local/bin/corvo-wan-p2p

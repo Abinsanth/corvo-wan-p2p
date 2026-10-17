@@ -214,6 +214,8 @@ pub enum Ending {
     Quit,
     /// It had to stop, like when the account is open in another window: why.
     Exit(String),
+    /// The account was deleted: what was done, for after the goodbye.
+    Leave(Vec<String>),
 }
 
 /// Adds `new` to the work queued. Quitting goes first: Ctrl-C during an
@@ -234,6 +236,7 @@ fn after(flow: Flow) -> ControlFlow<Ending, Option<Msg>> {
         Flow::Next(msg) => ControlFlow::Continue(msg),
         Flow::Quit => ControlFlow::Break(Ending::Quit),
         Flow::Exit(why) => ControlFlow::Break(Ending::Exit(why)),
+        Flow::Leave(notes) => ControlFlow::Break(Ending::Leave(notes)),
     }
 }
 
@@ -337,6 +340,8 @@ mod tests {
         let exit = after(Flow::Exit("open elsewhere".into()));
         assert!(matches!(exit, ControlFlow::Break(Ending::Exit(why)) if why == "open elsewhere"));
         assert!(matches!(after(Flow::Next(Some(Msg::Tick))), ControlFlow::Continue(Some(Msg::Tick))));
+        let leave = after(Flow::Leave(vec!["deleted".into()]));
+        assert!(matches!(leave, ControlFlow::Break(Ending::Leave(notes)) if notes == ["deleted"]));
     }
 
     #[test]

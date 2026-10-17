@@ -594,8 +594,8 @@ mod tests {
         s.reveal = Some(crate::ui::state::Secret::new("words".into()));
         assert!(!update(&mut s, received(rahul, "x2")).contains(&Effect::MarkRead(rahul)), "the words cover it");
         s.reveal = None;
-        s.overlay = Some(crate::ui::window::Overlay::Welcome { scroll: 0 });
-        assert!(!update(&mut s, received(rahul, "x2b")).contains(&Effect::MarkRead(rahul)), "the welcome covers it");
+        s.overlay = Some(crate::ui::window::Overlay::start(true));
+        assert!(!update(&mut s, received(rahul, "x2b")).contains(&Effect::MarkRead(rahul)), "the tips cover it");
         assert!(key(&mut s, KeyCode::Esc, KeyModifiers::NONE).contains(&Effect::MarkRead(rahul)), "closed");
         update(&mut s, Msg::Resize(30, 8));
         assert!(!update(&mut s, received(rahul, "x3")).contains(&Effect::MarkRead(rahul)), "too small to draw");

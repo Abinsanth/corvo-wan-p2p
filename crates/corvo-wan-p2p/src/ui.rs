@@ -17,6 +17,7 @@ pub mod window;
 
 use std::collections::VecDeque;
 use std::io::{Write, stdout};
+use std::ops::ControlFlow;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
@@ -201,9 +202,26 @@ fn typed_ahead(rx: &mut mpsc::UnboundedReceiver<TermEvent>) -> Vec<Msg> {
     kept
 }
 
-/// Runs the UI until it quits. `Some` with a message to print if it has to
-/// exit, like when the account is open in another window.
-pub async fn run<W: Write>(mut state: State, mut runner: Runner<W>) -> anyhow::Result<Option<String>> {
+/// How the UI ended, for what to print once the terminal is back.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Ending {
+    /// `/quit` or Ctrl-C.
+    Quit,
+    /// It had to stop, like when the account is open in another window: why.
+    Exit(String),
+}
+
+/// What the loop does after `flow`: go on, maybe with a message, or end.
+fn after(flow: Flow) -> ControlFlow<Ending, Option<Msg>> {
+    match flow {
+        Flow::Next(msg) => ControlFlow::Continue(msg),
+        Flow::Quit => ControlFlow::Break(Ending::Quit),
+        Flow::Exit(why) => ControlFlow::Break(Ending::Exit(why)),
+    }
+}
+
+/// Runs the UI until it ends.
+pub async fn run<W: Write>(mut state: State, mut runner: Runner<W>) -> anyhow::Result<Ending> {
     let result = interact(&mut state, &mut runner).await;
     // After the terminal is back, so leaving looks instant.
     runner.shutdown().await;
@@ -212,7 +230,7 @@ pub async fn run<W: Write>(mut state: State, mut runner: Runner<W>) -> anyhow::R
 
 /// The loop: draw, then carry out one waiting effect or wait for the next
 /// message. Drawing before each effect shows what's slow, like "unlocking…".
-async fn interact<W: Write>(state: &mut State, runner: &mut Runner<W>) -> anyhow::Result<Option<String>> {
+async fn interact<W: Write>(state: &mut State, runner: &mut Runner<W>) -> anyhow::Result<Ending> {
     // Declared in this order so they drop in reverse: the input thread stops
     // before the guard gives the terminal back.
     let _guard = Guard::enter().context("couldn't set up the terminal")?;
@@ -227,10 +245,9 @@ async fn interact<W: Write>(state: &mut State, runner: &mut Runner<W>) -> anyhow
         let (msg, slow) = match effects.pop_front() {
             Some(effect) => {
                 let slow = effect.busy().is_some();
-                match runner.apply(effect).await? {
-                    Flow::Next(msg) => (msg, slow),
-                    Flow::Quit => return Ok(None),
-                    Flow::Exit(why) => return Ok(Some(why)),
+                match after(runner.apply(effect).await?) {
+                    ControlFlow::Continue(msg) => (msg, slow),
+                    ControlFlow::Break(ending) => return Ok(ending),
                 }
             }
             None => (
@@ -290,6 +307,14 @@ mod tests {
         for part in ["\x1b[?1049l", "\x1b[?2004l", "\x1b[?1000l", "\x1b[?1004l", RESTORE_TITLE] {
             assert!(written.contains(part), "{part:?} is written");
         }
+    }
+
+    #[test]
+    fn quitting_ends_with_quit_and_a_fatal_error_with_exit() {
+        assert!(matches!(after(Flow::Quit), ControlFlow::Break(Ending::Quit)));
+        let exit = after(Flow::Exit("open elsewhere".into()));
+        assert!(matches!(exit, ControlFlow::Break(Ending::Exit(why)) if why == "open elsewhere"));
+        assert!(matches!(after(Flow::Next(Some(Msg::Tick))), ControlFlow::Continue(Some(Msg::Tick))));
     }
 
     #[test]

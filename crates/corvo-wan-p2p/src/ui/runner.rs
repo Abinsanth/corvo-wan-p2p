@@ -19,11 +19,12 @@ use super::chat::{History, Loaded};
 use super::people::Act;
 use super::state::{CHAT_LEN, Secret};
 use super::update::{Effect, Msg, Outcome};
-use crate::selfupdate::{self, Release, Urls};
+use crate::selfupdate::{self, Fetched, Release, Stage, Urls};
 use semver::Version;
 
 /// For commands that need the engine, before it has started.
 const NOT_STARTED: &str = "the chat engine hasn't started";
+const NOTHING_TO_INSTALL: &str = "nothing to install: /update looks for a newer version first";
 
 /// How the engine reaches other people.
 pub enum Net {
@@ -56,6 +57,9 @@ struct Updates {
     verify: bool,
     /// The release the last check found.
     found: Option<Release>,
+    /// The release being installed, and its download, between stages.
+    /// Dropping the download removes its temp folder.
+    installing: Option<(Release, Option<Fetched>)>,
     /// The version installed since this app started, which a restart runs.
     installed: Option<Version>,
 }
@@ -83,6 +87,7 @@ impl<W: Write> Runner<W> {
             asset: selfupdate::asset_name(os, arch).ok_or_else(|| selfupdate::no_build(os, arch)),
             verify: true,
             found: None,
+            installing: None,
             installed: None,
         };
         Runner { dir, home, config, net, out, store: None, client: None, updates }
@@ -92,7 +97,15 @@ impl<W: Write> Runner<W> {
     #[cfg(test)]
     fn with_updates(mut self, urls: Urls, asset: String, target: PathBuf) -> Self {
         let verify = selfupdate::testing::VERIFY;
-        self.updates = Updates { urls, target: Ok(target), asset: Ok(asset), verify, found: None, installed: None };
+        self.updates = Updates {
+            urls,
+            target: Ok(target),
+            asset: Ok(asset),
+            verify,
+            found: None,
+            installing: None,
+            installed: None,
+        };
         self
     }
 
@@ -109,10 +122,36 @@ impl<W: Write> Runner<W> {
         Ok(version)
     }
 
-    async fn install_update(&mut self, release: &Release) -> Result<(), String> {
+    /// Does one `stage` of installing the release the last check found. A
+    /// failure drops the download, which leaves the old version in place.
+    async fn install(&mut self, stage: Stage) -> Result<(), String> {
+        let result = self.try_install(stage).await;
+        if result.is_err() {
+            self.updates.installing = None;
+        }
+        result
+    }
+
+    async fn try_install(&mut self, stage: Stage) -> Result<(), String> {
         let (target, asset) = (self.updates.target.clone()?, self.updates.asset.clone()?);
-        selfupdate::install_with(&self.updates.urls, release, &asset, &target, self.updates.verify).await?;
-        self.updates.installed = Some(release.version.clone());
+        let updates = &mut self.updates;
+        match (stage, &mut updates.installing) {
+            (Stage::Fetch, _) => {
+                let release = updates.found.take().ok_or(NOTHING_TO_INSTALL)?;
+                let fetched = selfupdate::fetch(&updates.urls, &release, &asset, &target).await?;
+                updates.installing = Some((release, Some(fetched)));
+            }
+            (Stage::Check, Some((release, Some(fetched)))) => {
+                selfupdate::check(fetched, &release.version, updates.verify).await?;
+            }
+            (Stage::Swap, Some((release, fetched @ Some(_)))) => {
+                let version = release.version.clone();
+                selfupdate::swap(fetched.take().expect("matched Some"), &target)?;
+                updates.installing = None;
+                updates.installed = Some(version);
+            }
+            _ => return Err(NOTHING_TO_INSTALL.into()),
+        }
         Ok(())
     }
 
@@ -207,10 +246,7 @@ impl<W: Write> Runner<W> {
                 Some(version) => Outcome::UpdatedAlready(version.to_string()),
                 None => Outcome::UpdateChecked { yes, result: self.check_update().await },
             },
-            Effect::InstallUpdate => Outcome::Updated(match self.updates.found.take() {
-                Some(release) => self.install_update(&release).await.map(|()| release.version.to_string()),
-                None => Err("nothing to install: /update looks for a newer version first".into()),
-            }),
+            Effect::Install(stage) => Outcome::InstallStep { stage, result: self.install(stage).await },
             Effect::ShowCode => Outcome::CodeShown { saved: self.code_file() },
             Effect::WriteCode => self.write_code(),
             Effect::Refresh(show) => Outcome::Refreshed {
@@ -426,6 +462,7 @@ mod tests {
             let mut app = App::open_on(data, home, false, lookup);
             assert_eq!(app.send("pw").await, None);
             assert!(matches!(app.state.screen, Screen::Main));
+            app.close_the_start_window().await;
             app
         }
 
@@ -497,11 +534,19 @@ mod tests {
             seed
         }
 
-        /// Enter at the code starts the app; the welcome shows, and Enter closes it.
+        /// Enter at the code starts the app; the start window shows the tips,
+        /// and Enter closes it.
         async fn start(&mut self) {
             self.send("").await;
-            assert!(matches!(self.state.overlay, Some(Overlay::Welcome { .. })), "the welcome shows");
+            assert_eq!(self.state.overlay, Some(Overlay::start(true)), "the tips show");
             self.send("").await;
+            assert_eq!(self.state.overlay, None);
+        }
+
+        /// After an unlock: the start window shows, and any key closes it.
+        async fn close_the_start_window(&mut self) {
+            assert_eq!(self.state.overlay, Some(Overlay::start(false)), "the art shows");
+            self.handle(Msg::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))).await;
             assert_eq!(self.state.overlay, None);
         }
     }
@@ -817,6 +862,32 @@ mod tests {
         ana.runner.shutdown().await;
         let ana = App::restart(&data, &home, &lookup).await;
         assert_eq!(ana.state.name, "Ana M", "the new name was saved");
+    }
+
+    #[tokio::test]
+    async fn quitting_between_update_stages_leaves_the_old_program() {
+        let (data, home, site, bin) =
+            (TempDir::new().unwrap(), TempDir::new().unwrap(), TempDir::new().unwrap(), TempDir::new().unwrap());
+        let lookup = MemoryLookup::new();
+        let mut app = App::person(&data, &home, &lookup, "ana").await;
+        let (urls, asset) = crate::selfupdate::testing::publish(site.path(), true);
+        let target = bin.path().join("corvo-wan-p2p");
+        std::fs::write(&target, "old").unwrap();
+        app.runner = app.runner.with_updates(urls, asset, target.clone());
+        app.send("/update").await;
+        assert_eq!(app.state.ask().unwrap().label, "update now? y/n: ");
+        // The loop carries out one stage at a time; quit after the first two.
+        for stage in [Stage::Fetch, Stage::Check] {
+            let flow = app.runner.apply(Effect::Install(stage)).await.unwrap();
+            assert!(matches!(flow, Flow::Next(Some(Msg::Done(Outcome::InstallStep { result: Ok(()), .. })))));
+        }
+        let left = || std::fs::read_dir(bin.path()).unwrap().count();
+        assert_eq!(left(), 2, "the program and the update's temp folder");
+        assert!(matches!(app.runner.apply(Effect::Quit).await.unwrap(), Flow::Quit));
+        app.runner.shutdown().await;
+        drop(app);
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "old", "the old program is still there");
+        assert_eq!(left(), 1, "and nothing else");
     }
 
     #[tokio::test]

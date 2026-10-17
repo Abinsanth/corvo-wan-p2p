@@ -21,6 +21,7 @@ use super::people::{self, Act, Show};
 use super::state::{PATH_TICKS, Screen, Secret, State, Tone, WHEEL_STEP};
 use super::view::{areas, chat_page, input_rows, popup_area, sidebar_rows, sidebar_scrolled, sidebar_showing, tab_at};
 use super::window::{self, Overlay};
+use crate::selfupdate::Stage;
 
 #[derive(Debug)]
 pub enum Msg {
@@ -99,8 +100,8 @@ pub enum Effect {
     CheckUpdate {
         yes: bool,
     },
-    /// Install the release the last check found.
-    InstallUpdate,
+    /// A stage of installing the release the last check found.
+    Install(Stage),
     /// Whether the code file is there.
     ShowCode,
     /// Write the code file.
@@ -118,7 +119,7 @@ impl Effect {
             Effect::ChangePassphrase { .. } => "changing your passphrase…",
             Effect::Phrase { .. } => "checking your passphrase…",
             Effect::CheckUpdate { .. } => "checking for updates…",
-            Effect::InstallUpdate => "updating…",
+            Effect::Install(_) => "updating…",
             _ => return None,
         })
     }
@@ -179,8 +180,11 @@ pub enum Outcome {
         yes: bool,
         result: Result<Option<String>, String>,
     },
-    /// The version now installed.
-    Updated(Result<String, String>),
+    /// How a stage of installing went.
+    InstallStep {
+        stage: Stage,
+        result: Result<(), String>,
+    },
     /// `/update` after an update: this version is installed and waits for a restart.
     UpdatedAlready(String),
     /// `saved` is where the code file is, if it's there.
@@ -327,6 +331,7 @@ pub fn update(state: &mut State, msg: Msg) -> Vec<Effect> {
         Msg::Focus(focused) => state.focused = focused,
         Msg::Tick => {
             state.ticks = state.ticks.wrapping_add(1);
+            window::tick(state);
             if state.ticks.is_multiple_of(PATH_TICKS)
                 && matches!(state.screen, Screen::Main)
                 && let Some(peer) = state.open_peer()
@@ -558,9 +563,15 @@ fn on_command(state: &mut State, cmd: Cmd, effects: &mut Vec<Effect>) {
     match cmd {
         Cmd::Help => state.overlay = Some(Overlay::Help { scroll: 0 }),
         Cmd::Clear => state.clear_tab(),
-        Cmd::Welcome => state.overlay = Some(Overlay::Welcome { scroll: 0 }),
+        Cmd::About => {
+            let data_dir = state.data_dir.clone().unwrap_or_else(|| "(unknown)".into());
+            state.overlay = Some(Overlay::About { data_dir, scroll: 0 });
+        }
         cmd @ (Cmd::Passphrase | Cmd::Phrase | Cmd::PhraseSave) => account::begin(state, cmd),
         Cmd::Quit => effects.push(Effect::Quit),
+        Cmd::Update { .. } if state.installing.is_some() => {
+            state.say(Tone::Plain, "already updating: wait for it to finish")
+        }
         Cmd::Update { yes } => effects.push(Effect::CheckUpdate { yes }),
         Cmd::Close => {
             if !state.close_tab() {
@@ -574,11 +585,9 @@ fn on_command(state: &mut State, cmd: Cmd, effects: &mut Vec<Effect>) {
 fn on_done(state: &mut State, outcome: Outcome, effects: &mut Vec<Effect>) {
     match outcome {
         Outcome::Started { name, code, recovery_file } => {
-            let welcome = matches!(&state.screen, Screen::Onboarding(o) if o.made_account());
+            let first_run = matches!(&state.screen, Screen::Onboarding(o) if o.made_account());
             state.screen = Screen::Main;
-            if welcome {
-                state.overlay = Some(Overlay::Welcome { scroll: 0 });
-            }
+            state.overlay = Some(Overlay::start(first_run));
             state.short_code = code.short();
             state.code = Some(code);
             state.say(Tone::Good, format!("welcome, {name}. Your code is {code}"));

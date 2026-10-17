@@ -186,7 +186,8 @@ impl Drop for Fetched {
 
 /// Puts `release`'s `asset` in place of `target`: fetches it, checks it (and,
 /// with `verify`, runs it to see it works here), then swaps it in. Any failure
-/// leaves `target` as it was.
+/// leaves `target` as it was. The app runs the stages one at a time.
+#[cfg(test)]
 pub async fn install_with(
     urls: &Urls,
     release: &Release,

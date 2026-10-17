@@ -512,6 +512,10 @@ pub struct State {
     pub rows: RowCache,
     /// A window over the main screen, while open.
     pub overlay: Option<Overlay>,
+    /// Where your data lives, as `/about` shows it.
+    pub data_dir: Option<String>,
+    /// The version being installed, while an update's stages run.
+    pub installing: Option<String>,
     /// How the connection to someone went when last asked: the open chat's,
     /// for the status bar.
     pub path: Option<(Code, PathInfo)>,
@@ -550,6 +554,8 @@ impl State {
             changes: 0,
             rows: RowCache::default(),
             overlay: None,
+            data_dir: None,
+            installing: None,
             path: None,
             ticks: 0,
         }

@@ -28,7 +28,7 @@ pub enum Cmd {
     Update {
         yes: bool,
     },
-    Welcome,
+    About,
     Help,
     Quit,
 }
@@ -67,7 +67,7 @@ pub const COMMANDS: &[&str] = &[
     "close",
     "clear",
     "update",
-    "welcome",
+    "about",
     "help",
     "h",
     "quit",
@@ -108,7 +108,7 @@ pub const HELP: &[(&str, &[(&str, &str)])] = &[
         "App",
         &[
             ("/update", "get the newest version"),
-            ("/welcome", "the welcome again"),
+            ("/about", "version and info"),
             ("/help  /h", "this list"),
             ("/quit  /q", "quit (Ctrl-C)"),
         ],
@@ -180,7 +180,7 @@ const USAGES: &[(&str, Usage)] = &[
             Some("/update yes"),
         ),
     ),
-    ("welcome", card("/welcome", "Shows the welcome again.", None)),
+    ("about", card("/about", "Shows the version, where your data lives and where the source is.", None)),
     ("help", card("/help  /h", "Lists the commands and keys.", None)),
     ("quit", card("/quit  /q", "Quits the app, like Ctrl-C.", None)),
 ];
@@ -228,7 +228,7 @@ pub fn parse(line: &str) -> Input {
         "passphrase" => no_args(args, Cmd::Passphrase),
         "close" => no_args(args, Cmd::Close),
         "clear" => no_args(args, Cmd::Clear),
-        "welcome" => no_args(args, Cmd::Welcome),
+        "about" => no_args(args, Cmd::About),
         "help" | "h" => no_args(args, Cmd::Help),
         "quit" | "q" => no_args(args, Cmd::Quit),
         "add" if args.is_empty() => Err(None),
@@ -352,7 +352,7 @@ impl Cmd {
             Cmd::Close => "/close",
             Cmd::Clear => "/clear",
             Cmd::Update { .. } => "/update",
-            Cmd::Welcome => "/welcome",
+            Cmd::About => "/about",
             Cmd::Help => "/help",
             Cmd::Quit => "/quit",
         }
@@ -441,7 +441,7 @@ mod tests {
             ("/phrase", Cmd::Phrase),
             ("/close", Cmd::Close),
             ("/clear", Cmd::Clear),
-            ("/welcome", Cmd::Welcome),
+            ("/about", Cmd::About),
             ("/help", Cmd::Help),
             ("/h", Cmd::Help),
             ("/quit", Cmd::Quit),

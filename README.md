@@ -77,7 +77,9 @@ To chat:
 3. Messages are delivered whenever you're both online. Until then they wait on
    the sender's computer and go out on their own when you reconnect.
 
-A green dot next to a contact means they're online. Next to your own messages:
+In a chat, their messages are on the left (`14:02 hey`) and yours on the
+right (`see you soon 14:03 ✓✓`); the tab says who it is. A green dot next to
+a contact means they're online. After your own messages:
 
 | Mark | Meaning |
 |---|---|

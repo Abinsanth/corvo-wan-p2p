@@ -490,7 +490,10 @@ mod tests {
     #[test]
     fn the_data_folder_is_shown_from_home() {
         let home = Path::new("/home/ana");
-        assert_eq!(shown_path(&home.join(".config").join("corvo-wan-p2p"), Some(home)), "~/.config/corvo-wan-p2p");
+        let shown = shown_path(&home.join(".config").join("corvo-wan-p2p"), Some(home));
+        // With the system's own separator: `~\.config\corvo-wan-p2p` on Windows.
+        assert_eq!(shown, Path::new("~").join(".config").join("corvo-wan-p2p").display().to_string());
+        assert!(shown.starts_with('~') && !shown.contains("home"));
         assert_eq!(shown_path(Path::new("/srv/corvo"), Some(home)), "/srv/corvo");
         assert_eq!(shown_path(Path::new("/srv/corvo"), None), "/srv/corvo");
     }

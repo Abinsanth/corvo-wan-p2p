@@ -133,7 +133,7 @@ impl Onboarding {
                 "Type n to make a new one, or r to recover yours with your 12 words.",
             ],
             Step::Words => &["Type your 12 recovery words, in order, with spaces between them."],
-            Step::Name { .. } => &["Choose a display name. Friends see it, and /name changes it later."],
+            Step::Name { .. } => &["Choose a display name. Friends see it, and /profile changes it later."],
             Step::Passphrase { .. } => &[
                 "Choose a passphrase. It locks your history on this computer,",
                 "and you type it each time corvo-wan-p2p starts.",
@@ -277,7 +277,7 @@ impl Onboarding {
                 "n" | "no" => {
                     self.note(
                         Tone::Warn,
-                        "your words weren't saved to a file. Write them down, or use /phrase save once you're in.",
+                        "your words weren't saved to a file. Write them down, or save them from /profile once you're in.",
                     );
                     show_code(&seed, false)
                 }
@@ -354,7 +354,7 @@ impl Onboarding {
                     Tone::Bad,
                     format!(
                         "couldn't save the recovery file: {why}. Write the words down instead: \
-                         /phrase shows them again once you're in."
+                         /profile shows them again once you're in."
                     ),
                 );
                 show_code(&seed, false)
@@ -590,7 +590,7 @@ mod tests {
         done(&mut s, Outcome::RecoveryFile(Some(PathBuf::from("/h/corvo-wan-p2p-recovery.txt"))));
         assert_eq!(send(&mut s, "no"), vec![]);
         assert_eq!(last_note(&s).tone, Tone::Warn);
-        assert!(last_note(&s).text.contains("/phrase save"));
+        assert!(last_note(&s).text.contains("/profile"));
         assert_eq!(send(&mut s, ""), vec![Effect::Start]);
     }
 

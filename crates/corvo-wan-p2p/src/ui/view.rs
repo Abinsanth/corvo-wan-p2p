@@ -31,8 +31,10 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use zeroize::Zeroizing;
 
 use super::chat::local;
+use super::form::{self, Form};
 use super::onboarding::Onboarding;
-use super::state::{APP, Line, MAX_INPUT_ROWS, RowKey, Rows, Screen, Secret, State, Tab, Tone};
+use super::profile;
+use super::state::{APP, Line, MAX_INPUT_ROWS, RowKey, Rows, Screen, State, Tab, TabKind, Tone};
 use super::window::{self, Overlay};
 
 /// Smaller than this, only [`TOO_SMALL`] is drawn.
@@ -98,8 +100,10 @@ pub type Shown = (Line, usize);
 /// lines come from its messages: a line for each new day, the time, who
 /// sent it and, for yours, its mark.
 pub fn tab_lines(state: &State, tab: &Tab) -> (Vec<Shown>, usize) {
-    let Some(peer) = tab.peer else {
-        return (tab.lines.iter().map(|l| (l.clone(), 0)).collect(), tab.cleared);
+    let peer = match tab.kind {
+        TabKind::Corvo => return (tab.lines.iter().map(|l| (l.clone(), 0)).collect(), tab.cleared),
+        TabKind::Profile => return (profile::lines(state).into_iter().map(|l| (l, 0)).collect(), 0),
+        TabKind::Chat(peer) => peer,
     };
     let label = state.label(&peer);
     let mut lines = Vec::new();
@@ -147,7 +151,7 @@ thread_local! {
 /// The open tab's rows at `width`, and the row its last `/clear` was at.
 /// Built once per change and width, then reused.
 pub fn chat_rows(state: &State, width: u16) -> (Arc<Rows>, usize) {
-    let key = RowKey { tab: state.current, peer: state.tab().peer, width, changes: state.changes };
+    let key = RowKey { tab: state.current, peer: state.tab().peer(), width, changes: state.changes };
     if let Some(hit) = state.rows.get(&key) {
         return hit;
     }
@@ -322,10 +326,6 @@ pub fn draw(frame: &mut Frame, state: &State) {
     draw_tabs(frame, state, areas.tabs);
     draw_sidebar(frame, state, areas.sidebar);
     draw_chat(frame, state, areas.chat);
-    if let Some(words) = &state.reveal {
-        let body = Rect::new(0, areas.sidebar.y, area.width, areas.sidebar.height);
-        draw_reveal(frame, words, body);
-    }
     draw_flash(frame, state, areas.flash);
     frame.render_widget(Block::new().borders(Borders::TOP).border_style(dim()), areas.border);
     draw_input(frame, state, areas.input);
@@ -338,6 +338,9 @@ pub fn draw(frame: &mut Frame, state: &State) {
 
 /// A window centred over the screen, scrolled as `update` left it.
 fn draw_overlay(frame: &mut Frame, overlay: &Overlay, area: Rect) {
+    if let Overlay::Form(form) = overlay {
+        return draw_form(frame, form, overlay, area);
+    }
     let rows = window::rows(overlay, (area.width, area.height));
     let height = window::height((area.width, area.height), rows.len()) + 2;
     let width = overlay.width().min(area.width);
@@ -441,25 +444,32 @@ fn rows_of(text: &str, width: u16) -> Vec<Cow<'_, str>> {
     }
 }
 
-/// Your 12 words over the chat, from `/phrase`.
-fn draw_reveal(frame: &mut Frame, words: &Secret, area: Rect) {
-    let words: Vec<&str> = words.expose().split_whitespace().collect();
-    let block = Block::bordered().title(" your recovery words ");
-    let inner = block.inner(area);
-    let grid_rows = word_grid(&words, inner.width);
-    let grid: Vec<TextLine> = grid_rows.iter().map(|r| TextLine::from(r.as_str())).collect();
-    let hint = TextLine::styled("press any key to hide them", dim());
-    let fits = |rows: usize| rows <= inner.height.into();
-    let lines = if fits(grid.len() + 4) {
-        [vec![TextLine::from("Your 12 recovery words:"), TextLine::default()], grid, vec![TextLine::default(), hint]]
-            .concat()
-    } else if fits(grid.len() + 1) {
-        [grid, vec![hint]].concat()
-    } else {
-        vec![TextLine::styled(BIGGER_FOR_WORDS, tone(Tone::Warn)), hint]
-    };
-    frame.render_widget(Clear, area);
-    frame.render_widget(Paragraph::new(lines).block(block), area);
+/// A window with fields, centred. Its rows are drawn from where they're kept
+/// (no copies), and wiped after. The words are never cut off: if they don't
+/// all fit, it says to make the window bigger instead.
+fn draw_form(frame: &mut Frame, form: &Form, overlay: &Overlay, area: Rect) {
+    let width = overlay.width().min(area.width);
+    let inner = usize::from(width.saturating_sub(6));
+    let mut rows = form::rows(form, inner);
+    let room = usize::from(area.height.saturating_sub(4)).max(1);
+    let grid = form.words_shown().map_or(0, |_| rows.iter().take_while(|(r, _)| !r.is_empty()).count());
+    if grid > room {
+        rows = vec![(Zeroizing::new(BIGGER_FOR_WORDS.to_string()), Tone::Warn)];
+    }
+    rows.truncate(room);
+    let height = rows.len() as u16 + 2;
+    let at =
+        Rect::new(area.x + (area.width - width) / 2, area.y + area.height.saturating_sub(height) / 2, width, height);
+    let lines: Vec<TextLine> = rows
+        .iter()
+        .map(|(row, t)| TextLine::from(vec![Span::raw("  "), Span::styled(row.as_str(), tone(*t))]))
+        .collect();
+    let mut block = Block::bordered().title(overlay.title());
+    if let Some(hint) = overlay.hint() {
+        block = block.title(TextLine::from(hint).right_aligned());
+    }
+    frame.render_widget(Clear, at);
+    frame.render_widget(Paragraph::new(lines).block(block), at);
 }
 
 fn dim() -> Style {
@@ -518,7 +528,7 @@ fn draw_tabs(frame: &mut Frame, state: &State, area: Rect) {
 
 /// The sidebar's lines, each with the person a click on it opens.
 fn sidebar(state: &State) -> Vec<(TextLine<'static>, Option<Code>)> {
-    let open = state.tab().peer;
+    let open = state.tab().peer();
     let unread = |n: usize| if n > 0 { Span::styled(format!(" ({n})"), tone(Tone::Warn)) } else { Span::raw("") };
     let mut lines = Vec::new();
     for peer in state.people.iter().filter(|p| !p.request) {
@@ -778,7 +788,7 @@ fn status_parts(state: &State) -> Vec<String> {
 mod tests {
     use super::*;
     use crate::ui::onboarding::Onboarding;
-    use crate::ui::state::{Screen, Secret};
+    use crate::ui::state::Screen;
     use crate::ui::update::{Msg, update};
     use corvo_wan_p2p_core::chat::PathInfo;
     use corvo_wan_p2p_core::identity::Seed;
@@ -916,7 +926,7 @@ mod tests {
         for part in [
             "┌─ Help ─",
             " Esc closes ─┐",
-            "│  You        /name <new name>  your display name",
+            "│  You        /profile          name, passphrase, 12 words",
             "│  Friends    /code             your code",
             "│             /add <code>       add a friend",
             "│  Keys       Tab               complete",
@@ -1039,7 +1049,7 @@ mod tests {
     }
 
     fn rahul(state: &State) -> Code {
-        state.tabs[1].peer.unwrap()
+        state.tabs[1].peer().unwrap()
     }
 
     #[test]
@@ -1190,15 +1200,64 @@ mod tests {
         update(&mut state, Msg::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
         assert!(!screen(&render(&state, 80, 24)).contains("hunter2"));
 
-        let mut state = busy_state();
-        for (command, questions) in [("/passphrase", 3), ("/phrase", 1), ("/phrase save", 1)] {
-            send(&mut state, command);
-            for _ in 0..questions {
-                typed(&mut state, secret);
-                assert!(!screen(&render(&state, 80, 24)).contains("hunter2"), "{command}");
-                update(&mut state, Msg::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
-                assert!(!screen(&render(&state, 80, 24)).contains("hunter2"), "{command}");
+        for item in [1, 2] {
+            let mut state = busy_state();
+            send(&mut state, "/profile");
+            for _ in 0..item {
+                update(&mut state, Msg::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)));
             }
+            update(&mut state, Msg::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
+            for _ in 0..3 {
+                typed(&mut state, secret);
+                let shown = screen(&render(&state, 80, 24));
+                assert!(!shown.contains("hunter2") && shown.contains("••••"), "item {item}:\n{shown}");
+                update(&mut state, Msg::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)));
+            }
+            update(&mut state, Msg::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
+            assert!(!screen(&render(&state, 80, 24)).contains("hunter2"), "item {item}");
+        }
+    }
+
+    /// The words window, showing `seed`'s words.
+    fn words_window(seed: &Seed) -> State {
+        use crate::ui::form::FormKind;
+        use crate::ui::state::Secret;
+        let mut state = busy_state();
+        state.open_profile();
+        let mut form = Form::words();
+        form.kind =
+            FormKind::Words { passphrase: Some(Secret::new("pw".into())), words: Some(Secret::new(seed.phrase())) };
+        form.fields.clear();
+        state.overlay = Some(Overlay::Form(form));
+        state
+    }
+
+    #[test]
+    fn the_profile_tab_fits_40_by_12() {
+        let mut state = busy_state();
+        state.code = Some(Seed::generate().code());
+        state.open_profile();
+        let all = screen(&render(&state, 80, 24));
+        for part in
+            [" profile ", "Name: ana", "Code:", "corvo1", "› Change name", "  Change passphrase", "  Show 12 words"]
+        {
+            assert!(all.contains(part), "{part:?}:\n{all}");
+        }
+        // On 40×12 the menu shows, and PgUp brings the name and code into view.
+        let small = screen(&render(&state, 40, 12));
+        for part in [" profile ", "› Change name", "  Show 12 words", "↑/↓ choose"] {
+            assert!(small.contains(part), "{part:?}:\n{small}");
+        }
+        state.size = (40, 12);
+        update(&mut state, Msg::Key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE)));
+        assert!(screen(&render(&state, 40, 12)).contains("Name: ana"));
+        update(&mut state, Msg::Key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE)));
+        update(&mut state, Msg::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)));
+        assert!(screen(&render(&state, 40, 12)).contains("› Change passphrase"));
+        update(&mut state, Msg::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
+        let shown = screen(&render(&state, 40, 12));
+        for part in ["Change passphrase", "› Current", "  New", "  Again", "Esc closes"] {
+            assert!(shown.contains(part), "{part:?}:\n{shown}");
         }
     }
 
@@ -1218,24 +1277,22 @@ mod tests {
         send(&mut state, "");
         assert!(!shows_words(&render(&state, 80, 24), &seed), "hidden while typing them back");
 
-        let mut state = busy_state();
-        state.reveal = Some(Secret::new(seed.phrase()));
+        let mut state = words_window(&seed);
         assert!(shows_all_words(&render(&state, 80, 24), &seed));
-        assert!(screen(&render(&state, 80, 24)).contains("press any key"));
-        update(&mut state, Msg::Key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE)));
-        assert!(!shows_words(&render(&state, 80, 24), &seed), "gone after a key");
+        assert!(screen(&render(&state, 80, 24)).contains("S saves them"));
+        update(&mut state, Msg::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+        assert!(!shows_words(&render(&state, 80, 24), &seed), "gone with the window");
     }
 
     #[test]
-    fn the_words_are_never_cut_off() {
+    fn the_words_window_is_never_cut_off() {
         let mut onboarding = State::onboarding(Onboarding::start(false, false));
         for answer in ["n", "ana", "pw", "pw"] {
             send(&mut onboarding, answer);
         }
         let Screen::Onboarding(o) = &onboarding.screen else { panic!() };
         let seed = Seed::from_phrase(&o.words().unwrap().join(" ")).unwrap();
-        let mut main = busy_state();
-        main.reveal = Some(Secret::new(seed.phrase()));
+        let main = words_window(&seed);
         for w in MIN_WIDTH..=120 {
             for h in MIN_HEIGHT..=40 {
                 for state in [&onboarding, &main] {
@@ -1257,14 +1314,16 @@ mod tests {
         send(&mut onboarding, "ana");
         send(&mut onboarding, "pw");
         send(&mut onboarding, "pw");
-        let mut main = busy_state();
-        main.reveal = Some(Secret::new(Seed::generate().phrase()));
-        send(&mut main, "/phrase");
-        typed(&mut main, "日本語");
+        let main = words_window(&Seed::generate());
+        let mut name = busy_state();
+        send(&mut name, "/profile");
+        update(&mut name, Msg::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
+        typed(&mut name, &"日本語".repeat(20));
         for w in 1..=120 {
             for h in 1..=40 {
                 render(&onboarding, w, h);
                 render(&main, w, h);
+                render(&name, w, h);
             }
         }
     }

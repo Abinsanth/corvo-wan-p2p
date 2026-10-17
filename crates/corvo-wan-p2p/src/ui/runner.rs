@@ -511,6 +511,44 @@ mod tests {
             }
         }
 
+        async fn press(&mut self, code: KeyCode) {
+            self.handle(Msg::Key(KeyEvent::new(code, KeyModifiers::NONE))).await;
+        }
+
+        /// Opens the Profile tab's window for menu item `item` (0 is the first).
+        async fn open_profile_item(&mut self, item: usize) {
+            self.send("/profile").await;
+            for _ in 0..crate::ui::profile::MENU.len() {
+                self.press(KeyCode::Up).await;
+            }
+            for _ in 0..item {
+                self.press(KeyCode::Down).await;
+            }
+            self.press(KeyCode::Enter).await;
+            assert!(matches!(self.state.overlay, Some(Overlay::Form(_))), "the window opens");
+        }
+
+        /// Types `fields` into the open window, Tab between them, then Enter.
+        async fn fill(&mut self, fields: &[&str]) {
+            for (i, field) in fields.iter().enumerate() {
+                if i > 0 {
+                    self.press(KeyCode::Tab).await;
+                }
+                for c in field.chars() {
+                    self.press(KeyCode::Char(c)).await;
+                }
+            }
+            self.press(KeyCode::Enter).await;
+        }
+
+        /// What the open window says under its fields.
+        fn note(&self) -> String {
+            match &self.state.overlay {
+                Some(Overlay::Form(form)) => form.note.as_ref().map(|n| n.text.clone()).unwrap_or_default(),
+                other => panic!("no window: {other:?}"),
+            }
+        }
+
         fn written(&self) -> String {
             String::from_utf8_lossy(&self.runner.out).into_owned()
         }
@@ -583,14 +621,14 @@ mod tests {
         let mut app = App::open(&data, &home, false);
         app.make_account().await;
         app.start().await;
-        for answer in ["/passphrase", "wrong", "new", "new"] {
-            app.send(answer).await;
-        }
-        assert_eq!(app.said().last().unwrap(), "wrong passphrase; nothing changed");
-        for answer in ["/passphrase", "pw", "new", "new"] {
-            app.send(answer).await;
-        }
-        assert!(app.said().last().unwrap().starts_with("passphrase changed"));
+        app.open_profile_item(1).await;
+        app.fill(&["wrong", "new", "new"]).await;
+        assert_eq!(app.note(), "wrong passphrase; nothing changed");
+        app.press(KeyCode::Char('x')).await;
+        assert_eq!(app.state.overlay, None);
+        app.open_profile_item(1).await;
+        app.fill(&["pw", "new", "new"]).await;
+        assert_eq!(app.note(), "done: use the new one from now on");
         app.runner.shutdown().await;
 
         let mut app = App::open(&data, &home, false);
@@ -602,30 +640,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn phrase_shows_and_saves_the_words() {
+    async fn the_words_window_shows_and_saves_the_words() {
         let (data, home) = (TempDir::new().unwrap(), TempDir::new().unwrap());
         let mut app = App::open(&data, &home, false);
         let seed = app.make_account().await;
         app.start().await;
-        app.send("/phrase").await;
-        app.send("nope").await;
-        assert_eq!(app.state.reveal, None);
-        assert_eq!(app.said().last().unwrap(), "wrong passphrase");
-        app.send("/phrase").await;
-        app.send("pw").await;
-        assert_eq!(app.state.reveal.as_ref().map(|w| w.expose().to_string()), Some(seed.phrase()));
-        app.handle(Msg::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE))).await;
-        assert_eq!(app.state.reveal, None);
-
+        let words = |app: &App| match &app.state.overlay {
+            Some(Overlay::Form(form)) => form.words_shown().map(|w| w.expose().to_string()),
+            _ => None,
+        };
+        app.open_profile_item(2).await;
+        app.fill(&["nope"]).await;
+        assert_eq!(app.note(), "wrong passphrase");
+        assert_eq!(words(&app), None);
+        app.fill(&["pw"]).await;
+        assert_eq!(words(&app), Some(seed.phrase()));
+        let file = recovery::path(home.path());
+        app.press(KeyCode::Char('s')).await;
+        assert_eq!(app.note(), format!("already saved in {}", file.display()), "made with the account");
         recovery::remove(home.path()).unwrap();
-        app.send("/phrase save").await;
-        app.send("pw").await;
-        assert!(recovery::exists(home.path()));
-        app.send("/phrase save").await;
-        app.send("pw").await;
-        assert_eq!(app.state.ask().unwrap().label, "replace it? y/n: ");
-        app.send("y").await;
-        assert!(app.said().last().unwrap().starts_with("your words are saved in"));
+        app.press(KeyCode::Char('s')).await;
+        assert_eq!(app.note(), format!("saved in {}", file.display()));
+        assert!(std::fs::read_to_string(&file).unwrap().contains(&format!(" 1. {}", seed.words()[0])));
+        app.press(KeyCode::Esc).await;
+        assert_eq!(app.state.overlay, None);
+        assert!(app.state.on_profile());
         app.runner.shutdown().await;
     }
 
@@ -660,26 +699,6 @@ mod tests {
         app.send("y").await;
         let file = codefile::path(home.path());
         assert_eq!(std::fs::read_to_string(&file).unwrap(), format!("{}\n", seed.code()), "replaced with yours");
-        app.runner.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn phrase_save_checks_the_passphrase_before_asking_to_replace() {
-        let (data, home) = (TempDir::new().unwrap(), TempDir::new().unwrap());
-        let mut app = App::open(&data, &home, false);
-        app.make_account().await;
-        app.start().await;
-        let file = recovery::path(home.path());
-        let before = std::fs::read_to_string(&file).unwrap();
-        app.send("/phrase save").await;
-        app.send("nope").await;
-        assert_eq!(app.state.ask(), None, "no question after a wrong passphrase");
-        assert_eq!(app.said().last().unwrap(), "wrong passphrase");
-        app.send("/phrase save").await;
-        app.send("pw").await;
-        assert_eq!(app.state.ask().unwrap().label, "replace it? y/n: ");
-        app.send("n").await;
-        assert_eq!(std::fs::read_to_string(&file).unwrap(), before, "kept");
         app.runner.shutdown().await;
     }
 
@@ -853,7 +872,9 @@ mod tests {
         ana.send("y").await;
         assert_eq!(ana.state.standing(&friend), None);
         assert!(!ana.state.chats.contains_key(&friend));
-        ana.send("/name Ana M").await;
+        ana.open_profile_item(0).await;
+        ana.fill(&["Ana M"]).await;
+        assert_eq!(ana.state.overlay, None, "the window closes once it's saved");
         assert_eq!(ana.state.name, "Ana M");
         ana.send("/contacts").await;
         assert_eq!(ana.said().last().unwrap(), "no contacts yet: /add <code> adds a friend");

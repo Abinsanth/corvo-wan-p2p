@@ -206,7 +206,7 @@ pub fn loaded_older(state: &mut State, peer: Code, result: Result<(Vec<StoredMes
     let before = if open { chat_page(state).0 } else { 0 };
     let chat = state.chats.get_mut(&peer).expect("checked above");
     chat.messages.splice(0..0, page);
-    if let Some(tab) = state.tabs.iter_mut().find(|t| t.peer == Some(peer))
+    if let Some(tab) = state.tabs.iter_mut().find(|t| t.peer() == Some(peer))
         && tab.cleared > 0
     {
         tab.cleared += added;
@@ -251,7 +251,7 @@ pub fn trim(state: &mut State) {
         let gone = chat.messages.len() - CHAT_LEN;
         chat.messages.drain(..gone);
         chat.older = true;
-        if let Some(tab) = state.tabs.iter_mut().find(|t| t.peer == Some(*code)) {
+        if let Some(tab) = state.tabs.iter_mut().find(|t| t.peer() == Some(*code)) {
             // 0 once everything before the mark is gone: all of it shows.
             tab.cleared = tab.cleared.saturating_sub(gone);
         }
@@ -283,7 +283,6 @@ pub fn read_open_chat(state: &mut State, effects: &mut Vec<Effect>) {
         && matches!(state.screen, Screen::Main)
         && areas(state.size, input_rows(state)).is_some()
         && !state.scroll.is_scrolled()
-        && state.reveal.is_none()
         && state.overlay.is_none();
     if !visible {
         return;
@@ -416,7 +415,7 @@ mod tests {
         assert_eq!(s.chats[&rahul].unread, 2);
         assert_eq!(s.title, format!("(2) {APP}"));
         assert_eq!(s.people.iter().find(|p| p.code == rahul).unwrap().unread, 2, "the sidebar shows it");
-        assert!(s.tabs.iter().any(|t| t.peer == Some(rahul)), "a contact's chat opens");
+        assert!(s.tabs.iter().any(|t| t.peer() == Some(rahul)), "a contact's chat opens");
         assert!(s.on_corvo(), "without switching to it");
     }
 
@@ -480,7 +479,7 @@ mod tests {
         assert!(last_corvo(&s).contains("carol"));
         assert!(last_corvo(&s).contains("/accept"));
         assert_eq!(s.chats[&stranger].unread, 1);
-        assert!(!s.tabs.iter().any(|t| t.peer == Some(stranger)), "a request's chat waits in the sidebar");
+        assert!(!s.tabs.iter().any(|t| t.peer() == Some(stranger)), "a request's chat waits in the sidebar");
     }
 
     #[test]
@@ -523,7 +522,7 @@ mod tests {
         update(&mut s, received(rahul, "late"));
         assert_eq!(s.standing(&rahul), None, "not back as a request");
         assert!(!s.people.iter().any(|p| p.code == rahul));
-        assert!(!s.tabs.iter().any(|t| t.peer == Some(rahul)));
+        assert!(!s.tabs.iter().any(|t| t.peer() == Some(rahul)));
         assert!(s.chats.get(&rahul).is_none_or(|c| c.unread == 0 && c.messages.iter().all(|m| m.id != "late")));
     }
 
@@ -591,9 +590,6 @@ mod tests {
         assert!(!update(&mut s, received(rahul, "x1")).contains(&Effect::MarkRead(rahul)), "scrolled up");
         assert!(key(&mut s, KeyCode::Esc, KeyModifiers::NONE).contains(&Effect::MarkRead(rahul)), "back at the end");
 
-        s.reveal = Some(crate::ui::state::Secret::new("words".into()));
-        assert!(!update(&mut s, received(rahul, "x2")).contains(&Effect::MarkRead(rahul)), "the words cover it");
-        s.reveal = None;
         s.overlay = Some(crate::ui::window::Overlay::start(true));
         assert!(!update(&mut s, received(rahul, "x2b")).contains(&Effect::MarkRead(rahul)), "the tips cover it");
         assert!(key(&mut s, KeyCode::Esc, KeyModifiers::NONE).contains(&Effect::MarkRead(rahul)), "closed");

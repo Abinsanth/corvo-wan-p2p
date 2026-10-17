@@ -308,10 +308,9 @@ mod tests {
         press(&mut s, KeyCode::Tab);
         assert_eq!(s.editor.text(), "hello");
         s.editor.clear();
-        typed(&mut s, "/passphrase");
-        press(&mut s, KeyCode::Enter);
+        s.pending = Some(crate::ui::account::Pending::Update { version: "9.0.0".into() });
         typed(&mut s, "/q");
         press(&mut s, KeyCode::Tab);
-        assert_eq!(s.editor.text(), "/q", "a passphrase isn't completed");
+        assert_eq!(s.editor.text(), "/q", "an answer isn't completed");
     }
 }

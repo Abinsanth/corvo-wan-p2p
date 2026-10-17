@@ -1,6 +1,6 @@
 //! The commands about people: `/code`, `/add`, `/chat`, `/contacts`,
 //! `/requests`, `/accept`, `/block`, `/unblock`, `/blocked`, `/remove`,
-//! `/info`, `/name`, and `/update` for now.
+//! `/info`, and what came of changing your name.
 
 use std::path::PathBuf;
 
@@ -142,7 +142,6 @@ pub fn command(state: &mut State, cmd: Cmd, effects: &mut Vec<Effect>) {
                 effects.push(Effect::Refresh(Show::Info(code)));
             }
         }
-        Cmd::Name(name) => effects.push(Effect::SetName(name)),
         _ => {}
     }
 }
@@ -681,7 +680,7 @@ mod tests {
         assert!(send(&mut s, "/block").contains(&act(p.rahul, Act::Block)));
         let people = after(&s, p.rahul, Some(Standing::Blocked));
         done(&mut s, Outcome::Acted { code: p.rahul, act: Act::Block, result: Ok(()), people: Some(people) });
-        assert!(!s.tabs.iter().any(|t| t.peer == Some(p.rahul)));
+        assert!(!s.tabs.iter().any(|t| t.peer() == Some(p.rahul)));
         assert!(s.on_corvo());
         assert!(last(&s).contains("blocked rahul"));
     }
@@ -730,7 +729,7 @@ mod tests {
         let people = after(&s, p.rahul, None);
         let removed = Act::Remove { history: true };
         done(&mut s, Outcome::Acted { code: p.rahul, act: removed, result: Ok(()), people: Some(people) });
-        assert!(!s.tabs.iter().any(|t| t.peer == Some(p.rahul)));
+        assert!(!s.tabs.iter().any(|t| t.peer() == Some(p.rahul)));
         assert!(!s.chats.contains_key(&p.rahul), "the history is gone");
         assert!(last(&s).contains("removed rahul"));
     }
@@ -764,15 +763,6 @@ mod tests {
         let lines = said(&s);
         assert!(lines.iter().any(|l| l.contains(&p.bob.to_string())));
         assert!(lines.iter().any(|l| l.contains("request")));
-    }
-
-    #[test]
-    fn name_changes_yours() {
-        let (mut s, _) = state();
-        assert!(send(&mut s, "/name Ana Maria").contains(&Effect::SetName("Ana Maria".into())));
-        done(&mut s, Outcome::Named(Ok("Ana Maria".into())));
-        assert_eq!(s.name, "Ana Maria");
-        assert!(last(&s).contains("Ana Maria"));
     }
 
     #[test]

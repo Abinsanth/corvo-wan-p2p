@@ -5,7 +5,7 @@ app to app, end-to-end encrypted, with no server holding their messages. Share
 your code with a friend, they add it, and you chat. Messages wait on your
 machine until you're both online.
 
-**Status:** `v0.2.0`.
+**Status:** `v0.2.1`.
 
 ## Install
 

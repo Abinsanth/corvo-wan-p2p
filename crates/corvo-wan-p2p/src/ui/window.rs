@@ -558,6 +558,7 @@ mod tests {
             "Keys       Tab               complete",
             "           Shift-Tab, Alt-1..9  switch tabs",
             "           ↑/↓               what you typed before",
+            "           Double-click      copy a message",
         ] {
             assert!(help.iter().any(|r| r == row), "{row:?} missing: {help:#?}");
         }

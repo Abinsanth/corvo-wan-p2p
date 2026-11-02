@@ -113,6 +113,16 @@ impl Shown {
     fn plain(line: Line) -> Shown {
         Shown { line, head: 0, side: Side::Left }
     }
+
+    /// A message's own text, without its time and mark; `None` for other lines.
+    fn body(&self) -> Option<&str> {
+        let text = &self.line.text;
+        match self.side {
+            _ if self.head == 0 => None,
+            Side::Left => text.get(self.head..),
+            Side::Right => text.get(..text.len() - self.head),
+        }
+    }
 }
 
 /// What a tab shows, and the line its last `/clear` was at. A chat tab's
@@ -285,6 +295,30 @@ pub fn chat_page(state: &State) -> (usize, usize) {
     let (rows, clear_row) = chat_rows(state, areas.chat.width);
     let height = areas.chat.height as usize;
     (scroll_total(rows.len(), clear_row, height), height)
+}
+
+/// The message drawn at `x`, `y` in a chat, as drawn: its text cleaned, with
+/// its line breaks, and no time or mark.
+pub fn message_at(state: &State, x: u16, y: u16) -> Option<String> {
+    let areas = areas(state.size, input_rows(state))?;
+    if !matches!(state.screen, Screen::Main)
+        || !matches!(state.tab().kind, TabKind::Chat(_))
+        || !areas.chat.contains(Position::new(x, y))
+    {
+        return None;
+    }
+    let (rows, clear_row) = chat_rows(state, areas.chat.width);
+    let height = usize::from(areas.chat.height);
+    let mut row = state.scroll.top(scroll_total(rows.len(), clear_row, height), height) + usize::from(y - areas.chat.y);
+    let (lines, _) = tab_lines(state, state.tab());
+    for shown in &lines {
+        let n = line_rows(&shown.line.text, shown.head, areas.chat.width.into(), shown.side).len();
+        if row < n {
+            return shown.body().map(|text| text.split('\n').map(clean).collect::<Vec<_>>().join("\n"));
+        }
+        row -= n;
+    }
+    None
 }
 
 /// Rows to scroll through: after a `/clear`, enough below its mark to fill the area.
@@ -1552,6 +1586,44 @@ mod tests {
         let rows = chat_area(vec![mine(1, "sure", Mark::Delivered)], 80, 24);
         let row = rows.iter().find(|r| r.contains("sure")).unwrap();
         assert!(row.ends_with(&format!("sure {} ✓ ", time())), "the mark's slot is two columns: {row:?}");
+    }
+
+    #[test]
+    fn every_row_of_a_message_gives_its_whole_text() {
+        let long = "a message of mine long enough to wrap onto a few rows on the right";
+        let mut state = busy_state();
+        let rahul = rahul(&state);
+        state.chats.get_mut(&rahul).unwrap().messages = vec![
+            received(1, "hey, you there?"),
+            mine(2, long, Mark::Read),
+            received(3, "two\nlines \x1b[2Jhere\u{202E}"),
+        ];
+        state.select_tab(1);
+        let chat = areas(state.size, 1).unwrap().chat;
+        let found: Vec<Option<String>> = (chat.y..chat.bottom()).map(|y| message_at(&state, chat.x + 2, y)).collect();
+        assert_eq!(found[0], None, "the day line");
+        let mut texts: Vec<&str> = found.iter().flatten().map(String::as_str).collect();
+        assert!(texts.iter().filter(|t| **t == long).count() >= 2, "it wraps: {found:?}");
+        assert_eq!(texts.iter().filter(|t| **t == "two\nlines here").count(), 2, "cleaned, line breaks kept");
+        texts.dedup();
+        assert_eq!(texts, ["hey, you there?", long, "two\nlines here"], "no time, mark or name");
+        assert_eq!(found.last().unwrap(), &None, "below the messages");
+        assert_eq!(message_at(&state, 0, chat.y + 1), None, "the sidebar");
+        state.select_tab(0);
+        assert_eq!(message_at(&state, chat.x + 2, chat.y), None, "the corvo tab has no messages");
+    }
+
+    #[test]
+    fn a_scrolled_chat_gives_the_message_drawn_there() {
+        let mut state = busy_state();
+        state.select_tab(1);
+        let chat = areas(state.size, 1).unwrap().chat;
+        assert_eq!(message_at(&state, chat.x, chat.bottom() - 1).as_deref(), Some("two\nlines and 日本語 and "));
+        let at_end = message_at(&state, chat.x, chat.y).unwrap();
+        update(&mut state, Msg::Key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE)));
+        let scrolled = message_at(&state, chat.x, chat.y).unwrap();
+        assert!(scrolled.starts_with("message ") && scrolled.ends_with("to wrap around"), "{scrolled:?}");
+        assert_ne!(scrolled, at_end, "the one now at the top");
     }
 
     #[test]

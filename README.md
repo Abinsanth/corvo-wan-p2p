@@ -5,7 +5,7 @@ app to app, end-to-end encrypted, with no server holding their messages. Share
 your code with a friend, they add it, and you chat. Messages wait on your
 machine until you're both online.
 
-**Status:** `v0.2.1`.
+**Status:** `v0.3.0`.
 
 ## Install
 
@@ -122,7 +122,9 @@ online, and how many of your messages are still waiting.
 
 Keys: **Tab** completes, **Shift-Tab** or **Alt-1..9** switch tabs,
 **Alt+Enter** starts a new line, **PgUp/PgDn** scroll, and **↑/↓** bring back
-what you typed before.
+what you typed before. **Double-click** a message to copy its text; over SSH,
+or where there's no copy tool, it goes through the terminal, which may not
+allow it (Terminal.app doesn't).
 
 A command typed without what it needs, or with the wrong words, shows how
 it's typed, what it does and an example. Start a message with `//` to send
@@ -213,7 +215,8 @@ requests; accept them again.
   `CORVO_WAN_P2P_LOG=debug` for more while looking into a problem (still
   only the app's own notes). Past 1 MB it starts over, keeping one old file.
 - **The recovery file** holds your 12 words in plain text. Delete it once
-  you've copied them. The app never puts anything on your clipboard.
+  you've copied them. The app puts nothing on your clipboard but a message
+  you double-click.
 - **The code file**, `~/corvo-wan-p2p-code.txt`, is only there if you let
   `/code` save it. It holds just your code, which isn't secret.
 

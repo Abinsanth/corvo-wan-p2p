@@ -5,6 +5,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use corvo_wan_p2p_core::chat::PathInfo;
 use corvo_wan_p2p_core::identity::Code;
@@ -31,6 +32,8 @@ pub const FLASH_TICKS: u32 = 20;
 pub const PATH_TICKS: u32 = 8;
 /// Rows the mouse wheel scrolls per notch.
 pub const WHEEL_STEP: usize = 3;
+/// Most time between the two clicks of a double-click.
+pub const DOUBLE_CLICK: Duration = Duration::from_millis(500);
 
 /// Text that mustn't linger: a passphrase or the recovery words. Wiped from
 /// memory when dropped, and `{:?}` never shows it.
@@ -547,6 +550,8 @@ pub struct State {
     pub path: Option<(Code, PathInfo)>,
     /// Ticks so far, for things done every few of them.
     pub ticks: u32,
+    /// When and where the last click was that could start a double-click.
+    pub last_click: Option<(Instant, u16, u16)>,
 }
 
 impl State {
@@ -584,6 +589,7 @@ impl State {
             installing: None,
             path: None,
             ticks: 0,
+            last_click: None,
         }
     }
 

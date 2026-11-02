@@ -3,6 +3,7 @@
 //! out, and their results come back as messages.
 
 use std::path::PathBuf;
+use std::time::Instant;
 
 use corvo_wan_p2p_core::chat::{Event, PathInfo};
 use corvo_wan_p2p_core::identity::{Code, Seed};
@@ -15,13 +16,16 @@ use zeroize::Zeroizing;
 
 use super::account::{self, PhraseDone, PhraseUse};
 use super::chat::{self, Loaded};
+use super::clip::Copied;
 use super::commands::{Cmd, Input, parse, usage};
 use super::complete;
 use super::form;
 use super::people::{self, Act, Show};
 use super::profile;
-use super::state::{PATH_TICKS, Screen, Secret, State, Tone, WHEEL_STEP};
-use super::view::{areas, chat_page, input_rows, popup_area, sidebar_rows, sidebar_scrolled, sidebar_showing, tab_at};
+use super::state::{DOUBLE_CLICK, FLASH_TICKS, Flash, Line, PATH_TICKS, Screen, Secret, State, Tone, WHEEL_STEP};
+use super::view::{
+    areas, chat_page, input_rows, message_at, popup_area, sidebar_rows, sidebar_scrolled, sidebar_showing, tab_at,
+};
 use super::window::{self, Overlay};
 use crate::selfupdate::Stage;
 
@@ -104,6 +108,8 @@ pub enum Effect {
     },
     /// A stage of installing the release the last check found.
     Install(Stage),
+    /// Put a message you double-clicked on the clipboard.
+    Copy(String),
     /// Whether the code file is there.
     ShowCode,
     /// Write the code file.
@@ -199,6 +205,7 @@ pub enum Outcome {
     },
     /// `/update` after an update: this version is installed and waits for a restart.
     UpdatedAlready(String),
+    Copied(Copied),
     /// `saved` is where the code file is, if it's there.
     CodeShown {
         saved: Option<PathBuf>,
@@ -331,7 +338,9 @@ pub fn update(state: &mut State, msg: Msg) -> Vec<Effect> {
             MouseEventKind::ScrollDown => wheel(state, mouse, WHEEL_STEP as isize),
             MouseEventKind::Down(MouseButton::Left) => {
                 state.focused = true;
+                let copy = double_click(state, mouse.column, mouse.row);
                 click(state, mouse.column, mouse.row);
+                effects.extend(copy);
             }
             _ => {}
         },
@@ -429,6 +438,24 @@ fn click(state: &mut State, x: u16, y: u16) {
     {
         state.open_chat(*code, true);
     }
+}
+
+/// A second click soon after the first on the same spot copies the message
+/// there. Not while the completion list is open: it takes clicks itself.
+fn double_click(state: &mut State, x: u16, y: u16) -> Option<Effect> {
+    let now = Instant::now();
+    let second = state
+        .last_click
+        .take()
+        .is_some_and(|(at, cx, cy)| (cx, cy) == (x, y) && now.duration_since(at) <= DOUBLE_CLICK);
+    if state.popup.is_some() {
+        return None;
+    }
+    if !second {
+        state.last_click = Some((now, x, y));
+        return None;
+    }
+    message_at(state, x, y).map(Effect::Copy)
 }
 
 /// The wheel scrolls the sidebar when it's over it, and the chat otherwise.
@@ -638,6 +665,10 @@ fn on_done(state: &mut State, outcome: Outcome, effects: &mut Vec<Effect>) {
         | Outcome::Phrase(_)
         | Outcome::PassphraseChecked(_)) => effects.extend(form::done(state, outcome)),
         Outcome::Refreshed { show, result } => people::refreshed(state, show, result),
+        Outcome::Copied(copied) => {
+            let line = Line { text: copied.said().into(), tone: Tone::Good };
+            state.flash = Some(Flash { line, ticks_left: FLASH_TICKS });
+        }
         Outcome::CodeShown { saved } => people::code_shown(state, saved),
         Outcome::CodeWritten(result) => people::code_written(state, result),
         other => match &mut state.screen {
@@ -657,6 +688,7 @@ mod tests {
     use crate::ui::state::{APP, FLASH_TICKS, Line, Tab};
     use corvo_wan_p2p_core::identity::Seed;
     use ratatui::crossterm::event::KeyEventState;
+    use std::time::Duration;
 
     #[test]
     fn the_open_chats_path_is_asked_every_two_seconds() {
@@ -1062,6 +1094,71 @@ mod tests {
         let before = s.tabs[0].lines.len();
         send(&mut s, "   ");
         assert_eq!(s.tabs[0].lines.len(), before, "an empty line does nothing");
+    }
+
+    /// Ana on 80×24 in a chat with rahul: his message, then hers.
+    fn chatting() -> State {
+        use corvo_wan_p2p_core::store::{Mark, StoredMessage};
+        let mut s = state();
+        s.size = (80, 24);
+        let rahul = s.tabs[1].peer().unwrap();
+        let message = |id: &str, text: &str, mark| StoredMessage { id: id.into(), sent_at: 1, text: text.into(), mark };
+        s.chats.entry(rahul).or_default().messages =
+            vec![message("1", "hey, you there?", Mark::Received), message("2", "yes!", Mark::Read)];
+        s.select_tab(1);
+        s
+    }
+
+    /// What a click copies.
+    fn clicked(s: &mut State, column: u16, row: u16) -> Vec<Effect> {
+        let kind = MouseEventKind::Down(MouseButton::Left);
+        let effects = update(s, Msg::Mouse(MouseEvent { kind, column, row, modifiers: KeyModifiers::NONE }));
+        effects.into_iter().filter(|e| matches!(e, Effect::Copy(_))).collect()
+    }
+
+    /// The column and row of the first cell where `text` is drawn.
+    fn drawn_at(s: &State, text: &str) -> (u16, u16) {
+        let chat = areas(s.size, 1).unwrap().chat;
+        (chat.y..chat.bottom())
+            .find_map(|y| {
+                (chat.x..chat.right()).find(|&x| message_at(s, x, y).as_deref() == Some(text)).map(|x| (x, y))
+            })
+            .unwrap_or_else(|| panic!("{text:?} isn't drawn"))
+    }
+
+    #[test]
+    fn a_double_click_copies_a_message_on_either_side() {
+        let mut s = chatting();
+        for text in ["hey, you there?", "yes!"] {
+            let (x, y) = drawn_at(&s, text);
+            assert!(clicked(&mut s, x, y).is_empty(), "one click copies nothing");
+            assert_eq!(clicked(&mut s, x, y), [Effect::Copy(text.into())]);
+            assert!(clicked(&mut s, x, y).is_empty(), "a third click starts again");
+        }
+    }
+
+    #[test]
+    fn only_two_quick_clicks_on_one_spot_copy() {
+        let mut s = chatting();
+        let (x, y) = drawn_at(&s, "yes!");
+        clicked(&mut s, x, y);
+        assert!(clicked(&mut s, x - 1, y).is_empty(), "somewhere else");
+        clicked(&mut s, x, y);
+        s.last_click = s.last_click.map(|(at, x, y)| (at - DOUBLE_CLICK - Duration::from_millis(1), x, y));
+        assert!(clicked(&mut s, x, y).is_empty(), "too slow");
+        let chat = areas(s.size, 1).unwrap().chat;
+        clicked(&mut s, chat.x + 1, chat.y);
+        assert!(clicked(&mut s, chat.x + 1, chat.y).is_empty(), "the day line isn't a message");
+    }
+
+    #[test]
+    fn a_copy_is_flashed_as_it_went() {
+        let mut s = chatting();
+        update(&mut s, Msg::Done(Outcome::Copied(Copied::ByTool)));
+        assert_eq!(s.flash.as_ref().unwrap().line, Line { text: "copied".into(), tone: Tone::Good });
+        update(&mut s, Msg::Done(Outcome::Copied(Copied::ByTerminal)));
+        assert_eq!(s.flash.as_ref().unwrap().line.text, "sent to your clipboard if your terminal allows it");
+        assert_eq!(s.tabs[0].lines.len(), 0, "nothing said in the corvo tab");
     }
 
     #[test]

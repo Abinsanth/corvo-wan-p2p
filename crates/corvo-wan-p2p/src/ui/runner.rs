@@ -16,6 +16,7 @@ use ratatui::crossterm::terminal::SetTitle;
 
 use super::account::{PhraseDone, PhraseUse};
 use super::chat::{History, Loaded};
+use super::clip::{self, Copied, Tool};
 use super::people::Act;
 use super::state::{CHAT_LEN, Secret};
 use super::update::{Effect, Msg, Outcome};
@@ -76,8 +77,10 @@ pub struct Runner<W: Write> {
     home: Option<PathBuf>,
     config: Config,
     net: Net,
-    /// The terminal: window titles are written here.
+    /// The terminal: window titles, and copies where there's no tool, are written here.
     out: W,
+    /// What copies a message, tried in turn.
+    clip_tools: Vec<Tool>,
     /// An account just made, until the engine starts on it.
     store: Option<Store>,
     client: Option<Client>,
@@ -97,7 +100,8 @@ impl<W: Write> Runner<W> {
             installing: None,
             installed: None,
         };
-        Runner { dir, home, config, net, out, store: None, client: None, updates }
+        let clip_tools = clip::tools(os, |name| std::env::var_os(name).is_some());
+        Runner { dir, home, config, net, out, clip_tools, store: None, client: None, updates }
     }
 
     /// Points `/update` at `urls`, installing `asset` over `target`.
@@ -261,6 +265,7 @@ impl<W: Write> Runner<W> {
                 None => Outcome::UpdateChecked { yes, result: self.check_update().await },
             },
             Effect::Install(stage) => Outcome::InstallStep { stage, result: self.install(stage).await },
+            Effect::Copy(text) => Outcome::Copied(self.copy(text).await?),
             Effect::ShowCode => Outcome::CodeShown { saved: self.code_file() },
             Effect::WriteCode => self.write_code(),
             Effect::CheckPassphrase(passphrase) => Outcome::PassphraseChecked(match self.client() {
@@ -365,6 +370,18 @@ impl<W: Write> Runner<W> {
             Act::Remove { history } => client.remove(code, history).await,
         };
         done.map_err(|e| e.to_string())
+    }
+
+    /// Copies `text` with the first tool that takes it, or else through the terminal.
+    async fn copy(&mut self, text: String) -> anyhow::Result<Copied> {
+        let tools = self.clip_tools.clone();
+        let sequence = clip::osc52(&text);
+        if blocking(move || tools.into_iter().any(|tool| clip::run(tool, &text).is_ok())).await? {
+            return Ok(Copied::ByTool);
+        }
+        self.out.write_all(sequence.as_bytes())?;
+        self.out.flush()?;
+        Ok(Copied::ByTerminal)
     }
 
     /// Starts the engine on `store`; anything that stops it is fatal.
@@ -530,7 +547,9 @@ mod tests {
             let dir = data.path().join("corvo-wan-p2p");
             let state = State::onboarding(Onboarding::start(Store::exists(&dir), recover));
             let net = Net::Local(lookup.clone());
-            let runner = Runner::new(dir, Some(home.path().to_path_buf()), FAST, net, Vec::new());
+            let mut runner = Runner::new(dir, Some(home.path().to_path_buf()), FAST, net, Vec::new());
+            // Never this computer's clipboard: copies go to `written`.
+            runner.clip_tools.clear();
             App { state, runner, left: None }
         }
 
@@ -765,6 +784,30 @@ mod tests {
         assert_eq!(app.state.overlay, None);
         assert!(app.state.on_profile());
         app.runner.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_message_is_copied_through_the_terminal_where_there_is_no_tool() {
+        let (data, home) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        let mut app = App::open(&data, &home, false);
+        let flow = app.runner.apply(Effect::Copy("two\nlines".into())).await.unwrap();
+        assert!(matches!(flow, Flow::Next(Some(Msg::Done(Outcome::Copied(Copied::ByTerminal))))), "{flow:?}");
+        assert!(app.written().ends_with(&clip::osc52("two\nlines")));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_message_is_copied_by_the_first_tool_that_takes_it() {
+        let (data, home) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        let mut app = App::open(&data, &home, false);
+        let file = home.path().join("clipboard");
+        let path: &'static str = String::leak(file.to_string_lossy().into_owned());
+        let cat = Tool { program: "sh", args: Vec::leak(vec!["-c", "cat > \"$0\"", path]), wide: false };
+        app.runner.clip_tools = vec![Tool { program: "false", args: &[], wide: false }, cat];
+        let flow = app.runner.apply(Effect::Copy("hey, you there?".into())).await.unwrap();
+        assert!(matches!(flow, Flow::Next(Some(Msg::Done(Outcome::Copied(Copied::ByTool))))), "{flow:?}");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "hey, you there?");
+        assert!(!app.written().contains("\x1b]52"), "not through the terminal too");
     }
 
     #[tokio::test]

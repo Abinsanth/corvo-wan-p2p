@@ -4,6 +4,7 @@
 
 pub mod account;
 pub mod chat;
+pub mod clip;
 pub mod commands;
 pub mod complete;
 pub mod form;

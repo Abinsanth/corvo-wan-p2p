@@ -90,6 +90,7 @@ pub const KEYS: &[(&str, &str)] = &[
     ("Alt+Enter", "new line"),
     ("PgUp/PgDn", "scroll"),
     ("↑/↓", "what you typed before"),
+    ("Double-click", "copy a message"),
 ];
 
 /// How a command is typed, what it does in one sentence, and an example:
